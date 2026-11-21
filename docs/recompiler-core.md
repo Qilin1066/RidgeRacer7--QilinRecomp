@@ -1,6 +1,6 @@
 # The recompiler's core
 
-The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.3.0): the PPU decoder, run on the game's code.
+The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.4.0): the PPU decoder and the control-flow pass, both run on the game's code.
 
 ## The PPU decoder (`recomp/src/ppu.*`, `qilin::ppu`)
 
@@ -54,6 +54,7 @@ The sweep's first run found one fault in the decoder (`mftb` accepted any regist
 ### The commands
 
 ```sh
+build/qilin cfg     <game>                  # the control-flow pass's report
 build/qilin insns   <game>                  # every word of the code: address, word, instruction
 build/qilin profile <game>                  # how often each instruction is used; what doesn't decode
 build/qilin disasm  <file> [--base 0x10000] # a file of raw big-endian words, as insns prints them
@@ -61,8 +62,41 @@ build/qilin disasm  <file> [--base 0x10000] # a file of raw big-endian words, as
 
 `insns` and `profile` read the decrypted program's executable sections. On the real program (v0.3.0, `elf-analysis.md`): 1,065,028 words, 99.47% of which decode; the rest are jump tables and constants lying in the code. The game uses **151 of the 383 instructions**, which is the lifter's work list: a narrow, floating-point part of VMX, no atomic sequences, no cache instructions but `dcbt`.
 
+## The control-flow pass (`recomp/src/cfg.*`, `qilin cfg`)
+
+Finds every function, follows every branch, and accounts for every word of the code. **On the game: 1,065,028 words, none unknown.**
+
+| | |
+|---|---|
+| Functions | 14,294: the entry point, 248 import stubs, 14,045 from descriptors. One round: no function is found only by a call or a tail call |
+| Code | 1,059,387 words reached |
+| Jump tables | 5,634 words in 296 switches |
+| Padding | 3 words |
+| Dead | 4 words: an epilogue after a trap that always fires |
+| Unknown | **0** |
+| Words reached that aren't instructions, branches out of the code | 0 |
+
+What the program gives, and the pass takes:
+
+- **Descriptors.** In this ABI every function has one (14,046 of them, in one section, each a code address and the one TOC, `0x4de880`), so they are the list of functions. The section is found as the one holding the entry point's descriptor: RPCS3's file has no section names.
+- **Unwinding tables** (`.eh_frame`, found by its content): 170 CIEs and 7,530 FDEs, each FDE the exact first and last address of a function. A function with one is explored to that end; one without (the C library's, mostly) to the next function's start.
+- **Exception tables** (`.gcc_except_table`): 932 functions have one, with **2,845 landing pads** between them: the places the C++ unwinder enters a function when an exception passes through it, to run destructors or a `catch`. Nothing branches to a landing pad, so without these tables 51,000 words of code look unreachable. They are entry points of their functions.
+- **Import stubs**: the 248, each ending in the `bctr` that enters the system. A call to one is a call to a named system function.
+
+What it works out:
+
+- **Switches.** GCC puts a switch's table in the code, straight after the `bctr`, as 32-bit offsets from the table's own address. The table's address is loaded from a table of constants: the TOC itself, or (most of the game's code, built with a small TOC per source file) the file's own table, whose address the function takes from the TOC into a register in its prologue. The pass reads both from the file. All 296 tables are found, and all lie straight after their `bctr`. **The size of 264 is proven** by the bound the code checks the index against (`cmplwi` and `bgt` to the default on the way in, or `cmplwi` and `ble` as the only way into the switch's block). The other 32, whose check isn't on a path the pass follows yet, are sized by where their targets begin (a table ends where the nearest thing it jumps to starts). The two methods agree on every table that has both, and a wrong size would leave unknown words or reach words that aren't instructions: there are none of either.
+- **System calls.** The number is the value of `r11` at the `sc`. The compiler usually sets it just above, sometimes before a branch or a join, so the pass follows the constant in `r11` along every path through the function. **All 502 sites are numbered: 78 different system calls** (`elf-analysis.md`).
+- **Tail calls**: a branch out of a function. Here every target was already a function.
+- **Open-ended functions**: 491 reach their end without a return or a jump, because they end in a call that doesn't return (a throw, `abort`, `exit`). All but 18 have an unwinding entry that says where they end, and those 18 each end in a call and the `nop` after it.
+- 4,943 indirect calls (`bctrl`), and no indirect jump that isn't a switch or an import stub.
+
+**What this means for the runtime.** The game uses C++ exceptions for real: its unwinder and personality routine are part of the lifted code, and they resume a function at a landing pad with registers they have restored. So a lifted function has more than one way in (its start and its landing pads), and the lifted unwinder's jump to a landing pad is an indirect jump the dispatcher must know. That is a design item for the lifter (`roadmap-and-design-targets.md`).
+
+Not done yet: a JSON output for the lifter; proving the last 32 switch sizes; data pointers into code other than descriptors (none are needed for coverage, but vtables point at descriptors, not code, which is worth confirming).
+
 ## Next
 
 1. `verify_decoder.py --game`, where there is both the game and a PowerPC objdump.
-2. The control-flow pass: seeds from the function descriptors and the unwinding tables, the import stubs as known calls, the `sc` sites with their numbers, coverage to 0 unknown words.
+2. ✅ The control-flow pass (v0.4.0, above). Next for it: its output as JSON, and the lifter that reads it.
 3. The SPU decoder: there are 42 SPU programs and 209,660 words of SPU code, the car's physics among them (`elf-analysis.md`). Its reference is open: binutils dropped the SPU some versions ago (`roadmap-and-design-targets.md`).

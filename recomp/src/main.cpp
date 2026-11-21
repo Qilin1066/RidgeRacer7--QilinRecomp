@@ -12,6 +12,7 @@
 //   qilin sfo     <game>                     every entry of PARAM.SFO
 //   qilin data    <game>                     the game's own files, and the headers of its sound banks and films
 //   qilin spu     <game>                     the SPU programs the program carries
+//   qilin cfg     <game>                     the control-flow pass: functions, switches, system calls, coverage
 //   qilin insns   <game>                     every word of the program's code: address, word, instruction
 //   qilin profile <game>                     how often the code uses each instruction, and what doesn't decode
 //   qilin disasm  <file> [--base address]    a file of raw big-endian PPU words, as `insns` prints them
@@ -34,6 +35,7 @@
 #include <vector>
 
 #include "bytes.hpp"
+#include "cfg.hpp"
 #include "elf.hpp"
 #include "import_names.hpp"
 #include "media.hpp"
@@ -66,6 +68,7 @@ int usage() {
                "  qilin sfo     <game>\n"
                "  qilin data    <game>\n"
                "  qilin spu     <game>\n"
+               "  qilin cfg     <game>\n"
                "  qilin insns   <game>\n"
                "  qilin profile <game>\n"
                "  qilin disasm  <file of big-endian words> [--base address]\n"
@@ -540,6 +543,14 @@ int cmd_spu(const Args& a) {
     return 0;
 }
 
+int cmd_cfg(const Args& a) {
+    const Elf elf = elf_of(files_of(a));
+    const auto cfg = Cfg::build(elf);
+    if (!cfg) throw Failure{cfg.error()};
+    std::print("{}", cfg->summary());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -556,6 +567,7 @@ int main(int argc, char** argv) {
         if (a.command == "sfo") return cmd_sfo(a);
         if (a.command == "data") return cmd_data(a);
         if (a.command == "spu") return cmd_spu(a);
+        if (a.command == "cfg") return cmd_cfg(a);
         if (a.command == "insns") return cmd_insns(a);
         if (a.command == "profile") return cmd_profile(a);
         if (a.command == "disasm") return cmd_disasm(a);

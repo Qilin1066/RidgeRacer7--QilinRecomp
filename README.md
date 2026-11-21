@@ -19,7 +19,8 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 | CI: Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64 and x64, Windows x64, warnings as errors | ✅ |
 | PPU decoder: 64-bit PowerPC with VMX, 383 instructions (`docs/recompiler-core.md`) | ✅ identical to GNU objdump over a 4.9-million-word sweep of the encoding space, in CI; on the game's code 99.47% of 1,065,028 words decode and the rest are jump tables and constants; the game uses 151 of the instructions |
 | The data files: the sound banks' and films' headers, a survey of the archive (`docs/data-files.md`) | ✅ read from the owner's disc: MPEG-2 films at 1280 × 720, ATRAC3plus music in 5.1, PCM speech; the archive's directory is not in the archive |
-| SPU decoder; control-flow passes; lifters to C++; differential tests | later |
+| Control-flow pass for the PPU code (`docs/recompiler-core.md`) | ✅ on the game: 14,294 functions, 296 switches, 2,845 exception landing pads, all 502 system-call sites numbered; **every one of 1,065,028 words accounted for, none unknown** |
+| SPU decoder and control-flow pass; lifters to C++; differential tests | later |
 | Runtime: the system libraries and system calls replaced natively; the RSX's command stream on Vulkan 1.3; sound, controllers, saves, films | later |
 | The settings menu (F1), the same as the other Qilin recomps' | later, with the window |
 
@@ -72,6 +73,7 @@ build/qilin exports <game>                      # what the program offers the sy
 build/qilin sfo     <game>                      # every entry of PARAM.SFO
 build/qilin data    <game>                      # the game's own files; the sound banks' and films' headers
 build/qilin spu     <game>                      # the SPU programs the program carries
+build/qilin cfg     <game>                      # the control-flow pass: functions, switches, system calls, coverage
 build/qilin insns   <game>                      # every word of the program's code: address, word, instruction
 build/qilin profile <game>                      # how often the code uses each instruction
 build/qilin disasm  <file> [--base address]     # a file of raw big-endian PPU words
@@ -83,7 +85,7 @@ With only `EBOOT.BIN` there, `info` prints what its header leaves plain and then
 
 | Path | What |
 |---|---|
-| `recomp/src/` | `elf` (the PS3 program loader), `self` (`EBOOT.BIN`'s plain header), `sfo` (`PARAM.SFO`), `title` (finds the game's files; the known builds), `media` (the sound banks' and films' headers), `spu_image` (the SPU programs inside the program), `import_names` (the imported functions' names), `sha256`, `ppu` (the PPU decoder), `main` (the `qilin` CLI) |
+| `recomp/src/` | `elf` (the PS3 program loader), `self` (`EBOOT.BIN`'s plain header), `sfo` (`PARAM.SFO`), `title` (finds the game's files; the known builds), `media` (the sound banks' and films' headers), `spu_image` (the SPU programs inside the program), `import_names` (the imported functions' names), `sha256`, `ppu` (the PPU decoder), `cfg` (the control-flow pass), `main` (the `qilin` CLI) |
 | `recomp/tests/` | Unit tests on a program, a SELF and a `PARAM.SFO` built in memory, so they need no game files |
 | `tools/` | `analyse-game.ps1`, behind `Analyse game.bat`; `check/verify_decoder.py` (the PPU decoder against GNU objdump) |
 | `docs/` | Roadmap and design targets, the program's analysis, the data files, the recompiler's core, prior art, naming |

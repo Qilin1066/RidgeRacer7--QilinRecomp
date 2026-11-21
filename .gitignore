@@ -43,6 +43,7 @@ functions.json
 functions.json.gz
 imports.txt
 profile.txt
+cfg.txt
 spu.txt
 data.txt
 exports.txt

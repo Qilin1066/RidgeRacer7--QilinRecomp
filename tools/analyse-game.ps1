@@ -110,6 +110,7 @@ Save-Output "The program" $qilin @("info", $Game, "--json", (Join-Path $out "inf
 Save-Output "Its imports" $qilin @("imports", $Game) (Join-Path $out "imports.txt")
 Save-Output "Its exports" $qilin @("exports", $Game) (Join-Path $out "exports.txt")
 Save-Output "Its SPU programs" $qilin @("spu", $Game) (Join-Path $out "spu.txt") -Show
+Save-Output "Its control flow" $qilin @("cfg", $Game) (Join-Path $out "cfg.txt")
 Save-Output "Its code's profile" $qilin @("profile", $Game) (Join-Path $out "profile.txt")
 
 Write-Host ""

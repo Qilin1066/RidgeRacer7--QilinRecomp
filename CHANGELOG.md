@@ -4,8 +4,21 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-21
+
+The control-flow pass: every word of the game's code accounted for.
+
 ### Added
+- Control-flow pass for the PPU code (`recomp/src/cfg.*`, `qilin cfg`): functions from the program's descriptors, unwinding tables, import stubs and calls; recursive descent bounded by each function's unwinding entry; GCC's in-code jump tables, their addresses read through the TOC and the per-file constant tables and their sizes proven by the code's own bound check where it is in reach; the C++ exception tables' landing pads as entry points; the number of every system call, by following the constant in `r11` along every path; word-by-word coverage (`docs/recompiler-core.md`).
+- Readers for `.eh_frame` and the exception tables (`.gcc_except_table`).
 - Names for all 248 imported functions (`recomp/src/import_names.*`): the SDK's own names, each confirmed by computing its id from the name. `qilin imports` prints them and `qilin info` counts them. `docs/elf-analysis.md` says what they show: SPURS tasksets, the system's ATRAC3plus, audio and video decoders, a USB driver of the game's own, saves and hard-disk data.
+
+### Checked
+- On the game: 14,294 functions; 296 switches with 5,634 entries, 264 sized by proof and 32 by where their targets begin; 2,845 landing pads in 932 functions; all 502 system-call sites numbered (78 different calls); **1,065,028 words: 1,059,387 code, 5,634 jump-table entries, 3 padding, 4 dead, 0 unknown**, and no function reaches a word that isn't an instruction.
+
+### Found
+- Every function has a descriptor, so the descriptors alone list the functions.
+- The game uses C++ exceptions: the lifter has to make every landing pad an entry into its function.
 
 ### Changed
 - **Links and mentions of the sister projects follow their new names** (WindWakerHD--QilinRecomp, PunchOutWii--QilinRecomp, GBTGhoulies--QilinRecomp, ApbArcade--QilinRecomp, and RhythmHeavenFever--QilinRecomp for Beat the Beat: renamed by the owner; GitHub redirects the old names).

@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cfg.hpp"
 #include "elf.hpp"
 #include "elf_builder.hpp"
 #include "import_names.hpp"
@@ -323,6 +324,115 @@ void test_self() {
     CHECK(stamps && stamps->size() == 3 && (*stamps)[0].objects == 2 && (*stamps)[1].name == "libstdc++" &&
           (*stamps)[2].name == "libsysutil_np_matching_int_stub_03");
     CHECK(parse_sdk_stamps("") && parse_sdk_stamps("")->empty());
+}
+
+// ---------------------------------------------------------------- the control-flow pass
+
+void test_cfg() {
+    // Unwinding tables: a CIE ("zR", addresses relative to themselves, 8 bytes) and two FDEs.
+    Bytes eh(0x60);
+    put_be32(eh, 0, 0x14);          // CIE: length
+    eh[8] = 1;                      // version
+    put_text(eh, 9, "zR");
+    eh[12] = 4;                     // code alignment
+    eh[13] = 0x78;                  // data alignment (-8)
+    eh[14] = 65;                    // the return address's register
+    eh[15] = 1;                     // augmentation length
+    eh[16] = 0x14;                  // pcrel | udata8
+    const auto fde = [&](size_t at, uint32_t begin, uint32_t size) {
+        put_be32(eh, at, 0x1c);
+        put_be32(eh, at + 4, static_cast<uint32_t>(at + 4));  // back to the CIE at 0
+        put_be64(eh, at + 8, uint64_t{begin} - (0x20000 + at + 8));
+        put_be64(eh, at + 16, size);
+    };
+    fde(0x18, 0x10400, 0x44);
+    fde(0x38, 0x10000, 0x20);
+    const auto ranges = parse_eh_frame(eh, 0x20000);
+    CHECK(ranges.has_value());
+    if (ranges) {
+        CHECK(ranges->size() == 2);
+        CHECK((*ranges)[0].begin == 0x10400 && (*ranges)[0].end == 0x10444);
+        CHECK((*ranges)[1].begin == 0x10000 && (*ranges)[1].end == 0x10020);
+    }
+    Bytes bad = eh;
+    bad[16] = 0x21;  // an encoding that isn't one
+    CHECK(!parse_eh_frame(bad, 0x20000).has_value());
+    bad = eh;
+    put_be32(bad, 0x18 + 4, 0x10);  // an FDE pointing at no CIE
+    CHECK(!parse_eh_frame(bad, 0x20000).has_value());
+    bad = eh;
+    put_be32(bad, 0x38, 0x100);  // a record longer than the section
+    CHECK(!parse_eh_frame(bad, 0x20000).has_value());
+
+    // The test program: its one function and its two import stubs.
+    const auto elf = Elf::parse(make_elf());
+    CHECK(elf.has_value());
+    if (!elf) return;
+    const auto cfg = Cfg::build(*elf);
+    CHECK(cfg.has_value());
+    if (!cfg) {
+        std::println(stderr, "{}", cfg.error());
+        return;
+    }
+    const auto& functions = cfg->functions();
+    CHECK(functions.contains(elf->entry_code()) && functions.at(elf->entry_code()).origin == Origin::Entry);
+    CHECK(functions.contains(kStub0) && functions.at(kStub0).stub && functions.at(kStub0).stub->id == kId0);
+    CHECK(functions.contains(kStub1) && functions.at(kStub1).indirect_tails.size() == 1);
+    for (const auto& [start, f] : functions) CHECK(f.bad.empty());
+
+    // A function with a switch, reached by a tail call from the entry point:
+    // the table's address comes from the TOC, its size from the bound check,
+    // and the system calls' numbers from r11 along every path.
+    Bytes program = make_elf();
+    const uint32_t f = kText + 0x120;
+    const size_t at = kTextAt + 0x120;
+    put_segment(program, 0, 1, 5, kTextAt, kText, 0x170, 0x170, 0x10000);
+    put_section(program, 1, 1, 1, 6, kText, kTextAt, 0x170);
+    put_be32(program, kTextAt, 0x48000120);    // b f
+    const uint32_t code[] = {
+        0x2b830002,  // cmpli cr7,0,r3,2
+        0x419d0030,  // bc 12,4*cr7+gt,f+0x34
+        0x81628010,  // lwz r11,-32752(r2): the table's address
+        0x78691788,  // rldic r9,r3,2,30
+        0x7c09582e,  // lwzx r0,r9,r11
+        0x7c0007b4,  // extsw r0,r0
+        0x7c005a14,  // add r0,r0,r11
+        0x7c0903a6,  // mtspr 9,r0
+        0x4e800420,  // bcctr 20,lt,0
+        0x0000000c,  // the table, at f+0x24: to f+0x30,
+        0x00000010,  // f+0x34
+        0x00000014,  // and f+0x38
+        0x39600321,  // f+0x30: addi r11,0,801
+        0x44000002,  // f+0x34: sc (r11 is 801 from above, anything from the branches)
+        0x39600193,  // f+0x38: addi r11,0,403
+        0x44000002,  // sc
+        0x4e800020,  // bclr 20,lt,0
+    };
+    for (size_t i = 0; i < std::size(code); ++i) put_be32(program, at + 4 * i, code[i]);
+    put_be32(program, kDataAt + 16, f + 0x24);  // the TOC's slot for the table
+    const auto elf2 = Elf::parse(std::move(program));
+    CHECK(elf2.has_value());
+    if (!elf2) return;
+    const auto cfg2 = Cfg::build(*elf2);
+    CHECK(cfg2.has_value());
+    if (!cfg2) return;
+    CHECK(cfg2->rounds() == 2 && cfg2->functions().contains(f));
+    if (!cfg2->functions().contains(f)) return;
+    const Function& sw = cfg2->functions().at(f);
+    CHECK(sw.origin == Origin::TailCall && sw.bad.empty() && sw.words == 14 && sw.end == f + 0x44 && !sw.runs_off);
+    CHECK(sw.tables.size() == 1);
+    if (sw.tables.size() == 1) {
+        const JumpTable& table = sw.tables[0];
+        CHECK(table.at == f + 0x20 && table.table == f + 0x24 && table.proven);
+        CHECK(table.targets == std::vector<uint32_t>({f + 0x30, f + 0x34, f + 0x38}));
+    }
+    CHECK(sw.system_calls.size() == 2);
+    if (sw.system_calls.size() == 2) {
+        CHECK(sw.system_calls[0].at == f + 0x34 && !sw.system_calls[0].number);
+        CHECK(sw.system_calls[1].at == f + 0x3c && sw.system_calls[1].number == 403u);
+    }
+    CHECK(cfg2->functions().at(kText).tails.contains(f));
+    CHECK(cfg2->coverage().tables == 3);
 }
 
 // ---------------------------------------------------------------- import names
@@ -688,6 +798,7 @@ int main() {
     test_self();
     test_sfo();
     test_media();
+    test_cfg();
     test_import_names();
     test_spu_image();
     test_title();

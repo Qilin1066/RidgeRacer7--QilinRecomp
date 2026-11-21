@@ -189,7 +189,7 @@ What the names say about the game:
 - **Not used at all**: `lwarx`/`stwcx.` and `ldarx`/`stdcx.` (the program takes its locks through the system's libraries, never inline), `dcbz` and every other cache instruction except `dcbt` (58), the string and multiple-word loads and stores, the byte-reversed ones, `mcrxr`, `mtcrf` (the one-field `mtocrf` is used, 425 times, and `mfocrf` 617).
 - Of the loads and stores with update, only `stdu` (9,150: the stack frames), `lbzu` and `stbu` (6 each) and `ldu` (1).
 - One each of `sync`, `tw`, `fsqrts`, `mffs` and `mtfsf`; 13 `mftb` (the time base read directly).
-- **502 `sc` instructions**: the program makes system calls directly, from the system-call wrappers linked into it. A scan for the constant put in `r11` just before finds it at 477 of them: **78 different system calls**, among them the families at 90–108 (semaphores, mutexes, condition variables), 128–147 (event queues, timers), 341–352 (memory), 801–834 (files). The other 25 sites need the control-flow pass.
+- **502 `sc` instructions**: the program makes system calls directly, from the system-call wrappers linked into it. The control-flow pass numbers every one (v0.4.0): **78 different system calls**: 43–48, 70–76, 90–94, 100–108, 114, 128–130, 134–138, 141, 142, 145, 147, 169–173, 178, 181, 182, 190–194, 341, 342, 348, 349, 352, 402, 403, 801–815, 817, 818, 820, 831, 832, 834. By public descriptions of the system-call table these are threads and scheduling, timers, semaphores, mutexes, condition variables, event queues and ports, SPU threads and thread groups, memory, the console, and files. *They are not named in the code yet.*
 - 4,943 `bcctrl` (calls through a pointer: virtual calls, callbacks and the import stubs) and 544 `bcctr` (switches and tail calls).
 
 ### The SPU programs
@@ -213,4 +213,5 @@ What the names say about the game:
 1. ✅ The decrypted program read (v0.3.0).
 2. ✅ Names for the 248 ids. Still to do: names for the 78 system calls.
 3. ✅ The PPU decoder (v0.2.0, `recompiler-core.md`), its profile of the real code and the SPU programs found (v0.3.0).
-4. The decoder against objdump over every word of the real code (it needs a PowerPC objdump where the game is); the control-flow pass, which reads the jump tables and the remaining 25 system calls; the SPU decoder.
+4. ✅ The control-flow pass (v0.4.0, `recompiler-core.md`): every word accounted for.
+5. The decoder against objdump over every word of the real code (it needs a PowerPC objdump where the game is); names for the system calls; the SPU decoder; the archive's directory.

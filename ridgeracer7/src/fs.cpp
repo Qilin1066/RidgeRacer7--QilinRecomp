@@ -17,6 +17,7 @@
 // a directory entry is its type, its name's length and its name.
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -51,6 +52,8 @@ struct Handle {
     stdfs::path path;
     bool writable = false, append = false;
 };
+// A development aid: with RR7_FILES in the environment, every file opened and every read is logged.
+const bool g_trace = std::getenv("RR7_FILES") != nullptr;
 std::mutex g_mutex;
 std::vector<Handle> g_handles(256);  // by descriptor; 0 to 2 are never given (the console's own)
 
@@ -232,6 +235,7 @@ void cellFsOpen(Cpu& c) {
     h.writable = writing;
     h.append = (flags & kAppend) != 0;
     store32(out, fd);
+    if (g_trace) qilin::rt::log("(files) open %s -> %u", path.c_str(), fd);
     c.r[3] = kOk;
 }
 
@@ -266,7 +270,9 @@ void cellFsRead(Cpu& c) {
         c.r[3] = kEfault;
         return;
     }
+    const int64_t from = g_trace ? tell_host(file) : 0;
     const size_t got = std::fread(guest_memory() + buffer, 1, static_cast<size_t>(bytes), file);
+    if (g_trace) qilin::rt::log("(files) read %u: %llu bytes at %lld to %08x, got %zu", static_cast<uint32_t>(c.r[3]), static_cast<unsigned long long>(bytes), static_cast<long long>(from), buffer, got);
     if (out) store64(out, got);
     c.r[3] = kOk;
 }

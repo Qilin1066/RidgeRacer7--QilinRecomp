@@ -33,6 +33,7 @@ struct Import {
 struct Machine {
     qilin::rt::AddressSpace space;
     std::span<const qilin::rt::LiftedFunction> functions;
+    std::span<const qilin::rt::LiftedSpuProgram> spu_programs;
     std::vector<Import> imports;
     std::chrono::steady_clock::time_point started;
     uint32_t next_allocation = kRuntimeArea;
@@ -43,6 +44,8 @@ struct Machine {
     uint32_t natives_count = 0;
 };
 Machine* g_machine = nullptr;
+// A development aid: with RR7_ERRORS in the environment, every error code the system hands the game is logged (a game may ignore one).
+bool g_log_errors = false;
 
 qilin::rt::GuestFn find_function(uint32_t address) {
     const auto& functions = g_machine->functions;
@@ -61,6 +64,7 @@ void on_call(Cpu& c, uint32_t target) {
         thread_enters(import.name.c_str(), 0, static_cast<uint32_t>(c.lr));
         import.handler(c);
         thread_leaves();
+        if (g_log_errors && (c.r[3] >> 16) == 0x8001u) log("(errors) %s returned %08x to %08x", import.name.c_str(), static_cast<uint32_t>(c.r[3]), static_cast<uint32_t>(c.lr));
         return;
     }
     if (target >= kNativeCode && target < kNativeCode + 4 * kNativeFunctions && target % 4 == 0) {
@@ -81,6 +85,7 @@ void on_system_call(Cpu& c, uint32_t pc) {
         thread_enters("a system call", number, pc);
         handler(c);
         thread_leaves();
+        if (g_log_errors && (c.r[3] >> 16) == 0x8001u) log("(errors) system call %u at %08x returned %08x", number, pc, static_cast<uint32_t>(c.r[3]));
         return;
     }
     const qilin::SystemCallName* name = qilin::system_call_name(number);
@@ -124,6 +129,8 @@ void call_guest(Cpu& c, uint32_t code) {
 
 TlsImage tls_image() { return g_machine->tls; }
 
+std::span<const qilin::rt::LiftedSpuProgram> spu_programs() { return g_machine->spu_programs; }
+
 uint32_t native_function(void (*handler)(Cpu&)) {
     uint32_t index;
     {
@@ -152,9 +159,10 @@ uint32_t allocate(uint32_t size, uint32_t alignment) {
     return at;
 }
 
-int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functions, GameInfo info) {
+int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functions, std::span<const qilin::rt::LiftedSpuProgram> spu_programs, GameInfo info) {
     Machine machine;
     g_machine = &machine;
+    machine.spu_programs = spu_programs;
     machine.info = std::move(info);
     machine.functions = functions;
     machine.started = std::chrono::steady_clock::now();
@@ -230,6 +238,7 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
         cpu.r[12] = elf.process_param() ? elf.process_param()->malloc_page_size : 0x100000u;
     }
     start_watch();
+    g_log_errors = std::getenv("RR7_ERRORS") != nullptr;
     set_current_cpu(&cpu);
     const qilin::rt::GuestFn entry = find_function(elf.entry_code());
     if (!entry) fatal("the program's entry point %08x is not among the lifted functions", elf.entry_code());

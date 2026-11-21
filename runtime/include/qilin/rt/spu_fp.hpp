@@ -33,6 +33,9 @@
 // double compares (which the game doesn't use), are outside the lifter's
 // slice.
 //
+// The helpers here are left to the compiler to inline or not: forced into every one of the game's 13,000 uses,
+// they made the lifted SPU code take over twenty minutes to compile. (What that costs at run time is to be measured.)
+//
 // Included by spu.hpp's users after it. Runtime code: no std::format here.
 #pragma once
 
@@ -53,13 +56,13 @@ struct Single {
     uint32_t mantissa = 0;  // 2^23 to 2^24 - 1
     int exponent = 0;
 };
-QILIN_SPU_INLINE Single unpack(uint32_t w) {
+inline Single unpack(uint32_t w) {
     const uint32_t e = (w >> 23) & 0xffu;
     if (e == 0) return {};
     return {false, (w >> 31) != 0, (w & 0x007fffffu) | 0x00800000u, static_cast<int>(e) - 150};
 }
 // The single nearest zero-wards to magnitude * 2^exponent: saturated if too large, +0 if too small or nothing.
-QILIN_SPU_INLINE uint32_t pack(bool negative, uint64_t magnitude, int exponent) {
+inline uint32_t pack(bool negative, uint64_t magnitude, int exponent) {
     if (magnitude == 0) return 0;
     const int top = 63 - std::countl_zero(magnitude);
     if (top > 23) magnitude >>= top - 23;
@@ -70,7 +73,7 @@ QILIN_SPU_INLINE uint32_t pack(bool negative, uint64_t magnitude, int exponent) 
     return (negative ? 0x80000000u : 0u) | (static_cast<uint32_t>(biased) << 23) | (static_cast<uint32_t>(magnitude) & 0x007fffffu);
 }
 // x + y, where each is a magnitude below 2^62 with at least 14 zero bits at its low end, times a power of two.
-QILIN_SPU_INLINE uint32_t sum(bool x_negative, uint64_t x, int x_exponent, bool y_negative, uint64_t y, int y_exponent) {
+inline uint32_t sum(bool x_negative, uint64_t x, int x_exponent, bool y_negative, uint64_t y, int y_exponent) {
     if (x_exponent < y_exponent) {
         std::swap(x_negative, y_negative);
         std::swap(x, y);
@@ -85,20 +88,20 @@ QILIN_SPU_INLINE uint32_t sum(bool x_negative, uint64_t x, int x_exponent, bool 
     if (x > y) return pack(x_negative, x - y - (lost ? 1 : 0), x_exponent);  // (a little less than x - y: the next whole number down)
     return pack(y_negative, y - x, x_exponent);                              // (nothing was lost when y is the larger: its low bits were zeros)
 }
-QILIN_SPU_INLINE uint32_t add32(uint32_t a, uint32_t b, bool subtract) {
+inline uint32_t add32(uint32_t a, uint32_t b, bool subtract) {
     const Single x = unpack(a), y = unpack(b);
     if (x.zero && y.zero) return 0;
     if (y.zero) return a;
     if (x.zero) return subtract ? b ^ 0x80000000u : b;
     return sum(x.negative, uint64_t{x.mantissa} << 38, x.exponent - 38, y.negative != subtract, uint64_t{y.mantissa} << 38, y.exponent - 38);
 }
-QILIN_SPU_INLINE uint32_t multiply32(uint32_t a, uint32_t b) {
+inline uint32_t multiply32(uint32_t a, uint32_t b) {
     const Single x = unpack(a), y = unpack(b);
     if (x.zero || y.zero) return 0;
     return pack(x.negative != y.negative, uint64_t{x.mantissa} * y.mantissa, x.exponent + y.exponent);
 }
 // a * b + c, the product exact; with `negate_product` c - a * b, with `negate_addend` a * b - c.
-QILIN_SPU_INLINE uint32_t fused32(uint32_t a, uint32_t b, uint32_t c, bool negate_product, bool negate_addend) {
+inline uint32_t fused32(uint32_t a, uint32_t b, uint32_t c, bool negate_product, bool negate_addend) {
     const Single x = unpack(a), y = unpack(b), z = unpack(c);
     const bool product_zero = x.zero || y.zero, product_negative = (x.negative != y.negative) != negate_product;
     if (product_zero) return z.zero ? 0u : (negate_addend ? c ^ 0x80000000u : c);
@@ -106,53 +109,53 @@ QILIN_SPU_INLINE uint32_t fused32(uint32_t a, uint32_t b, uint32_t c, bool negat
     if (z.zero) return pack(product_negative, product, x.exponent + y.exponent);
     return sum(product_negative, product << 14, x.exponent + y.exponent - 14, z.negative != negate_addend, uint64_t{z.mantissa} << 38, z.exponent - 38);
 }
-QILIN_SPU_INLINE SpuReg fa(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, false); }); }
-QILIN_SPU_INLINE SpuReg fs(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, true); }); }
-QILIN_SPU_INLINE SpuReg fm(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return multiply32(p, q); }); }
-QILIN_SPU_INLINE SpuReg fma(const SpuReg& a, const SpuReg& b, const SpuReg& c) {
+inline SpuReg fa(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, false); }); }
+inline SpuReg fs(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, true); }); }
+inline SpuReg fm(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return multiply32(p, q); }); }
+inline SpuReg fma(const SpuReg& a, const SpuReg& b, const SpuReg& c) {
     return {{fused32(a.w[0], b.w[0], c.w[0], false, false), fused32(a.w[1], b.w[1], c.w[1], false, false), fused32(a.w[2], b.w[2], c.w[2], false, false),
              fused32(a.w[3], b.w[3], c.w[3], false, false)}};
 }
-QILIN_SPU_INLINE SpuReg fms(const SpuReg& a, const SpuReg& b, const SpuReg& c) {
+inline SpuReg fms(const SpuReg& a, const SpuReg& b, const SpuReg& c) {
     return {{fused32(a.w[0], b.w[0], c.w[0], false, true), fused32(a.w[1], b.w[1], c.w[1], false, true), fused32(a.w[2], b.w[2], c.w[2], false, true),
              fused32(a.w[3], b.w[3], c.w[3], false, true)}};
 }
-QILIN_SPU_INLINE SpuReg fnms(const SpuReg& a, const SpuReg& b, const SpuReg& c) {
+inline SpuReg fnms(const SpuReg& a, const SpuReg& b, const SpuReg& c) {
     return {{fused32(a.w[0], b.w[0], c.w[0], true, false), fused32(a.w[1], b.w[1], c.w[1], true, false), fused32(a.w[2], b.w[2], c.w[2], true, false),
              fused32(a.w[3], b.w[3], c.w[3], true, false)}};
 }
 
 // ---- compares: every word with a zero exponent is the one zero ----
-QILIN_SPU_INLINE int64_t ordered(uint32_t w) {
+inline int64_t ordered(uint32_t w) {
     if (((w >> 23) & 0xffu) == 0) return 0;
     const int64_t magnitude = w & 0x7fffffffu;
     return (w >> 31) ? -magnitude : magnitude;
 }
-QILIN_SPU_INLINE SpuReg fceq(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return ordered(p) == ordered(q) ? 0xffffffffu : 0u; }); }
-QILIN_SPU_INLINE SpuReg fcgt(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return ordered(p) > ordered(q) ? 0xffffffffu : 0u; }); }
-QILIN_SPU_INLINE SpuReg fcmeq(const SpuReg& a, const SpuReg& b) {
+inline SpuReg fceq(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return ordered(p) == ordered(q) ? 0xffffffffu : 0u; }); }
+inline SpuReg fcgt(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return ordered(p) > ordered(q) ? 0xffffffffu : 0u; }); }
+inline SpuReg fcmeq(const SpuReg& a, const SpuReg& b) {
     return words(a, b, [](uint32_t p, uint32_t q) { return ordered(p & 0x7fffffffu) == ordered(q & 0x7fffffffu) ? 0xffffffffu : 0u; });
 }
-QILIN_SPU_INLINE SpuReg fcmgt(const SpuReg& a, const SpuReg& b) {
+inline SpuReg fcmgt(const SpuReg& a, const SpuReg& b) {
     return words(a, b, [](uint32_t p, uint32_t q) { return ordered(p & 0x7fffffffu) > ordered(q & 0x7fffffffu) ? 0xffffffffu : 0u; });
 }
 
 // ---- conversions with whole numbers: `scale` is the number of bits after the binary point (0 to 127) ----
-QILIN_SPU_INLINE SpuReg csflt(const SpuReg& a, int scale) {
+inline SpuReg csflt(const SpuReg& a, int scale) {
     return words(a, [scale](uint32_t w) {
         const bool negative = (w >> 31) != 0;
         return pack(negative, negative ? uint64_t{0u - w} : uint64_t{w}, -scale);
     });
 }
-QILIN_SPU_INLINE SpuReg cuflt(const SpuReg& a, int scale) { return words(a, [scale](uint32_t w) { return pack(false, w, -scale); }); }
+inline SpuReg cuflt(const SpuReg& a, int scale) { return words(a, [scale](uint32_t w) { return pack(false, w, -scale); }); }
 // The whole part of |x| * 2^scale, or 2^32 if it is that or more.
-QILIN_SPU_INLINE uint64_t whole(const Single& x, int scale) {
+inline uint64_t whole(const Single& x, int scale) {
     const int up = x.exponent + scale;
     if (up > 8) return uint64_t{1} << 32;
     if (up >= 0) return uint64_t{x.mantissa} << up;
     return up <= -32 ? 0 : uint64_t{x.mantissa} >> -up;
 }
-QILIN_SPU_INLINE SpuReg cflts(const SpuReg& a, int scale) {
+inline SpuReg cflts(const SpuReg& a, int scale) {
     return words(a, [scale](uint32_t w) -> uint32_t {
         const Single x = unpack(w);
         if (x.zero) return 0;
@@ -161,7 +164,7 @@ QILIN_SPU_INLINE SpuReg cflts(const SpuReg& a, int scale) {
         return magnitude > 0x7fffffffu ? 0x7fffffffu : static_cast<uint32_t>(magnitude);
     });
 }
-QILIN_SPU_INLINE SpuReg cfltu(const SpuReg& a, int scale) {
+inline SpuReg cfltu(const SpuReg& a, int scale) {
     return words(a, [scale](uint32_t w) -> uint32_t {
         const Single x = unpack(w);
         if (x.zero || x.negative) return 0;
@@ -173,11 +176,11 @@ QILIN_SPU_INLINE SpuReg cfltu(const SpuReg& a, int scale) {
 // ---- the estimates, and the interpolation that uses them ----
 // fi: b is a sign, an exponent, a base 1.BBBBBBBBBBBBB and a step 0.000SSSSSSSSSS; Y is a's low 19 bits as a
 // fraction. The result is (base - step * Y) * 2^(exponent - 127), exactly, then cut to a single.
-QILIN_SPU_INLINE uint32_t interpolate32(uint32_t a, uint32_t b) {
+inline uint32_t interpolate32(uint32_t a, uint32_t b) {
     const uint64_t base = 0x2000u | ((b >> 10) & 0x1fffu), step = b & 0x3ffu, y = a & 0x7ffffu;
     return pack((b >> 31) != 0, (base << 19) - step * y, static_cast<int>((b >> 23) & 0xffu) - 127 - 32);
 }
-QILIN_SPU_INLINE SpuReg fi(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return interpolate32(p, q); }); }
+inline SpuReg fi(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return interpolate32(p, q); }); }
 
 // The base and step (as the low 23 bits of a result) for each of 32 pieces of [1, 2), for a function that falls and
 // curves upward there (2/m; 2/sqrt(m); sqrt(2)/sqrt(m)), as the top of the file says.
@@ -218,15 +221,15 @@ inline SpuReg frsqest(const SpuReg& a) { return words(a, [](uint32_t w) { return
 
 // ---- double precision: two to a register ----
 inline constexpr uint64_t kDefaultNan64 = 0x7ff8000000000000ull;
-QILIN_SPU_INLINE uint64_t pair(const SpuReg& v, unsigned i) { return (uint64_t{v.w[2 * i]} << 32) | v.w[2 * i + 1]; }
-QILIN_SPU_INLINE bool nan64(uint64_t d) { return (d & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; }
+inline uint64_t pair(const SpuReg& v, unsigned i) { return (uint64_t{v.w[2 * i]} << 32) | v.w[2 * i + 1]; }
+inline bool nan64(uint64_t d) { return (d & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; }
 // An operand: a denormal is zero, with its sign.
-QILIN_SPU_INLINE double operand64(uint64_t d) {
+inline double operand64(uint64_t d) {
     if ((d & 0x7ff0000000000000ull) == 0) d &= 0x8000000000000000ull;
     return std::bit_cast<double>(d);
 }
 template <typename F>
-QILIN_SPU_INLINE SpuReg doubles(const SpuReg& a, const SpuReg& b, F f) {
+inline SpuReg doubles(const SpuReg& a, const SpuReg& b, F f) {
     SpuReg r;
     for (unsigned i = 0; i < 2; ++i) {
         const uint64_t x = pair(a, i), y = pair(b, i);
@@ -240,11 +243,11 @@ QILIN_SPU_INLINE SpuReg doubles(const SpuReg& a, const SpuReg& b, F f) {
     }
     return r;
 }
-QILIN_SPU_INLINE SpuReg dfa(const SpuReg& a, const SpuReg& b) { return doubles(a, b, [](double x, double y) { return x + y; }); }
-QILIN_SPU_INLINE SpuReg dfs(const SpuReg& a, const SpuReg& b) { return doubles(a, b, [](double x, double y) { return x - y; }); }
-QILIN_SPU_INLINE SpuReg dfm(const SpuReg& a, const SpuReg& b) { return doubles(a, b, [](double x, double y) { return x * y; }); }
+inline SpuReg dfa(const SpuReg& a, const SpuReg& b) { return doubles(a, b, [](double x, double y) { return x + y; }); }
+inline SpuReg dfs(const SpuReg& a, const SpuReg& b) { return doubles(a, b, [](double x, double y) { return x - y; }); }
+inline SpuReg dfm(const SpuReg& a, const SpuReg& b) { return doubles(a, b, [](double x, double y) { return x * y; }); }
 // fesd: the single in the left word of each pair, as a double. frds: each double as a single in the left word, zeros in the right.
-QILIN_SPU_INLINE SpuReg fesd(const SpuReg& a) {
+inline SpuReg fesd(const SpuReg& a) {
     SpuReg r;
     for (unsigned i = 0; i < 2; ++i) {
         uint32_t w = a.w[2 * i];
@@ -260,7 +263,7 @@ QILIN_SPU_INLINE SpuReg fesd(const SpuReg& a) {
     }
     return r;
 }
-QILIN_SPU_INLINE SpuReg frds(const SpuReg& a) {
+inline SpuReg frds(const SpuReg& a) {
     SpuReg r;
     for (unsigned i = 0; i < 2; ++i) {
         const uint64_t d = pair(a, i);

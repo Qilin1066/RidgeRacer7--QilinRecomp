@@ -241,7 +241,7 @@ target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt PRIVATE qil
 target_include_directories(ridgeracer7_machine SYSTEM PRIVATE $<TARGET_PROPERTY:freetype,INTERFACE_INCLUDE_DIRECTORIES>)
 set(QILIN_GEN_DIR "" CACHE PATH "The folder `qilin lift <game> --out` wrote: the lifted code of your own copy")
 if(QILIN_GEN_DIR)
-    if(NOT EXISTS "${QILIN_GEN_DIR}/table.cpp")
+    if(NOT EXISTS "${QILIN_GEN_DIR}/table.cpp" OR NOT EXISTS "${QILIN_GEN_DIR}/spu_table.cpp")
         message(FATAL_ERROR "QILIN_GEN_DIR (${QILIN_GEN_DIR}) holds no lifted code: run `qilin lift <game> --out ${QILIN_GEN_DIR}` first")
     endif()
     file(GLOB qilin_lifted CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")

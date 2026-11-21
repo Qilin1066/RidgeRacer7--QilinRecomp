@@ -65,5 +65,5 @@ int main(int argc, char** argv) {
         static qilin::host::AudioOut out;
         out.push(left_right, frames, 48000);
     });
-    return rr7::run(*elf, {qilin::rt::kLiftedFunctions, qilin::rt::kLiftedFunctionCount}, std::move(info));
+    return rr7::run(*elf, {qilin::rt::kLiftedFunctions, qilin::rt::kLiftedFunctionCount}, {qilin::rt::kLiftedSpuPrograms, qilin::rt::kLiftedSpuProgramCount}, std::move(info));
 }

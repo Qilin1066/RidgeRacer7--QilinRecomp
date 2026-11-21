@@ -21,9 +21,6 @@ namespace rr7 {
 
 namespace {
 
-// Errors beyond kernel.hpp's (the SDK's list, as recalled: *to be confirmed*).
-constexpr uint64_t kEcanceled = 0x80010013u, kEisconn = 0x80010015u, kEnotconn = 0x80010016u;
-
 struct Queue {
     std::mutex mutex;
     std::condition_variable arrived;
@@ -224,6 +221,17 @@ uint64_t send_event(uint32_t queue_id, const Event& event) {
         queue->events.push_back(event);
     }
     queue->arrived.notify_one();
+    return kOk;
+}
+
+uint64_t receive_event(uint32_t queue_id, Event& event) {
+    const auto queue = g_queues.find(queue_id);
+    if (!queue) return kEsrch;
+    std::unique_lock lock(queue->mutex);
+    queue->arrived.wait(lock, [&] { return !queue->events.empty() || queue->destroyed; });
+    if (queue->events.empty()) return kEcanceled;
+    event = queue->events.front();
+    queue->events.pop_front();
     return kOk;
 }
 

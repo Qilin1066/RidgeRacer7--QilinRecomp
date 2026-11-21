@@ -29,7 +29,7 @@ The script builds `qilin`, lifts your copy's program to C++ (`qilin lift <game> 
 
 Each was added when the game reached it, and does what the system's function does as far as the game can tell. The files are in `ridgeracer7/src/`.
 
-**Imports** (103 of the game's 248):
+**Imports** (105 of the game's 248):
 
 | | Functions | What they are here |
 |---|---|---|
@@ -50,7 +50,7 @@ Each was added when the game reached it, and does what the system's function doe
 | `pad.cpp` | `cellPadInit`, `cellPadEnd`, `cellPadGetInfo`, `cellPadGetData` and the five others by port | **a console with no controller plugged in**: host input isn't connected yet, and "no device" is an answer the real system gives |
 | `usbd.cpp` | `cellUsbdInit`, `cellUsbdRegisterExtraLdd`, `cellUsbdUnregisterExtraLdd` | **a USB bus with nothing on it**: the game's own driver (for steering wheels) is registered and, since nothing attaches, never called |
 
-**System calls** (42 of the game's 78):
+**System calls** (54 of the game's 78):
 
 | | Calls | |
 |---|---|---|
@@ -60,7 +60,7 @@ Each was added when the game reached it, and does what the system's function doe
 | `events.cpp` | 128-130, 134-138 | event queues and ports. The receive call returns its event in `r4` to `r7`: read off the game's code after each `sc` |
 | `timers.cpp` | 70, 71, 73-76 | timers that send an event when due, served by one host thread. (Their names were among the ten unconfirmed; the game's use of them fits) |
 | `tty.cpp` | 402, 403 | the console's terminal: what the game prints goes to the log as `[the game] ...` |
-| `spu.cpp` | 169 | the process says how many SPUs it will use (six, none raw) |
+| `spu.cpp` | 169-173, 178, 181, 182, 190-194 (and the imports `sys_spu_image_import`, `sys_spu_image_close`) | SPU threads (below) |
 
 **Not yet as designed: the scheduler.** Every guest thread simply runs as a host thread; priorities are kept and reported but decide nothing, and apart from semaphores waiters are woken in the host's order. The roadmap's design lets two guest threads run guest code at once, by priority, as the console's two hardware threads do. Until that exists, a game that leans on the console's order of running could go wrong here: when something looks like a race, this is the first suspect.
 
@@ -82,6 +82,20 @@ The game draws its text with the system's font library: it opens one of the cons
 - **The console's fonts are the player's to supply, as the game is**: the `data/font` folder of a PS3's system software. Sony publishes the system software file (`PS3UPDAT.PUP`) on its support site; RPCS3 installs it (`rpcs3 --installfw PS3UPDAT.PUP`) and leaves a `dev_flash` folder beside itself. `ridgeracer7 <game> --flash <dev_flash>` names it; without the option, an `RPCS3` folder beside the game's is looked in. Nothing stands in for a missing font: the game stops and says what it needs.
 - *Stated choices, to be compared with the console's picture:* glyphs are loaded unhinted; "scale pixel" is the em's size in pixels; glyphs sit on whole pixels; font set `0x101` is New Rodin's Japanese font with the extension font behind it. A character the font doesn't have stops the game (the library's answer to that isn't known here).
 
+## SPU threads (`spu.cpp`)
+
+The game hands the system an SPU program (an ELF file in its own memory), makes a group of threads, gives each a program and four arguments, and starts the group. **A thread here is a host thread running the program's lifted code**: `qilin lift` lifts each of the 42 programs, the one to run is found by where its ELF file lies in the game's memory, and a program that was not lifted stops the game (every SPU program must be known when the game is built). A group can be started again after it ends: each start loads the program's segments afresh.
+
+What an SPU program does beyond its own 256 KiB arrives as the lifted code's hooks:
+
+- **Memory transfers** (channels 16 to 24): get and put between the SPU's memory and the game's, singly or by a list, **done at once when commanded**, so every tag is always complete. The atomic pair (get a 128-byte line with a reservation; put it back only if nobody changed it) is done by comparing: *a put succeeds if the line still holds what was read.* That is how a lost reservation shows in everything but a change back to the same bytes, and it is a stated difference from a console.
+- **Mailboxes** (28 to 30): a word in from the game, a word out, and the "interrupt" word by which a thread sends one of the game's event queues an event (`sys_spu_thread_send_event`, and with bit 30 `throw_event`, which the game's programs use). *The event's layout (the SPU key, the thread's id, the port and 24 bits of data, the mailbox word) is from public descriptions of the system: to be checked against the game's reading of it.*
+- **Stops**: `0x101` ends the group, `0x102` the thread, `0x110` waits for an event from a queue bound to the thread. Any other stops the game with its code, as does a channel or a transfer command not provided.
+
+**The first to run is the sound core**: `bnusCoreSpu.elf`, thread `bnusCoreMain` in group `bnusCore`, started as soon as the sound port is open. (The game numbers the one thread of that group "1": a thread's number is its own, not a place below the group's size, which this runtime first got wrong; the game ignores the error.)
+
+*Not as a console does it:* SPU threads run freely, each on a host thread, with no priorities, as the PPU's do.
+
 ## Files (`fs.cpp`, `gamedata.cpp`)
 
 A game names files by the console's mount points, and each is a folder of the host's:
@@ -101,13 +115,16 @@ A path is kept inside its mount point (`..` can't climb out), and a name under n
 
 - **A bad memory access is reported** (`fault.cpp`): the guest address, the thread, and the lifted functions on the stack, found from the host's return addresses. Then the process stops, as for any other unknown. Before this a fault ended the process without a word.
 - `qilin lift --pc` makes lifted code note each instruction's address before it touches memory (`Cpu::pc`), and the report then names the instruction. It is slower, so it is for finding faults, not for playing.
+- `RR7_ERRORS` logs every error code the system hands the game (a game may ignore one, and did). `RR7_FILES` logs every file opened and every read.
 - Two aids in the environment, neither a way to play: `RR7_WATCH=<seconds>` prints what system function each guest thread is inside after that long, and stops; `RR7_RSX_SURVEY` counts the RSX methods not yet provided up to the first flip, without running them, prints the list and stops.
 
 ## Where it stops now
 
-After v0.13.0: **system call 170, `sys_spu_thread_group_create`**: the game has opened its sound port and now starts its sound core, an SPU program (`bnusCoreSpu.elf`), as an SPU thread. Before that it stopped at `cellAudioInit`: By then the game has started SPURS (4 SPUs) and made four tasksets, entered its main loop's system-event check, looked for its game data on the hard disk, opened a directory on the disc, started the network and PlayStation Network libraries (and been told: no cable, not signed in), and set the sound output to stereo. Nothing is left in front of the SPU lifter now.
+After v0.13.0: **a fault in the game's own code** (`0x13bd38`, in the function at `0x13ba90`, on the first thread): a read at an address that is not memory. By then the game has started SPURS and made four tasksets, looked for its game data, started the network libraries (no cable, not signed in), set the sound output to stereo, opened its sound port, **started its sound core as an SPU thread, which runs**, and begun reading `RR7.DAT`: the packs `SoundCommon`, `DjCommon`, `DB`, `CommonCar`, one at 5.06 GB, `Text`, `TextFr` and `Text_TGS`.
 
-Still ahead, and large: **the SPU lifter** (the first SPURS task or SPU thread the game starts needs its program lifted; all 42 programs end with the system's "thread exit" stop, `0x102`, so they are built as plain SPU threads, whatever SPURS is handed), and **the RSX's drawing on Vulkan**.
+The function that faults is going over a table read from the last of those, exchanging the byte order of its words in place; the word it then uses as an offset is `0x48000000`, as if a word already in the PPU's order had been exchanged. **Open, and next:** whether the pack was unpacked wrongly (the unpacker is the game's own, lifted: a lifter fault would show here), whether two threads are at the table at once (the scheduler), or whether the game is being told something that sends it to the wrong pack (it loads the French text, and a pack left from a trade-show build, on a console set to English).
+
+Still ahead, and large: **SPURS tasks** (the game makes tasksets; creating a task stops it), and **the RSX's drawing on Vulkan**.
 
 ## Checked
 

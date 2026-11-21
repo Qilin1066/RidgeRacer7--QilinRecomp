@@ -12,6 +12,9 @@ struct Event {
 // Puts an event on a queue. Returns the system's code: 0, "no such queue", or "busy" if it is full.
 uint64_t send_event(uint32_t queue_id, const Event& event);
 
+// Takes the next event from a queue, waiting for one. Returns the system's code: 0, "no such queue", or "cancelled" if the queue was destroyed.
+uint64_t receive_event(uint32_t queue_id, Event& event);
+
 // The queue made with this key, or 0. (A key is how one part of a program names a queue to another.)
 uint32_t event_queue_by_key(uint64_t key);
 

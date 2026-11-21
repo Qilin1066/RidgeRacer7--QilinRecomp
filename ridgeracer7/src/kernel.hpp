@@ -17,7 +17,7 @@ namespace rr7 {
 inline constexpr uint64_t kOk = 0;
 inline constexpr uint64_t kEagain = 0x80010001u, kEinval = 0x80010002u, kEnosys = 0x80010003u, kEnomem = 0x80010004u, kEsrch = 0x80010005u,
                           kEnoent = 0x80010006u, kEdeadlk = 0x80010008u, kEperm = 0x80010009u, kEbusy = 0x8001000Au, kEtimedout = 0x8001000Bu,
-                          kEfault = 0x8001000Du;
+                          kEfault = 0x8001000Du, kEcanceled = 0x80010013u, kEisconn = 0x80010015u, kEnotconn = 0x80010016u;
 
 // The id of the guest thread this host thread runs.
 uint32_t current_thread();

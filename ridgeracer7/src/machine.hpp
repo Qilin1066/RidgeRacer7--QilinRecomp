@@ -41,6 +41,7 @@ std::span<const NativeImport> pad_imports();      // pad.cpp
 std::span<const NativeImport> usbd_imports();     // usbd.cpp
 std::span<const NativeImport> mempool_imports();  // mempool.cpp
 std::span<const NativeImport> gcm_imports();      // gcm.cpp
+std::span<const NativeImport> spu_imports();      // spu.cpp
 std::span<const NativeImport> audio_imports();  // audio.cpp
 std::span<const NativeImport> np_imports();  // np.cpp
 std::span<const NativeImport> net_imports();  // net.cpp
@@ -90,7 +91,9 @@ const GameInfo& game();
 // Loads the program into a new address space, sets up the first thread and
 // runs the entry point. Returns the process's exit code. `functions` are the
 // lifted functions, in address order.
-int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functions, GameInfo info);
+int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functions, std::span<const qilin::rt::LiftedSpuProgram> spu_programs, GameInfo info);
+// The game's SPU programs, lifted (spu.cpp runs them).
+std::span<const qilin::rt::LiftedSpuProgram> spu_programs();
 
 // From now on a bad memory access is reported, with the guest's address and call stack, before the process stops (fault.cpp).
 void report_faults(std::span<const qilin::rt::LiftedFunction> functions);

@@ -34,6 +34,8 @@ struct State {
 
 // Runs one instruction that is not a branch. False if the reference doesn't know it.
 bool step(State& s, const qilin::spu::Insn& in, uint32_t pc);
+// The floating-point instructions (ref_fp.cpp); `step` calls it.
+bool step_fp(State& s, const qilin::spu::Insn& in);
 
 // What reading a channel, or asking its count, gives in the test (the runner's hooks answer the same).
 inline uint32_t channel_value(uint32_t channel) { return 0xC0DE0000u + channel * 0x101u; }

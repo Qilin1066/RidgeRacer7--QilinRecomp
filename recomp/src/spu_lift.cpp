@@ -17,7 +17,22 @@ bool spu_in_slice(const Insn& in, std::string* why) {
     };
     if (!in.valid()) return no("an invalid word");
     const spu::Spec& s = spu::spec(in.op);
-    if (s.flags & spu::kFloat) return no(std::format("SPU floating point ({})", s.name));
+    switch (in.op) {
+    case Op::fa: case Op::fs: case Op::fm: case Op::fma: case Op::fms: case Op::fnms: case Op::fceq: case Op::fcgt: case Op::fcmeq: case Op::fcmgt:
+    case Op::frest: case Op::frsqest: case Op::fi: case Op::dfa: case Op::dfs: case Op::dfm: case Op::fesd: case Op::frds:
+        return true;
+    // The scale is 155 or 173 less the field, and is defined only from 0 to 127.
+    case Op::csflt: case Op::cuflt:
+        if (in.u8() < 28 || in.u8() > 155) return no(std::format("an {} whose scale the instruction set leaves undefined", s.name));
+        return true;
+    case Op::cflts: case Op::cfltu:
+        if (in.u8() < 46 || in.u8() > 173) return no(std::format("an {} whose scale the instruction set leaves undefined", s.name));
+        return true;
+    case Op::fscrrd: case Op::fscrwr: return no(std::format("the SPU's floating-point status and control register ({})", s.name));
+    default:
+        if (s.flags & spu::kFloat) return no(std::format("SPU floating point the game doesn't use ({})", s.name));
+        break;
+    }
     switch (in.op) {
     case Op::iret: case Op::bisled: return no(std::format("SPU interrupts ({})", s.name));
     case Op::mfspr: case Op::mtspr: return no(std::format("an SPU special-purpose register ({})", s.name));
@@ -294,6 +309,30 @@ private:
             line(std::format("if (static_cast<int32_t>({}.w[0]) > {}) s.hooks->halt(s, {}, \"hgti\");", R(a), in.i10(), hex(pc)));
             return true;
         case Op::hlgti: line(std::format("if ({}.w[0] > {}) s.hooks->halt(s, {}, \"hlgti\");", R(a), hex(i10), hex(pc))); return true;
+
+        // ---------------------------------------------------------------- floating point (spu_fp.hpp)
+        case Op::fa: rr("fa"); return true;
+        case Op::fs: rr("fs"); return true;
+        case Op::fm: rr("fm"); return true;
+        case Op::fceq: rr("fceq"); return true;
+        case Op::fcgt: rr("fcgt"); return true;
+        case Op::fcmeq: rr("fcmeq"); return true;
+        case Op::fcmgt: rr("fcmgt"); return true;
+        case Op::fi: rr("fi"); return true;
+        case Op::dfa: rr("dfa"); return true;
+        case Op::dfs: rr("dfs"); return true;
+        case Op::dfm: rr("dfm"); return true;
+        case Op::frest: r1("frest"); return true;
+        case Op::frsqest: r1("frsqest"); return true;
+        case Op::fesd: r1("fesd"); return true;
+        case Op::frds: r1("frds"); return true;
+        case Op::fma: line(std::format("{} = spu::fma({}, {}, {});", R(in.rt4()), R(a), R(b), R(t))); return true;
+        case Op::fms: line(std::format("{} = spu::fms({}, {}, {});", R(in.rt4()), R(a), R(b), R(t))); return true;
+        case Op::fnms: line(std::format("{} = spu::fnms({}, {}, {});", R(in.rt4()), R(a), R(b), R(t))); return true;
+        case Op::csflt: line(std::format("{} = spu::csflt({}, {});", R(t), R(a), 155 - static_cast<int>(in.u8()))); return true;
+        case Op::cuflt: line(std::format("{} = spu::cuflt({}, {});", R(t), R(a), 155 - static_cast<int>(in.u8()))); return true;
+        case Op::cflts: line(std::format("{} = spu::cflts({}, {});", R(t), R(a), 173 - static_cast<int>(in.u8()))); return true;
+        case Op::cfltu: line(std::format("{} = spu::cfltu({}, {});", R(t), R(a), 173 - static_cast<int>(in.u8()))); return true;
 
         // ---------------------------------------------------------------- channels and stops
         case Op::rdch: line(std::format("{} = SpuReg{{{{s.hooks->read_channel(s, {}u, {}), 0u, 0u, 0u}}}};", R(t), a, hex(pc))); return true;

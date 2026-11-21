@@ -299,6 +299,7 @@ add_custom_command(
 add_executable(qilin_spu_difftest
     recomp/tests/spu_difftest/run.cpp
     recomp/tests/spu_difftest/ref.cpp
+    recomp/tests/spu_difftest/ref_fp.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/spu_difftest_cases.cpp)
 target_include_directories(qilin_spu_difftest PRIVATE recomp/tests/spu_difftest)
 target_link_libraries(qilin_spu_difftest PRIVATE qilin_recomp qilin_rt qilin_warnings)

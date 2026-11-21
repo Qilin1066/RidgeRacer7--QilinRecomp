@@ -258,3 +258,23 @@ Started after v0.13.0, when the game reached the first thing that needs an SPU p
 **Slice 1: everything but floating point. 1,719 of the 2,332 functions lift.** Every one of the other 613 is stopped by a floating-point instruction (`fm` in 225, `fcgt` in 143, `fs` in 101, ...): nothing else is in the way.
 
 **The differential test** (`recomp/tests/spu_difftest`, `qilin_spu_difftest` in `ctest`) is the PPU test's twin: the generator lifts random encodings of every instruction in the slice that is not a branch (148 instructions, 3,552 cases), the runner runs each from 64 states (227,328 runs) as lifted code and by a separately written reference, and compares all 128 registers, the whole local store after a store, what was written to a channel, a stop's code and whether a halt fired. The reference (`ref.cpp`) is in another shape on purpose: a register is sixteen bytes, elements are read and written by width and number, and the whole-register shifts work on the register as one 128-bit number, where the helpers work on words and bytes. **All agree**; with `sumb`'s halves exchanged and `rotqmby`'s count cut short on purpose it gave 7,908 disagreements. *Branches, calls and the switch need a program around them, and are not in this test: they are checked by the game's own programs running.*
+
+### Slice 2: floating point (`runtime/include/qilin/rt/spu_fp.hpp`)
+
+**2,330 of the 2,332 functions now lift.** The two left read and write the floating-point status and control register (`fscrrd`, `fscrwr`: one program's library functions), which is not kept, as the PPU's is not.
+
+The source is IBM's public *Synergistic Processor Unit Instruction Set Architecture* (version 1.2, January 2007), section 9, read from the Internet Archive's copy.
+
+**Single precision is not IEEE's**, and is done in whole numbers, exactly:
+
+- a word with a zero exponent is zero whatever its sign and fraction (no denormals); every other word is an ordinary number, the largest exponent included (no infinities, no NaNs);
+- results are truncated toward zero, the only mode there is; a result too large becomes the largest number of its sign (`0x7FFFFFFF`, `0xFFFFFFFF`), one too small becomes zero, and a zero result is always +0;
+- `fma`, `fms` and `fnms` multiply exactly and round once.
+
+So a sum is aligned in 64 bits with what falls off remembered, a product is exact in 48 bits, and the result is cut once (`pack`). The compares take every zero-exponent word as the one zero. The conversions' scale is 155 or 173 less the instruction's field and is defined from 0 to 127: an instruction outside that is outside the slice.
+
+**`fi` is defined exactly** by the document (a base `1.BBBBBBBBBBBBB`, a step `0.000SSSSSSSSSS`, and the operand's low 19 bits as the fraction between them) and is exact here. **The estimates' base and step are an implementation's own**: the document gives their form and how good the result must be after its Newton-Raphson step, not their values, and a console's are not known here. *The stated choice:* 32 straight pieces to the binade for 1/x, and 64 for 1/sqrt(x) (32 for each parity of the exponent), each the line through its piece's ends lowered by half its error at the middle, rounded to the 13 and 10 bits the form has. A result can differ from a console's in the low bits. ***Open:*** *a console's tables, which would replace this.*
+
+**Double precision** (three instructions and the two conversions, in three programs) is IEEE's on the host's doubles, with two choices the document leaves to the implementation, stated: a denormal operand is zero with its sign, and a NaN result is always the default one. Rounding is to nearest. The fused double forms and the double compares, which the game doesn't use, are outside the slice.
+
+**Checked.** The differential test now has **4,080 cases and 362,496 runs, all agree**. The reference's floating point (`ref_fp.cpp`) uses another method on purpose: every number is put whole into one 704-bit unsigned number at its true place, sums and differences are exact, and only then is the answer cut to 24 bits; it builds the estimates' tables by whole numbers of 2^-40. Float cases draw their operands from singles of every kind (zeros, denormals, the ends of the range, the largest exponent, neighbours that cancel). With the sum's borrow left out on purpose: 24,068 disagreements. **The estimates are also checked against the document's own bound**: over 2,000,000 numbers, its two sequences (estimate, interpolate, one Newton-Raphson step) give the largest single below the true value or the one beside it, as it requires (the furthest is 1 unit for each); with the tables' lowering turned the wrong way on purpose, 1,839,906 of them break the bound.

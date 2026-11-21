@@ -47,7 +47,7 @@ int main(int argc, char** argv) {
     }
     std::ofstream f(argv[1], std::ios::binary);
     f << "// Written by qilin_spu_difftest_gen: the SPU lifter's output for the differential test's cases.\n"
-         "#include \"ref.hpp\"\n\nusing namespace qilin::rt;\n\n"
+         "#include \"qilin/rt/spu_fp.hpp\"\n#include \"ref.hpp\"\n\nusing namespace qilin::rt;\n\n"
       << functions << "\nnamespace spu_difftest {\nconst Case kCases[] = {\n"
       << table << "};\nconst size_t kCaseCount = " << count << ";\n}  // namespace spu_difftest\n";
     f.close();

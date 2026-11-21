@@ -870,7 +870,7 @@ int cmd_lift(const Args& a) {
                 ++it->functions;
             }
             spu_files.emplace_back(space + ".cpp",
-                                   std::format("// Lifted from one of the game's SPU programs by qilin: do not share.\n#include \"qilin/rt/spu.hpp\"\nusing namespace qilin::rt;\n\n"
+                                   std::format("// Lifted from one of the game's SPU programs by qilin: do not share.\n#include \"qilin/rt/spu.hpp\"\n#include \"qilin/rt/spu_fp.hpp\"\nusing namespace qilin::rt;\n\n"
                                                "namespace {} {{\n\nvoid call(Spu& s, uint32_t target, uint32_t pc);\n{}{}\n"
                                                "// The function at an address the program worked out.\nvoid call(Spu& s, uint32_t target, uint32_t pc) {{\n    switch (target) {{\n{}"
                                                "    default: s.hooks->halt(s, pc, \"a branch through a register to an address that is not a function\");\n    }}\n}}\n\n}}  // namespace {}\n",

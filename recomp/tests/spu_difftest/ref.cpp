@@ -338,7 +338,7 @@ bool step(State& s, const Insn& in, uint32_t pc) {
     case Op::stop: s.stopped = true, s.stop_code = in.u14(); return true;
     case Op::stopd: s.stopped = true, s.stop_code = 0x3fff; return true;
     case Op::nop: case Op::lnop: case Op::sync: case Op::dsync: case Op::hbr: case Op::hbra: case Op::hbrr: return true;
-    default: return false;
+    default: return step_fp(s, in);
     }
 }
 

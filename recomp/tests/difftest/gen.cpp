@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
     // ---- one instruction, then blr ----
     size_t covered = 0;
     for (const ppu::Spec& s : ppu::specs()) {
-        if ((s.flags & ppu::kBranch) || s.op == Op::sc || s.op == Op::tw || s.op == Op::td || s.op == Op::twi || s.op == Op::tdi) continue;
+        if ((s.flags & ppu::kBranch) || s.op == Op::sc || s.op == Op::mftb || s.op == Op::tw || s.op == Op::td || s.op == Op::twi || s.op == Op::tdi) continue;
         uint32_t fields = (s.flags & ppu::kRc) ? 1u : 0u;
         for (const ppu::Opnd o : s.operands) fields |= ppu::field_mask(o);
         const bool memory = s.flags & (ppu::kLoad | ppu::kStore);
@@ -159,6 +159,10 @@ int main(int argc, char** argv) {
         const uint32_t pc = out.pc(), bcctr = 0x4E800420u;
         JumpTable table{pc, pc + 4, {pc + 16, pc + 24, pc + 16}, true};
         ok &= out.add(Kind::Switch, bcctr, {{pc, bcctr}, {pc + 16, li_r3(1)}, {pc + 20, kBlr}, {pc + 24, li_r3(2)}, {pc + 28, kBlr}}, {table});
+    }
+    for (const uint32_t mftb : {0x7C6C42E6u, 0x7C8D42E6u}) {  // mftb r3,268 and mftb r4,269
+        const uint32_t pc = out.pc();
+        ok &= out.add(Kind::TimeBase, mftb, {{pc, mftb}, {pc + 4, kBlr}});
     }
     if (!ok) return 1;
 

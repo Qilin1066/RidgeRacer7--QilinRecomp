@@ -65,13 +65,20 @@ bool in_slice(const Insn& in, std::string* why) {
     if (!in.valid()) return no("an invalid word");
     const ppu::Spec& s = ppu::spec(in.op);
     if (s.flags & ppu::kVector) return no("VMX");
-    if (s.flags & ppu::kFloat) return no("floating point");
+    if (s.flags & ppu::kFloat) {
+        switch (in.op) {
+        case Op::mffs: case Op::mtfsf: case Op::mtfsfi: case Op::mtfsb0: case Op::mtfsb1: case Op::mcrfs:
+            return no(std::format("FPSCR access ({})", s.name));
+        case Op::fres: case Op::frsqrte: return no(std::format("an estimate ({})", s.name));
+        default: break;
+        }
+        if ((s.flags & ppu::kRc) && in.rc()) return no(std::format("floating-point record form ({}.)", s.name));
+    }
     if ((s.flags & ppu::kOe) && in.oe()) return no(std::format("overflow-enable form ({}o)", s.name));
     switch (in.op) {
     case Op::lmw: case Op::stmw: case Op::lswi: case Op::lswx: case Op::stswi: case Op::stswx:
         return no("multiple or string load/store");
     case Op::lwarx: case Op::ldarx: case Op::stwcx_rc: case Op::stdcx_rc: return no("atomic sequence");
-    case Op::mftb: return no("time base");
     case Op::mcrxr: return no("mcrxr");
     case Op::dcbz: return no("dcbz");
     case Op::mfspr: case Op::mtspr: {
@@ -151,6 +158,10 @@ private:
         crs_.insert(n);
         return std::format("cr{}", n);
     }
+    std::string F(unsigned n) {
+        fprs_.insert(n);
+        return std::format("f{}", n);
+    }
     std::string use(const char* n) {
         specials_.insert(n);
         return n;
@@ -165,6 +176,7 @@ private:
         std::string p;
         for (const unsigned n : gprs_) p += std::format("    uint64_t r{0} = c.r[{0}];\n", n);
         for (const unsigned n : crs_) p += std::format("    uint32_t cr{0} = (c.cr >> {1}) & 15u;\n", n, 28 - 4 * n);
+        for (const unsigned n : fprs_) p += std::format("    double f{0} = c.f[{0}];\n", n);
         if (specials_.contains("lr")) p += "    uint64_t lr = c.lr;\n";
         if (specials_.contains("ctr")) p += "    uint64_t ctr = c.ctr;\n";
         if (specials_.contains("so")) p += "    uint32_t so = c.xer_so;\n";
@@ -183,6 +195,10 @@ private:
         for (const unsigned n : gprs_) {
             out_s += std::format("c.r[{0}] = r{0}; ", n);
             in_s += std::format("r{0} = c.r[{0}]; ", n);
+        }
+        for (const unsigned n : fprs_) {
+            out_s += std::format("c.f[{0}] = f{0}; ", n);
+            in_s += std::format("f{0} = c.f[{0}]; ", n);
         }
         if (!crs_.empty()) {
             uint32_t keep = 0xFFFFFFFFu;
@@ -292,6 +308,18 @@ private:
             if (d == 31) line(std::format("{} c.hooks->trap(c, {}, \"trap\"); return;", sync_out(), hex32(pc)));
             else line(std::format("if (trap_on({}u, {}, {})) {{ {} c.hooks->trap(c, {}, \"trap\"); return; }}", d, x, y, sync_out(), hex32(pc)));
         };
+        // Floating-point loads, stores and operations: the helpers are cpu.hpp's fp:: functions.
+        const auto fload = [&](const char* read, const std::string& ea, bool update, const char* wrap) {
+            if (update) line(std::format("{{ const uint64_t ea = {}; {} = {}; {} = ea; }}", ea, F(d), fill(wrap, std::format("{}(c, static_cast<uint32_t>(ea))", read)), R(a)));
+            else line(std::format("{} = {};", F(d), fill(wrap, std::format("{}(c, {})", read, addr(ea)))));
+        };
+        const auto fstore = [&](const char* write, const std::string& ea, bool update, const char* wrap) {
+            if (update) line(std::format("{{ const uint64_t ea = {}; {}(c, static_cast<uint32_t>(ea), {}); {} = ea; }}", ea, write, fill(wrap, F(d)), R(a)));
+            else line(std::format("{}(c, {}, {});", write, addr(ea), fill(wrap, F(d))));
+        };
+        const auto fp1 = [&](const char* fn) { line(std::format("{} = fp::{}({});", F(d), fn, F(b))); };
+        const auto fp2 = [&](const char* fn, unsigned x, unsigned y) { line(std::format("{} = fp::{}({}, {});", F(d), fn, F(x), F(y))); };
+        const auto fp3 = [&](const char* fn) { line(std::format("{} = fp::{}({}, {}, {});", F(d), fn, F(a), F(in.rc_reg()), F(b))); };
         const auto s32 = [&](unsigned n) { return std::format("static_cast<int32_t>({})", R(n)); };
         const auto s64 = [&](unsigned n) { return std::format("static_cast<int64_t>({})", R(n)); };
         const auto u32 = [&](unsigned n) { return std::format("static_cast<uint32_t>({})", R(n)); };
@@ -473,6 +501,57 @@ private:
         case Op::stwbrx: store("write32", ea_x(), false, kSwap32); return true;
         case Op::stdbrx: store("write64", ea_x(), false, kSwap64); return true;
 
+        // ---------------------------------------------------------------- floating point (cpu.hpp's fp::)
+        case Op::lfs: fload("read32", ea_d(in.simm()), false, "fp::load_single($)"); return true;
+        case Op::lfsu: fload("read32", ea_d(in.simm()), true, "fp::load_single($)"); return true;
+        case Op::lfsx: fload("read32", ea_x(), false, "fp::load_single($)"); return true;
+        case Op::lfsux: fload("read32", ea_x(), true, "fp::load_single($)"); return true;
+        case Op::lfd: fload("read64", ea_d(in.simm()), false, "fp::from_bits($)"); return true;
+        case Op::lfdu: fload("read64", ea_d(in.simm()), true, "fp::from_bits($)"); return true;
+        case Op::lfdx: fload("read64", ea_x(), false, "fp::from_bits($)"); return true;
+        case Op::lfdux: fload("read64", ea_x(), true, "fp::from_bits($)"); return true;
+        case Op::stfs: fstore("write32", ea_d(in.simm()), false, "fp::store_single($)"); return true;
+        case Op::stfsu: fstore("write32", ea_d(in.simm()), true, "fp::store_single($)"); return true;
+        case Op::stfsx: fstore("write32", ea_x(), false, "fp::store_single($)"); return true;
+        case Op::stfsux: fstore("write32", ea_x(), true, "fp::store_single($)"); return true;
+        case Op::stfd: fstore("write64", ea_d(in.simm()), false, "fp::bits($)"); return true;
+        case Op::stfdu: fstore("write64", ea_d(in.simm()), true, "fp::bits($)"); return true;
+        case Op::stfdx: fstore("write64", ea_x(), false, "fp::bits($)"); return true;
+        case Op::stfdux: fstore("write64", ea_x(), true, "fp::bits($)"); return true;
+        case Op::stfiwx: fstore("write32", ea_x(), false, "fp::bits($)"); return true;  // the low word of the register's bits
+        case Op::fmr: line(std::format("{} = {};", F(d), F(b))); return true;
+        case Op::fneg: fp1("fneg"); return true;
+        case Op::fabs: fp1("fabs"); return true;
+        case Op::fnabs: fp1("fnabs"); return true;
+        case Op::frsp: fp1("frsp"); return true;
+        case Op::fcfid: fp1("fcfid"); return true;
+        case Op::fctiw: fp1("fctiw"); return true;
+        case Op::fctiwz: fp1("fctiwz"); return true;
+        case Op::fctid: fp1("fctid"); return true;
+        case Op::fctidz: fp1("fctidz"); return true;
+        case Op::fsqrt: fp1("fsqrt"); return true;
+        case Op::fsqrts: fp1("fsqrts"); return true;
+        case Op::fadd: fp2("fadd", a, b); return true;
+        case Op::fadds: fp2("fadds", a, b); return true;
+        case Op::fsub: fp2("fsub", a, b); return true;
+        case Op::fsubs: fp2("fsubs", a, b); return true;
+        case Op::fdiv: fp2("fdiv", a, b); return true;
+        case Op::fdivs: fp2("fdivs", a, b); return true;
+        case Op::fmul: fp2("fmul", a, in.rc_reg()); return true;
+        case Op::fmuls: fp2("fmuls", a, in.rc_reg()); return true;
+        case Op::fmadd: fp3("fmadd"); return true;
+        case Op::fmadds: fp3("fmadds"); return true;
+        case Op::fmsub: fp3("fmsub"); return true;
+        case Op::fmsubs: fp3("fmsubs"); return true;
+        case Op::fnmadd: fp3("fnmadd"); return true;
+        case Op::fnmadds: fp3("fnmadds"); return true;
+        case Op::fnmsub: fp3("fnmsub"); return true;
+        case Op::fnmsubs: fp3("fnmsubs"); return true;
+        case Op::fsel: fp3("fsel"); return true;
+        case Op::fcmpu: case Op::fcmpo:  // (they differ in the exceptions they raise, which are not kept)
+            line(std::format("{} = fp::fcompare({}, {});", CR(in.crfd()), F(a), F(b)));
+            return true;
+
         // ---------------------------------------------------------------- LR, CTR, XER
         case Op::mfspr:
             if (in.spr() == kLr) result(d, LR());
@@ -499,6 +578,9 @@ private:
         case Op::td: trap(s64(a), s64(b)); return true;
         case Op::tdi: trap(s64(a), std::format("{}", in.simm())); return true;
         case Op::sc: line(std::format("{} c.hooks->system_call(c, {}); {}", sync_out(), hex32(pc), sync_in())); return true;
+        case Op::mftb:  // the whole time base, or (register 269) its upper half
+            result(d, in.spr() == 268 ? std::string("c.hooks->time_base(c)") : std::string("c.hooks->time_base(c) >> 32"));
+            return true;
 
         // ---------------------------------------------------------------- branches
         case Op::b: {
@@ -585,7 +667,7 @@ private:
     const LiftInput& f_;
     std::set<uint32_t> present_, labels_;
     std::map<uint32_t, const JumpTable*> tables_;
-    std::set<unsigned> gprs_, crs_;
+    std::set<unsigned> gprs_, crs_, fprs_;
     std::set<std::string> specials_;
     std::string error_;
 };

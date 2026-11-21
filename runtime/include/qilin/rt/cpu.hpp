@@ -22,6 +22,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+
+#include "qilin/rt/fp.hpp"
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>  // the high half of a 64-bit multiply
 #endif
@@ -48,6 +50,7 @@ struct CpuHooks {
     void (*call)(Cpu&, uint32_t target);               // bctrl / bctr / blrl: a call or jump to a computed code address
     void (*system_call)(Cpu&, uint32_t pc);            // sc: the call's number is in r11
     void (*trap)(Cpu&, uint32_t pc, const char* why);  // a trap instruction that fired; must not return
+    uint64_t (*time_base)(Cpu&);                       // mftb: the time base, which counts 79,800,000 to the second on a PS3
 };
 
 struct Cpu {

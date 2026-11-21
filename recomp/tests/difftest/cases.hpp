@@ -18,6 +18,7 @@ enum class Kind : uint8_t {
     Tail,    // b to a second function
     System,  // sc
     Switch,  // a jump table of two targets
+    TimeBase,  // mftb: the hook's value, or its upper half
 };
 
 struct Case {

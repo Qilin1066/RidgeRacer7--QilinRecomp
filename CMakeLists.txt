@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(RidgeRacer7QilinRecomp VERSION 0.8.0 LANGUAGES CXX)
+project(RidgeRacer7QilinRecomp VERSION 0.9.0 LANGUAGES CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -139,6 +139,7 @@ add_custom_command(
 add_executable(qilin_difftest
     recomp/tests/difftest/run.cpp
     recomp/tests/difftest/ref.cpp
+    recomp/tests/difftest/ref_fp.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/difftest_cases.cpp)
 target_include_directories(qilin_difftest PRIVATE recomp/tests/difftest)
 target_link_libraries(qilin_difftest PRIVATE qilin_recomp qilin_rt qilin_warnings)

@@ -360,7 +360,7 @@ bool step(State& s, const Insn& in) {
 
     case Op::sync: case Op::eieio: case Op::isync: case Op::dcbt: case Op::dcbtst: case Op::dcbst: case Op::dcbf: case Op::icbi:
         return true;  // nothing a program can see
-    default: return false;
+    default: return step_fp(s, in);
     }
 }
 

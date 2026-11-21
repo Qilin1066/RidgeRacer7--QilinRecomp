@@ -5,10 +5,13 @@
 // shifts, compares and the condition register, integer loads and stores (with
 // update, indexed, byte-reversed), LR, CTR and XER, traps, system calls, the
 // cache and synchronisation instructions that need nothing done, and all
-// branches and calls, switches among them. Anything else (floating point,
-// VMX, the time base, atomic sequences, the overflow-enable and string
-// forms) makes the function one that isn't lifted yet, with the reason:
-// nothing is skipped silently (docs/recompiler-core.md).
+// branches and calls, switches among them. Slice 2 (v0.9.0): floating point,
+// bit-exact (runtime/include/qilin/rt/fp.hpp): loads and stores, arithmetic
+// in both precisions, the fused forms, conversions, compares, fsel. Anything
+// else (VMX, the FPSCR, the estimates, floating-point record forms, the time
+// base, atomic sequences, the overflow-enable and string forms) makes the
+// function one that isn't lifted yet, with the reason: nothing is skipped
+// silently (docs/recompiler-core.md).
 #pragma once
 
 #include <cstdint>

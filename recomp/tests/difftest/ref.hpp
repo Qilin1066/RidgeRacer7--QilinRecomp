@@ -16,6 +16,7 @@ namespace qilin::ref {
 
 struct State {
     uint64_t gpr[32] = {};
+    uint64_t fpr[32] = {};  // as bit patterns
     uint32_t cr = 0;
     uint64_t xer = 0, lr = 0, ctr = 0;
     uint8_t* mem = nullptr;  // guest address a is mem[a]
@@ -25,6 +26,9 @@ struct State {
 // false if it isn't one the reference knows (the test then fails: every
 // instruction of the slice must be here).
 bool step(State& s, const ppu::Insn& in);
+
+// The floating-point instructions (ref_fp.cpp: integers only, no host floating point). Called by step.
+bool step_fp(State& s, const ppu::Insn& in);
 
 // A conditional branch's decision (and its CTR update): taken or not.
 bool branch_taken(State& s, unsigned bo, unsigned bi);

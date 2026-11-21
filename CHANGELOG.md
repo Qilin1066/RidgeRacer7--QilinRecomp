@@ -4,6 +4,22 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-21
+
+The lifter's second slice: floating point, bit-exact.
+
+### Added
+- Floating point in the PPU lifter, and its runtime (`runtime/include/qilin/rt/fp.hpp`): loads and stores, arithmetic in both precisions, the fused forms, conversions, compares, `fsel`. PowerPC's NaN results, single-precision results rounded once whatever the operands, and the architecture's own conversions of singles in memory.
+- The time base (`mftb`), through a hook.
+- The reference's floating point (`recomp/tests/difftest/ref_fp.cpp`): integers only, exact in 128 bits, rounded once.
+
+### Checked
+- On the game: 13,732 of 14,294 functions lift (914,967 of 1,059,387 instructions). VMX (560 functions) and two functions that use the FPSCR are left.
+- The differential test: 4,765 cases, 1,085,808 runs, all agree. Floating-point arithmetic runs from 1,200 states a case.
+
+### Fixed
+- Found by the reference on its first run, before any release had it: the slow path of the single-precision fused forms rounded a tie the wrong way when the product underflowed in double.
+
 ## [0.8.0] - 2026-11-21
 
 The PPU lifter's first slice, and the differential test.

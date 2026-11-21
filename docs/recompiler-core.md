@@ -1,6 +1,6 @@
 # The recompiler's core
 
-The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.8.0): the decoders and control-flow passes for both processors, and the first slice of the PPU lifter, all run on the game's code.
+The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.9.0): the decoders and control-flow passes for both processors, and the PPU lifter for everything but VMX, all run on the game's code.
 
 ## The PPU decoder (`recomp/src/ppu.*`, `qilin::ppu`)
 
@@ -181,9 +181,31 @@ How lifted code is shaped:
 
 **Where the architecture leaves a result undefined**, the runtime's helper states its choice (`cpu.hpp`): a divide by zero or of the most negative number by −1 gives 0; the upper half of a word divide is 0 and of `mulhw` the sign extension; `mfocrf` gives the named field and zeros elsewhere. *These are choices, not measurements of the PPU. No code that depends on one is expected; if any is found, RPCS3 running the game is the reference.*
 
-**Not in slice 1, and not skipped silently:** a function with any instruction outside the slice is not lifted, and `qilin lift` counts it under the reason. Floating point and VMX are the next slices; then the time base, `dcbz`, atomic sequences (which this game doesn't use). **Landing pads** are emitted as labels in their functions but nothing can enter at one yet (the open design item in `roadmap-and-design-targets.md`).
+**Not in the slice, and not skipped silently:** a function with any instruction outside the slice is not lifted, and `qilin lift` counts it under the reason. After floating point (below) comes VMX; then `dcbz` and atomic sequences (which this game doesn't use). **Landing pads** are emitted as labels in their functions but nothing can enter at one yet (the open design item in `roadmap-and-design-targets.md`).
 
 With `--out <folder>` the lifted code is written out, 256 functions to a file (derived from the game: keep it out of the repository). All 11,873 functions compile with Visual Studio 2022 (checked on the owner's PC: 47 files, under three minutes).
+
+### Slice 2 (v0.9.0): floating point, bit-exact
+
+**13,732 of 14,294 functions now lift, 914,967 of 1,059,387 instructions.** What is left: VMX (560 functions) and the two functions that write and read the FPSCR.
+
+The floating-point helpers are `runtime/include/qilin/rt/fp.hpp`. A register holds a double; the host's arithmetic is used where it is exactly the guest's, and corrected where it isn't:
+
+- **NaNs.** PowerPC's result for a NaN operand is the first NaN operand in the order frA, frB, frC, made quiet, and for an invalid operation the positive default NaN. Hosts differ from that and from each other (x86's default NaN is negative), so every operation tests its result and works a NaN out itself.
+- **Single-precision arithmetic rounds once.** `fadds` and its kin round the exact result of their double operands to single. With operands that are themselves singles (nearly always), the host's float arithmetic is that. With others, rounding the double result again would round twice: the slow path finds on which side of the double result the exact one lies (by error-free transformations: two-sum, the fused remainder of a product, quotient or root) and rounds through "round to odd", which makes the second rounding harmless.
+- **The fused forms** (`fmadds`, `fmsubs` and their negatives) with frA and frC singles take the product exactly in a double and round one sum once. The host's single-precision `fma` is not used. Double-precision `fmadd` is `std::fma`.
+- **Loads and stores of singles** convert formats as the architecture's own conversions do: no rounding, no quieting (a signalling NaN goes through `lfs` and `stfs` unchanged), a register that doesn't hold a single stored by bit selection.
+- **Moves** (`fmr`, `fneg`, `fabs`, `fnabs`) are bit operations.
+- Conversions to integer saturate, and give the most negative integer for a NaN. `fsel` and the compares are as defined; the compares set a CR field and nothing in the FPSCR.
+- **The time base** (`mftb`) is a hook: the runtime will say what time it is.
+
+**Assumed, and said where:** the rounding mode is round to nearest (the mode a program starts in), and the FPSCR's exception and result flags are not kept. So the instructions that read or write the FPSCR, and floating-point record forms, are not in the slice: a function that could notice is not lifted. The two that do (one `mtfsf`, one `mffs`, in the C library's environment functions by the look of them) are the two left. The estimates (`fres`, `frsqrte`), which the game doesn't use, are out too: their results are the hardware's tables'. The upper half of `fctiwz`'s result, undefined by the architecture, is `0xFFF80000`; `frsp` of a NaN keeps what of its payload a single holds; an arithmetic instruction passes a NaN's whole payload through. *Choices, to be confirmed against RPCS3 if anything is found to depend on them.*
+
+**Its check is integers only.** The reference's floating point (`recomp/tests/difftest/ref_fp.cpp`) uses no host floating-point operation at all: a number is a sign, an integer significand and a power of two; sums, products, quotients and square roots are formed exactly in 128 bits (with a "sticky" note of anything below) and rounded once by one routine. So it shares neither a mistake nor a C library with `fp.hpp`.
+
+- Floating-point arithmetic cases run from 1,200 states each (the hard cases are rare), drawn from the special values, singles, doubles exactly halfway between two singles and one unit either side, operands that nearly cancel, and noise.
+- **4,765 cases, 1,085,808 runs, all agree.**
+- It found one fault on its first run, in the slow path: a product that underflows in double lost its error term, and a tie was rounded the wrong way. Fixed, with the same hazard in the division path.
 
 ### The differential test (`recomp/tests/difftest/`, `qilin_difftest`)
 
@@ -201,4 +223,4 @@ The reference shares the lifter's author and the choices above for undefined res
 1. `verify_decoder.py --game`, where there is both the game and a PowerPC objdump.
 2. ✅ The control-flow pass (v0.4.0, above). Next for it: its output as JSON, and the lifter that reads it.
 3. ✅ The SPU decoder (v0.6.0) and control-flow pass (v0.7.0).
-4. 🔨 The PPU lifter: slice 1 done (v0.8.0). Next: floating point (bit-exact, `fmadd` as `std::fma`, the FPSCR's rounding mode), then VMX, then landing pads; then the SPU lifter.
+4. 🔨 The PPU lifter: integers and control flow (v0.8.0), floating point and the time base (v0.9.0). Next: VMX, then landing pads; then the SPU lifter.

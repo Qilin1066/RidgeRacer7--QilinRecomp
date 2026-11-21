@@ -11,7 +11,9 @@
 //   qilin exports <game>                     what the program offers the system
 //   qilin sfo     <game>                     every entry of PARAM.SFO
 //   qilin id      <name>                     the id a system function of that name has
+//   qilin archive <game> [--files]           RR7.DAT's directory, read from the program: its packs, and every file
 //   qilin data    <game>                     the game's own files, and the headers of its sound banks and films
+//   qilin shaders <game>                     the compiled shader programs the program carries
 //   qilin spu     <game>                     the SPU programs the program carries
 //   qilin cfg     <game>                     the control-flow pass: functions, switches, system calls, coverage
 //   qilin insns   <game>                     every word of the program's code: address, word, instruction
@@ -35,6 +37,7 @@
 #include <string_view>
 #include <vector>
 
+#include "archive.hpp"
 #include "bytes.hpp"
 #include "cfg.hpp"
 #include "elf.hpp"
@@ -43,6 +46,7 @@
 #include "ppu.hpp"
 #include "self.hpp"
 #include "sfo.hpp"
+#include "shaders.hpp"
 #include "spu_image.hpp"
 #include "title.hpp"
 
@@ -68,7 +72,9 @@ int usage() {
                "  qilin exports <game>\n"
                "  qilin sfo     <game>\n"
                "  qilin id      <function name>\n"
+               "  qilin archive <game> [--files]\n"
                "  qilin data    <game>\n"
+               "  qilin shaders <game>\n"
                "  qilin spu     <game>\n"
                "  qilin cfg     <game>\n"
                "  qilin insns   <game>\n"
@@ -82,6 +88,7 @@ struct Args {
     std::string command, input;
     std::optional<std::string> json;
     uint32_t base = 0;
+    bool list_files = false;
 };
 
 uint32_t parse_address(std::string_view text) {
@@ -102,6 +109,7 @@ Args parse_args(std::span<char*> argv) {
         const std::string_view arg = argv[i];
         if (arg == "--json" && i + 1 < argv.size()) a.json = argv[++i];
         else if (arg == "--base" && i + 1 < argv.size()) a.base = parse_address(argv[++i]);
+        else if (arg == "--files") a.list_files = true;
         else throw Failure{std::format("unknown argument {}", arg)};
     }
     return a;
@@ -553,6 +561,87 @@ int cmd_cfg(const Args& a) {
     return 0;
 }
 
+// The archive's directory, which the program holds: the packs, the files in
+// them, and whether RR7.DAT is the size the directory says.
+int cmd_archive(const Args& a) {
+    const GameFiles files = files_of(a);
+    const Elf elf = elf_of(files);
+    const auto found = find_archive(elf);
+    if (!found) throw Failure{found.error()};
+    const Archive& archive = *found;
+    size_t compressed = 0, loose = 0;
+    uint64_t stored = 0, unpacked = 0, plain = 0;
+    for (const ArchivePack& p : archive.packs) {
+        if (p.compressed) {
+            ++compressed;
+            stored += p.stored_size;
+            unpacked += p.size;
+        } else {
+            plain += p.size;
+        }
+    }
+    for (const ArchiveFile& f : archive.files) loose += f.pack == ArchiveFile::kNoPack;
+    std::println("the directory: {} files at {:#x}, {} packs at {:#x}", archive.files.size(), archive.files_at, archive.packs.size(),
+                 archive.packs_at);
+    std::println("{} packs are compressed: {} bytes stored, {} unpacked; {} are stored plain: {} bytes", compressed, stored, unpacked,
+                 archive.packs.size() - compressed, plain);
+    std::println("{} files are in no pack", loose);
+    std::println("the archive is {} bytes by its directory", archive.size());
+    if (!files.usrdir.empty()) {
+        std::error_code ec;
+        const fs::path dat = files.usrdir / "RR7.DAT";
+        const uint64_t size = fs::file_size(dat, ec);
+        if (ec) throw Failure{std::format("{} isn't there", dat.string())};
+        if (size != archive.size()) throw Failure{std::format("{} is {} bytes, and the program's directory describes {}", dat.string(), size, archive.size())};
+        std::println("{} is that size", dat.string());
+    }
+    if (a.list_files) {
+        for (const ArchivePack& p : archive.packs) {
+            std::println("{} (sector {}, {} sectors{})", p.name, p.sector, p.sectors,
+                         p.compressed ? std::format(", {} bytes stored, {} unpacked", p.stored_size, p.size) : std::string(", plain"));
+            for (uint32_t i = p.first_file; i < p.first_file + p.files; ++i)
+                std::println("  {:#10x} {:9}  {}", archive.files[i].offset, archive.files[i].size, archive.files[i].name);
+        }
+        return 0;
+    }
+    // The files by name: how many of each, and their bytes.
+    struct Kind {
+        std::string name;
+        size_t count = 0;
+        uint64_t bytes = 0;
+    };
+    std::vector<Kind> kinds;
+    for (const ArchiveFile& f : archive.files) {
+        auto it = std::ranges::find(kinds, f.name, &Kind::name);
+        if (it == kinds.end()) it = kinds.insert(kinds.end(), Kind{f.name});
+        ++it->count;
+        it->bytes += f.size;
+    }
+    std::ranges::sort(kinds, [](const Kind& x, const Kind& y) { return x.bytes > y.bytes; });
+    std::println("{} different file names; the largest in all:", kinds.size());
+    for (size_t i = 0; i < kinds.size() && i < 30; ++i) std::println("  {:6} x {:24} {:12} bytes", kinds[i].count, kinds[i].name, kinds[i].bytes);
+    return 0;
+}
+
+int cmd_shaders(const Args& a) {
+    const Elf elf = elf_of(files_of(a));
+    const auto programs = find_shader_programs(elf);
+    if (!programs) throw Failure{programs.error()};
+    size_t vertex = 0;
+    uint64_t bytes = 0, microcode = 0, parameters = 0;
+    for (const ShaderProgram& s : *programs) {
+        std::println("{:#010x} {:8} {:6} bytes  {:3} parameters  {:5} bytes of microcode", s.address, s.vertex() ? "vertex" : "fragment", s.size,
+                     s.parameters, s.microcode_size);
+        vertex += s.vertex();
+        bytes += s.size;
+        microcode += s.microcode_size;
+        parameters += s.parameters;
+    }
+    std::println("{} compiled shader programs: {} vertex, {} fragment; {} bytes, {} of them microcode; {} parameters", programs->size(), vertex,
+                 programs->size() - vertex, bytes, microcode, parameters);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -571,7 +660,9 @@ int main(int argc, char** argv) {
             std::println("{:08x} {}", import_id(a.input), a.input);
             return 0;
         }
+        if (a.command == "archive") return cmd_archive(a);
         if (a.command == "data") return cmd_data(a);
+        if (a.command == "shaders") return cmd_shaders(a);
         if (a.command == "spu") return cmd_spu(a);
         if (a.command == "cfg") return cmd_cfg(a);
         if (a.command == "insns") return cmd_insns(a);

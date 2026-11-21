@@ -16,7 +16,7 @@ Static recompilation of **Ridge Racer 7** (PlayStation 3, USA, `BLUS30001`, vers
 
 ## Layout
 
-- `recomp/src/`: `elf` (the PS3 program: segments, sections, the entry descriptor, process and PRX parameters, imports with ids, slots and stubs, exports, TLS), `self` (`EBOOT.BIN`'s plain header: the ELF's tables, the stored segments, the SDK library stamps), `sfo` (`PARAM.SFO`), `title` (finds the files in the player's copy; `known_build`; the decrypt message), `media` (the headers of the `.nub` sound banks and `.pam` films), `spu_image` (the SPU programs inside the program), `import_names` (id to name, all 248; `import_id`), `syscall_names` (number to name, all 78), `sha256`, `bytes.hpp`. These are CMake's `qilin_game`: **runtime code too, so no `std::format` in them** (macOS 10.15). `ppu` (the PPU decoder, `qilin::ppu`) and `cfg` (the control-flow pass, with the `.eh_frame` and exception-table readers) are CMake's `qilin_recomp`: tools only, as is `main.cpp`, the `qilin` CLI (`std::format` and `std::print` are fine there).
+- `recomp/src/`: `elf` (the PS3 program: segments, sections, the entry descriptor, process and PRX parameters, imports with ids, slots and stubs, exports, TLS), `self` (`EBOOT.BIN`'s plain header: the ELF's tables, the stored segments, the SDK library stamps), `sfo` (`PARAM.SFO`), `title` (finds the files in the player's copy; `known_build`; the decrypt message), `media` (the headers of the `.nub` sound banks and `.pam` films), `spu_image` (the SPU programs inside the program), `import_names` (id to name, all 248; `import_id`), `syscall_names` (number to name, all 78), `sha256`, `bytes.hpp`. These are CMake's `qilin_game`: **runtime code too, so no `std::format` in them** (macOS 10.15). `ppu` (the PPU decoder, `qilin::ppu`) , `cfg` (the control-flow pass, with the `.eh_frame` and exception-table readers), `archive` (`RR7.DAT`'s directory, from the program) and `shaders` (the compiled Cg programs in the program) are CMake's `qilin_recomp`: tools only, as is `main.cpp`, the `qilin` CLI (`std::format` and `std::print` are fine there).
 - `recomp/tests/`: `tests.cpp` (unit tests), `elf_builder.hpp` (builds a program, its SELF and a `PARAM.SFO` in memory).
 - `tools/analyse-game.ps1` and `Analyse game.bat`: build `qilin` on Windows and write the analysis to `analysis-out/`. Keep the script Windows PowerShell 5.1-compatible and ASCII-only. Run on the owner's PC up to the decrypt message; its steps after that (imports, exports, profile) have not run.
 - `tools/check/verify_decoder.py`: the PPU decoder against GNU objdump (`--sweep` in CI; `--game` needs the decrypted program and a PowerPC objdump).
@@ -62,13 +62,14 @@ Before a milestone commit: tests pass, warnings are clean (`QILIN_WERROR`), and 
 - Other PS3 static recompilations exist (`docs/prior-art.md`: ps3recomp and ports built on it). Their licences are unchecked: don't read their code until they are.
 - Facts about the game not read from the disc (60 frames a second, 1080p, online play, what it shares with Ridge Racer 6) are from public descriptions.
 
-## Status (v0.4.0)
+## Status (v0.5.0)
 
 - The tools find the game, read `PARAM.SFO` and the SELF's plain header, and load a decrypted PS3 program (on synthetic files). Read from the owner's disc: `docs/elf-analysis.md`.
 - The PPU decoder (383 instructions) agrees with binutils 2.42 over CI's sweep of 4.9 million words, with no unexplained difference. `qilin data` reads the sound banks' and films' headers.
 - Checked: unit tests and a warnings-as-errors build on all six CI configurations and with MSVC on the owner's PC; `qilin info` and `qilin data` on the owner's disc folder; `Analyse game.bat`'s script up to the decrypt message.
 - The decrypted program is read: `info`, `imports`, `exports`, `spu`, `insns`, `profile` and `Analyse game.bat` all run on it on the owner's PC.
 - The control-flow pass accounts for every word of the game's code: 14,294 functions, 296 switches, 2,845 landing pads, 502 system-call sites all numbered, 0 unknown words (`docs/recompiler-core.md`).
+- `RR7.DAT`'s directory is read from the program and matches the file to the byte; the 242 compiled shaders are found (`docs/data-files.md`).
 - Unchecked: `verify_decoder.py --game` (no PowerPC objdump where the game is).
 
 ## Next steps, in order
@@ -78,7 +79,7 @@ Before a milestone commit: tests pass, warnings are clean (`QILIN_WERROR`), and 
 3. ✅ The PPU decoder (v0.2.0). Still to do with the real program: `qilin profile` (which VMX and 64-bit forms the game uses; whether `mcrxr`, `ldbrx`, `stdbrx` or anything left out occurs) and `verify_decoder.py --game` (in CI's absence of game files, that needs a PowerPC objdump where the game is).
 4. ✅ in part (v0.3.0): the 42 SPU programs are found and read (`qilin spu`). Still to do: the SPU decoder (`qilin::spu`), `qilin spu-insns`/`spu-profile`. Its check needs a reference: current binutils has no SPU (**open**, in the roadmap).
 5. ✅ (v0.4.0) The control-flow pass on the PPU code: 0 unknown words. Still to do for it: JSON output for the lifter (WindWakerHD's `cfg.json` is the model); proof of the last 32 switch sizes (their bound check is in a block the proof doesn't follow yet).
-6. ✅ in part (v0.2.0): the `.nub` and `.pam` headers are read (`qilin data`) and the codecs known. Still to do: find `RR7.DAT`'s directory (look in the program's read-only data for a table of sector offsets and sizes), then a `qilin` command that lists the archive; identify its compression and the `ArcL`, `R7T`, `R7W` and `RR7 ` formats; find the shaders. Decide the ATRAC3plus decoder (**open**).
+6. ✅ (v0.5.0) The `.nub` and `.pam` headers, `RR7.DAT`'s directory (`qilin archive`: file table at `0x1015012c`, pack table at `0x1018e9f4`, found by shape, not by address) and the shaders (`qilin shaders`: 242 Cg binaries at `0x101ae628`). Still to do: the archive's compression (byte-oriented LZ; compressed packs sit at the end of their sectors, for unpacking in place; the game's own routine is lifted, so only the tools want it); the formats inside the packs; the translation of the shaders. Decide the ATRAC3plus decoder (**open**).
 7. Then, in WindWakerHD's order: lifter and difftest, the runtime skeleton, the window and the settings menu, threads, files, the RSX on Vulkan, sound.
 
 ## Conventions

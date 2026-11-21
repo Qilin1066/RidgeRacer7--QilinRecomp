@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "archive.hpp"
 #include "cfg.hpp"
 #include "elf.hpp"
 #include "elf_builder.hpp"
@@ -17,6 +18,7 @@
 #include "self.hpp"
 #include "sfo.hpp"
 #include "sha256.hpp"
+#include "shaders.hpp"
 #include "spu_image.hpp"
 #include "syscall_names.hpp"
 #include "title.hpp"
@@ -463,6 +465,146 @@ void test_import_names() {
     }
 }
 
+// ---------------------------------------------------------------- the archive's directory
+
+// Program data holding a directory: names, then 3 files, then 9 packs (the
+// first compressed with two files, the second plain with one, the rest empty).
+struct ArchiveData {
+    static constexpr uint32_t kAt = 0x10150000, kFiles = 0x100, kPacks = kFiles + 3 * 20;
+    Bytes bytes = Bytes(0x400);
+    ArchiveData() {
+        put_text(bytes, 0x10, "Tex");
+        put_text(bytes, 0x18, "Mdl");
+        put_text(bytes, 0x20, "Car");
+        put_text(bytes, 0x28, "Table");
+        file(0, 0, 0x900, 0x10);
+        file(1, 0x940, 0x100, 0x18);
+        file(2, 0, 0x7ff, 0x18, 2048);
+        pack(0, 0, 2, 0, 2, true, 0xc00, 0xa40, 0x20);
+        pack(1, 2, 1, 2, 3, false, 0, 0, 0x28);
+        for (uint32_t i = 2; i < 9; ++i) {
+            const std::string name = "Empty" + std::to_string(i);
+            put_text(bytes, 0x30 + 8 * i, name);
+            pack(i, 3, 0, 0, 0, false, 0, 0, 0x30 + 8 * i);
+        }
+    }
+    void file(uint32_t i, uint32_t offset, uint32_t size, uint32_t name, uint16_t align = 64) {
+        const size_t at = kFiles + 20 * i;
+        put_be16(bytes, at + 4, static_cast<uint16_t>((offset % 2048 + size + 2047) / 2048));
+        put_be16(bytes, at + 6, align);
+        put_be32(bytes, at + 8, size);
+        put_be32(bytes, at + 12, offset);
+        put_be32(bytes, at + 16, kAt + name);
+    }
+    void pack(uint32_t i, uint32_t sector, uint16_t sectors, uint16_t first, uint16_t end, bool compressed, uint32_t stored, uint32_t size,
+              uint32_t name) {
+        const size_t at = kPacks + 36 * i;
+        put_be32(bytes, at, sector);
+        put_be16(bytes, at + 4, sectors);
+        put_be16(bytes, at + 6, first);
+        put_be16(bytes, at + 8, end);
+        put_be16(bytes, at + 10, compressed);
+        put_be32(bytes, at + 12, stored);
+        put_be32(bytes, at + 16, size);
+        put_be32(bytes, at + 32, kAt + name);
+    }
+    std::expected<Archive, std::string> find() const {
+        const ArchiveMemory memory[] = {{kAt, bytes}};
+        return find_archive(memory, [&](uint32_t address) -> std::string {
+            if (address < kAt || address - kAt >= bytes.size()) return {};
+            return reinterpret_cast<const char*>(bytes.data() + (address - kAt));
+        });
+    }
+    std::string error() const {
+        const auto found = find();
+        return found ? std::string() : found.error();
+    }
+};
+
+void test_archive() {
+    const ArchiveData data;
+    const auto archive = data.find();
+    CHECK(archive.has_value());
+    if (archive) {
+        CHECK(archive->files_at == ArchiveData::kAt + ArchiveData::kFiles && archive->packs_at == ArchiveData::kAt + ArchiveData::kPacks);
+        CHECK(archive->files.size() == 3 && archive->packs.size() == 9 && archive->size() == 3 * 2048);
+        const ArchivePack& car = archive->packs[0];
+        CHECK(car.name == "Car" && car.compressed && car.stored_size == 0xc00 && car.size == 0xa40 && car.files == 2);
+        CHECK(car.stored_at() == 2 * 2048 - 0xc00);  // its bytes end with its sectors
+        const ArchivePack& table = archive->packs[1];
+        CHECK(table.name == "Table" && !table.compressed && table.size == 2048 && table.stored_at() == 2 * 2048 && table.first_file == 2);
+        CHECK(archive->files[0].name == "Tex" && archive->files[0].pack == 0 && archive->files[0].size == 0x900);
+        CHECK(archive->files[1].name == "Mdl" && archive->files[1].offset == 0x940 && archive->files[2].pack == 1);
+        CHECK(archive->packs[2].files == 0 && archive->packs[2].sectors == 0);
+    }
+    ArchiveData bad;
+    bad.file(1, 0x8c0, 0x100, 0x18);  // overlaps the file before it
+    CHECK(has(bad.error(), "overlaps"));
+    bad = ArchiveData();
+    bad.file(1, 0x980, 0x100, 0x18);  // runs past the pack's unpacked bytes
+    CHECK(has(bad.error(), "runs past"));
+    bad = ArchiveData();
+    bad.file(0, 0, 0x900, 0x10, 32);
+    CHECK(has(bad.error(), "aligned to 32"));
+    bad = ArchiveData();
+    bad.pack(0, 0, 2, 0, 2, true, 0x700, 0xa40, 0x20);  // too few stored bytes to reach back into its first sector
+    CHECK(has(bad.error(), "stored bytes"));
+    bad = ArchiveData();
+    put_text(bad.bytes, 0x28, "Car");  // two packs of one name
+    bad.bytes[0x2b] = 0;
+    CHECK(has(bad.error(), "two packs"));
+    bad = ArchiveData();
+    put_be32(bad.bytes, ArchiveData::kFiles + 16, 0);  // a file with no name
+    CHECK(has(bad.error(), "no name"));
+    bad = ArchiveData();
+    bad.pack(1, 5, 1, 2, 3, false, 0, 0, 0x28);  // the packs don't follow one another: no table
+    CHECK(has(bad.error(), "wasn't found"));
+}
+
+// ---------------------------------------------------------------- compiled shaders
+
+void test_shaders() {
+    // The test program with room made in its data for two compiled programs.
+    const auto with_shaders = [](uint32_t second_microcode_at) {
+        Bytes program = make_elf();
+        const size_t at = kDataAt + 0x20;
+        put_segment(program, 1, 1, 6, kDataAt, kData, 0x80, 0x100, 0x10000);
+        const auto shader = [&](size_t where, uint32_t profile, uint32_t size, uint32_t microcode_at) {
+            put_be32(program, where, profile);
+            put_be32(program, where + 4, 6);
+            put_be32(program, where + 8, size);
+            put_be32(program, where + 12, 1);
+            put_be32(program, where + 16, 0x20);
+            put_be32(program, where + 20, 0x20);
+            put_be32(program, where + 24, 8);
+            put_be32(program, where + 28, microcode_at);
+        };
+        shader(at, 7003, 0x30, 0x28);
+        shader(at + 0x30, 7004, 0x30, second_microcode_at);
+        return Elf::parse(std::move(program));
+    };
+    const auto elf = with_shaders(0x28);
+    CHECK(elf.has_value());
+    if (!elf) return;
+    const auto programs = find_shader_programs(*elf);
+    CHECK(programs.has_value());
+    if (programs) {
+        CHECK(programs->size() == 2);
+        if (programs->size() == 2) {
+            CHECK((*programs)[0].address == kData + 0x20 && (*programs)[0].vertex() && (*programs)[0].size == 0x30);
+            CHECK((*programs)[1].address == kData + 0x50 && !(*programs)[1].vertex() && (*programs)[1].microcode_size == 8);
+        }
+    }
+    const auto broken = with_shaders(0x2c);  // the second one's microcode runs past its end
+    CHECK(broken.has_value());
+    if (broken) {
+        const auto found = find_shader_programs(*broken);
+        CHECK(!found && has(found.error(), "microcode is outside"));
+    }
+    const auto plain = Elf::parse(make_elf());
+    CHECK(plain && find_shader_programs(*plain).has_value() && find_shader_programs(*plain)->empty());
+}
+
 // ---------------------------------------------------------------- system-call names
 
 void test_syscall_names() {
@@ -823,6 +965,8 @@ int main() {
     test_self();
     test_sfo();
     test_media();
+    test_shaders();
+    test_archive();
     test_syscall_names();
     test_cfg();
     test_import_names();

@@ -4,6 +4,21 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-21
+
+The archive's directory, the shaders, and names for the system calls.
+
+### Added
+- `qilin archive` and its reader (`recomp/src/archive.*`): `RR7.DAT`'s directory, which is in the program's data, found by its shape and checked relation by relation. `--files` lists every pack and file.
+- `qilin shaders` and its reader (`recomp/src/shaders.*`): the compiled Cg programs in the program's data.
+
+### Checked
+- The directory on the owner's program and disc: 12,810 files in 2,088 packs (908 compressed, 4.70 GB stored and 10.22 GB unpacked; 1,180 plain), running from sector 0 to the archive's last with no gap, **5,231,794,176 bytes: `RR7.DAT`'s size exactly**. Compressed packs sit at the end of their sectors, which accounts for the zero bytes the survey found.
+- 242 compiled shader programs in the program: 121 vertex, 121 fragment. The shaders are a closed set known at build time, as the plan needed.
+
+### Not done
+- The archive's compression is not decoded.
+
 ### Added
 - Names for the 78 system calls the game makes directly (`recomp/src/syscall_names.*`); `qilin cfg` lists them. 68 are confirmed by PSL1GHT's headers; 10 are flagged as unconfirmed.
 - `import_id` and `qilin id <name>`: the id of a system function, computed from its name (SHA-1 of the name and the scheme's fixed suffix). The unit tests now recompute all 248 ids in the table of names, so it is checked on every push. The suffix is a constant of the naming scheme, not a key; it is in the repository by the owner's decision.

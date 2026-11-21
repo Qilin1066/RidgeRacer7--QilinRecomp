@@ -1,6 +1,6 @@
 # The game's data files
 
-What is in `PS3_GAME/USRDIR` beside the program, as read from the owner's disc on the owner's PC (2026-11-21, v0.2.0). `qilin data <game>` prints the list and what the headers of the sound banks and films say; `Analyse game.bat` writes it to `analysis-out\data.txt`.
+What is in `PS3_GAME/USRDIR` beside the program, as read from the owner's disc on the owner's PC (2026-11-21, v0.2.0; the archive's directory and the shaders at v0.5.0). `qilin data <game>` prints the list and what the headers of the sound banks and films say; `Analyse game.bat` writes it to `analysis-out\data.txt`.
 
 Everything here was read from the files themselves. The layouts are **as observed**: nothing documents them for this project, so each field below is one whose meaning the files make plain (a count that matches, an offset that lands), and what is only inferred says so. The readers (`recomp/src/media.*`) stop with an error on anything else: a sound of an unknown kind, a stream of an unknown coding, a table that doesn't add up.
 
@@ -75,14 +75,32 @@ A sound's header (`0xd0` bytes for PCM, `0x100` for ATRAC3plus):
 
 ## The archive (`RR7.DAT`)
 
-Surveyed by sector (2048 bytes), with no directory to go by:
+**Its directory is in the program** (v0.5.0): two tables in the program's data, found and checked by `qilin archive` (`recomp/src/archive.*`). `qilin archive <game> --files` lists every pack and file; `Analyse game.bat` writes that to `analysis-out\archive.txt`.
 
-- 2,554,587 sectors; 212 of them hold nothing but zeros, in short gaps between 65 runs of data. The largest unbroken run is 1,717,767 sectors (3.5 GB) from sector 281.
-- **The file doesn't begin with a directory.** Its first `0x360` bytes are zero, and what follows is a file's contents. So where each file lies is recorded somewhere else: *in the program, most likely* (the read-only data segment is 1.3 MB), to be found when the decrypted program is read.
-- **At least some files are compressed** with a byte-oriented LZ scheme: the first one is a text file whose words can be read between the control bytes. A megabyte sampled at 39 places across the archive has 6.2 to 7.9 bits of entropy per byte, so it is a mix of compressed and plain data.
-- Tags that begin a sector many times, and so look like the starts of files of the game's own formats: `ArcL` (88 times), `R7W` (84), `R7T` (53), `RR7 ` (44). *What they are is not known yet.*
+| | |
+|---|---|
+| Files | 12,810, under 466 different names |
+| Packs | 2,088, each with a name of its own |
+| Compressed packs | 908: 4,698,407,702 bytes stored, 10,220,050,505 unpacked |
+| Plain packs | 1,180: 532,465,664 bytes |
+| The archive's size by the directory | 5,231,794,176 bytes: **`RR7.DAT`'s size exactly** |
 
-No `qilin` command reads the archive yet: without its directory there is nothing sound to list.
+- The archive is a run of **packs**, one after another in 2048-byte sectors from sector 0 to the last, with no gaps. A pack is a few files that are loaded together: a car, a course's part, a menu screen.
+- A pack is stored plain or **compressed as a whole**. A compressed pack's bytes are pushed to the *end* of its sectors: the slack is at the front (which is why the archive begins with `0x363` zero bytes, and why zero sectors turn up between runs of data). That is the layout for unpacking in place: read the sectors into the front of a buffer the size of the unpacked pack, and unpack from the back of what was read towards the front. *Inferred from the layout; the unpacking routine is in the program and will be lifted with it.*
+- The file table (20 bytes a file): a position in sectors, the sectors it spans, its alignment (64 bytes, or 2048), its size, its offset in its pack's unpacked bytes, and the address of its name. File names are not unique: 845 packs have a `Tex`, 654 a `Mdl`.
+- The pack table (36 bytes a pack, straight after the files): first sector, sectors, the first file's number and one past the last's, whether it is compressed, the stored and unpacked sizes, three more words (the first small and usually 0: *not understood*), and the address of its name.
+- Five files belong to no pack, and two packs are empty. The last pack is one sector named for the archive itself.
+- A file's first field is its first sector when its pack is plain. For a compressed pack it is some position in the unpacked image: *not understood, and not needed*.
+
+What the names say is in it: textures and their shadow maps at several sizes (the bulk of the bytes), models, materials, the courses' collision and road data (`RoadPoly`, `RunOffArea`, `Danmen`), per-car packs (27 cars, by the names of their sound files), engine sounds (416 `EngineWave` packs), the menus' screens (`Obj_...`), fonts, text in each language, replays and ghosts.
+
+**The compression is not decoded yet.** It is byte-oriented LZ with literal runs (text can be read between the control bytes). The tools don't need it for the game to run (the game's own routine is lifted), only for looking inside the packs.
+
+## The shaders
+
+**They are not in the archive: the program carries them** (`qilin shaders`, `recomp/src/shaders.*`). Its data holds **242 compiled Cg programs** end to end at `0x101ae628`: **121 vertex programs** (profile 7003) and **121 fragment programs** (profile 7004), binary format revision 6, 897,728 bytes of which 142,672 are microcode, with 11,348 parameters named in them. No file in the archive is named for a shader.
+
+So the roadmap's open question is answered as hoped: the shaders are a closed set, known at build time, and can be translated to SPIR-V ahead of time from the player's own program. *Still to check: that nothing in the archive's material files carries microcode of its own.*
 
 ## What this decides
 

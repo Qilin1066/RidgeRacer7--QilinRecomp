@@ -43,6 +43,8 @@ functions.json
 functions.json.gz
 imports.txt
 profile.txt
+archive.txt
+shaders.txt
 cfg.txt
 spu.txt
 data.txt

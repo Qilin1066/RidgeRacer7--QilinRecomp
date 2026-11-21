@@ -16,6 +16,7 @@
 #include <string>
 
 #include "machine.hpp"
+#include "qilin/host/audio.hpp"
 #include "qilin/host/paths.hpp"
 #include "qilin/rt/lifted.hpp"
 #include "qilin/rt/report.hpp"
@@ -59,5 +60,10 @@ int main(int argc, char** argv) {
     info.title_id = sfo->text("TITLE_ID").value_or("");
     info.parental_level = sfo->number("PARENTAL_LEVEL").value_or(0);
     if (info.title_id.empty()) fatal("%s names no title id", files->sfo.string().c_str());
+    // The game's sound, to the host's output: opened when the first of it comes.
+    rr7::set_audio_sink([](const int16_t* left_right, size_t frames) {
+        static qilin::host::AudioOut out;
+        out.push(left_right, frames, 48000);
+    });
     return rr7::run(*elf, {qilin::rt::kLiftedFunctions, qilin::rt::kLiftedFunctionCount}, std::move(info));
 }

@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -40,6 +41,7 @@ std::span<const NativeImport> pad_imports();      // pad.cpp
 std::span<const NativeImport> usbd_imports();     // usbd.cpp
 std::span<const NativeImport> mempool_imports();  // mempool.cpp
 std::span<const NativeImport> gcm_imports();      // gcm.cpp
+std::span<const NativeImport> audio_imports();  // audio.cpp
 std::span<const NativeImport> np_imports();  // np.cpp
 std::span<const NativeImport> net_imports();  // net.cpp
 std::span<const NativeImport> fs_imports();  // fs.cpp
@@ -112,6 +114,9 @@ void become_guest_thread(Cpu& c, uint32_t stack_size, int32_t priority);
 void call_descriptor(Cpu& c, uint32_t descriptor);
 // Tells the game of a system event at its next cellSysutilCheckCallback (sysutil.cpp): 0x0101 is "the player asks to quit".
 void system_event(uint64_t status, uint64_t parameter);
+// Where the game's sound goes (audio.cpp): called from the mixer's thread with 256 left-right pairs of 16-bit
+// samples at 48 kHz, 187.5 times a second. Set before run().
+void set_audio_sink(std::function<void(const int16_t* left_right, size_t frames)> sink);
 // The program's thread-local image: each thread gets a copy.
 struct TlsImage {
     uint32_t address = 0, file_size = 0, memory_size = 0;

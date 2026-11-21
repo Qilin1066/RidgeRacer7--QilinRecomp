@@ -29,7 +29,7 @@ The script builds `qilin`, lifts your copy's program to C++ (`qilin lift <game> 
 
 Each was added when the game reached it, and does what the system's function does as far as the game can tell. The files are in `ridgeracer7/src/`.
 
-**Imports** (94 of the game's 248):
+**Imports** (103 of the game's 248):
 
 | | Functions | What they are here |
 |---|---|---|
@@ -40,6 +40,7 @@ Each was added when the game reached it, and does what the system's function doe
 | `sysutil.cpp` | `cellSysutilGetSystemParamInt`, `cellSysutilGetSystemParamString`, `cellDiscGameGetBootDiscInfo`, `cellSysutilRegisterCallback`, `UnregisterCallback`, `CheckCallback` | the console's settings (fixed for now: US English, cross confirms; the settings menu's Game page will hold them), and the disc's title id and parental level from `PARAM.SFO`. A parameter with no value here stops the game. The system's events (the player asks to quit) are a queue the runtime can put to (`system_event`), handed to the game's registered functions at its per-frame check; nothing puts to it yet |
 | `gamedata.cpp` | `cellGameDataCheckCreate2` | the game's folder on the hard disk (below) |
 | `fs.cpp` | `cellFsOpen`, `Close`, `Read`, `Write`, `Lseek`, `Fstat`, `Opendir`, `Readdir`, `Closedir`, `Unlink` | the file system (below) |
+| `audio.cpp` | `cellAudioInit`, `Quit`, `PortOpen`, `GetPortConfig`, `PortStart`, `PortStop`, `PortClose`, `SetNotifyEventQueue`, `RemoveNotifyEventQueue` | the sound ports: a ring of blocks of 256 float samples which one thread takes 187.5 times a second by the host's clock, mixes to stereo, clears, and tells the game's queues about; out through `host/`'s `AudioOut` (joined in `main.cpp`). The game opens one port of 8 channels and 8 blocks. *An 8-channel port is mixed down with the centre and surrounds at -3 dB and no bass channel: a stated choice, to be compared with the console's down-mixer. The event's own words are zero: the game's sound thread reads none of them* |
 | `spurs.cpp` | `cellSpursInitialize`, `cellSpursAttachLv2EventQueue`, `cellSpursCreateTaskset` | the SPURS instance (4 SPUs) and its tasksets (the game makes four). `cellSpursCreateTask` stops the game and says which SPU program it was handed: that needs the SPU lifter |
 | `net.cpp` | `sys_net_initialize_network_ex`, `sys_net_finalize_network`, `cellNetCtlInit`, `cellNetCtlTerm` | **a console with no network cable**: the libraries start, as they do on one. Sockets and the connection dialog are not provided yet |
 | `np.cpp` | `sceNpInit`, `sceNpTerm`, `sceNpManagerGetStatus` | PlayStation Network on **a console that is not signed in**: the status is "offline" |
@@ -104,7 +105,7 @@ A path is kept inside its mount point (`..` can't climb out), and a name under n
 
 ## Where it stops now
 
-After v0.13.0: **`cellAudioInit`**. By then the game has started SPURS (4 SPUs) and made four tasksets, entered its main loop's system-event check, looked for its game data on the hard disk, opened a directory on the disc, started the network and PlayStation Network libraries (and been told: no cable, not signed in), and set the sound output to stereo. Next is the audio library itself: ports of mixed samples the system takes every 256 samples, out through `host/`'s sound output.
+After v0.13.0: **system call 170, `sys_spu_thread_group_create`**: the game has opened its sound port and now starts its sound core, an SPU program (`bnusCoreSpu.elf`), as an SPU thread. Before that it stopped at `cellAudioInit`: By then the game has started SPURS (4 SPUs) and made four tasksets, entered its main loop's system-event check, looked for its game data on the hard disk, opened a directory on the disc, started the network and PlayStation Network libraries (and been told: no cable, not signed in), and set the sound output to stereo. Nothing is left in front of the SPU lifter now.
 
 Still ahead, and large: **the SPU lifter** (the first SPURS task or SPU thread the game starts needs its program lifted; all 42 programs end with the system's "thread exit" stop, `0x102`, so they are built as plain SPU threads, whatever SPURS is handed), and **the RSX's drawing on Vulkan**.
 

@@ -10,8 +10,10 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The start of SPURS: the instance, event-queue attachment, tasksets.
 - The system's event callbacks, memory containers (system calls 341, 342), the sound output's description (stereo linear PCM at 48 kHz), and the network and PlayStation Network libraries as a console with no cable and not signed in.
 
+- The sound ports (`cellAudio`), mixed by the host's clock and played through `host/`'s sound output.
+
 ### Checked
-- On the owner's PC: the game runs on to `cellAudioInit`, with 94 of its 248 imports and 42 of its 78 system calls provided.
+- On the owner's PC: the game runs on to `sys_spu_thread_group_create` (its sound core, an SPU program), with 103 of its 248 imports and 42 of its 78 system calls provided.
 
 ## [0.13.0] - 2026-11-21
 

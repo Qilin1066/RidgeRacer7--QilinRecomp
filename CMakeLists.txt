@@ -207,6 +207,7 @@ set(BUILD_SHARED_LIBS ${qilin_saved_shared})
 
 add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/events.cpp
+    ridgeracer7/src/audio.cpp
     ridgeracer7/src/fault.cpp
     ridgeracer7/src/font.cpp
     ridgeracer7/src/fs.cpp

@@ -19,6 +19,7 @@
 #include "sfo.hpp"
 #include "sha256.hpp"
 #include "spu.hpp"
+#include "spu_cfg.hpp"
 #include "shaders.hpp"
 #include "spu_image.hpp"
 #include "syscall_names.hpp"
@@ -775,6 +776,48 @@ void test_spu_image() {
     }
 }
 
+// ---------------------------------------------------------------- the SPU control-flow pass
+
+void test_spu_cfg() {
+    // The test SPU program with real code in its four words: a function that
+    // returns, the entry point calling it and returning, and padding.
+    Bytes file = make_spu_elf();
+    put_be32(file, 0x100, 0x35000000);  // 0x3000: bi $0
+    put_be32(file, 0x104, 0x337fff80);  // 0x3004 (the entry point): brsl $0,0x3000
+    put_be32(file, 0x108, 0x35000000);  // 0x3008: bi $0
+    put_be32(file, 0x10c, 0x00200000);  // 0x300c: lnop
+    const auto image = parse_spu_image(file, 0x10052b00);
+    CHECK(image.has_value());
+    if (!image) return;
+    const auto cfg = SpuCfg::build(*image, file);
+    CHECK(cfg.has_value());
+    if (!cfg) return;
+    CHECK(cfg->functions().size() == 2 && cfg->rejected().empty());
+    CHECK(cfg->functions().contains(0x3004) && cfg->functions().at(0x3004).origin == SpuOrigin::Entry);
+    CHECK(cfg->functions().at(0x3004).calls.contains(0x3000) && cfg->functions().at(0x3004).words == 2);
+    CHECK(cfg->functions().contains(0x3000) && cfg->functions().at(0x3000).origin == SpuOrigin::Call);
+    CHECK(cfg->coverage().code == 3 && cfg->coverage().padding == 1 && cfg->coverage().unknown == 0);
+
+    // The same with the call taken out: the first function is code nothing reaches, found as a gap... but it is
+    // the section's first word, with nothing before it to make the boundary clean, so it stays unknown.
+    put_be32(file, 0x104, 0x40200000);  // nop
+    const auto alone = SpuCfg::build(*image, file);
+    CHECK(alone && alone->functions().size() == 1 && alone->coverage().unknown == 1);
+
+    // Code after the entry function's return is a gap, and a function.
+    put_be32(file, 0x100, 0x35000000);  // 0x3000: bi $0   (unknown, as above)
+    put_be32(file, 0x104, 0x35000000);  // 0x3004 (entry): bi $0
+    put_be32(file, 0x108, 0x00200000);  // lnop
+    put_be32(file, 0x10c, 0x35000000);  // 0x300c: bi $0, reached by nothing
+    const auto gap = SpuCfg::build(*image, file);
+    CHECK(gap && gap->functions().contains(0x300c) && gap->functions().at(0x300c).origin == SpuOrigin::Gap);
+
+    // A word that isn't an instruction, reached from the entry point, is reported.
+    put_be32(file, 0x104, 0x07000000);
+    const auto broken = SpuCfg::build(*image, file);
+    CHECK(broken && broken->functions().at(0x3004).bad.size() == 1);
+}
+
 // ---------------------------------------------------------------- sound banks and films
 
 // A bank of two sounds: one of PCM, one of ATRAC3plus.
@@ -1022,6 +1065,7 @@ int main() {
     test_self();
     test_sfo();
     test_media();
+    test_spu_cfg();
     test_shaders();
     test_archive();
     test_syscall_names();

@@ -40,7 +40,7 @@ struct SpuImage {
     std::vector<SpuSegment> segments;
     std::vector<SpuSection> sections;
 
-    uint32_t code_size() const;                 // its executable sections, in bytes
+    uint32_t code_size() const;                 // its code, in bytes (not the 16-byte .SpuGUID)
     const SpuSection* section(std::string_view section_name) const;
 };
 

@@ -28,7 +28,7 @@ std::string text_at(const uint8_t* chars, size_t limit) {
 uint32_t SpuImage::code_size() const {
     uint32_t bytes = 0;
     for (const SpuSection& s : sections)
-        if (s.type == kShtProgbits && (s.flags & kShfExec)) bytes += s.size;
+        if (s.type == kShtProgbits && (s.flags & kShfExec) && s.name != ".SpuGUID") bytes += s.size;  // (16 bytes marked as code that aren't)
     return bytes;
 }
 

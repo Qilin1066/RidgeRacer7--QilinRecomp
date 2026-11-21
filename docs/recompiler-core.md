@@ -1,6 +1,6 @@
 # The recompiler's core
 
-The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.6.0): the PPU decoder and control-flow pass, and the SPU decoder, all run on the game's code.
+The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.7.0): the decoders and control-flow passes for both processors, all run on the game's code.
 
 ## The PPU decoder (`recomp/src/ppu.*`, `qilin::ppu`)
 
@@ -114,7 +114,7 @@ The roadmap's open question was the reference: binutils dropped the SPU after it
 
 ### On the game's SPU programs
 
-`qilin spu-profile`: the 42 programs' **209,660 words; 209,656 decode**. The other four are the one jump table in all of the SPU code (four addresses after a `bi`, in the sound core).
+`qilin spu-profile`: the 42 programs' **209,492 words; 209,488 decode**. The other four are the one jump table in all of the SPU code (four addresses after a `bi`, in the sound core).
 
 - **147 of the 199 instructions are used.** The most frequent: `lqd`, `il`, `stqd`, `shufb`, `ai`, `ori`, `rotqby`, `lqx`: loads, constants and shuffles, as SPU code is.
 - **Floating point is single precision**: `fma` (3,690), `fm`, `fs`, `fcgt`, `fnms`, `fa`, the estimates (`frest`, `frsqest` with `fi`). Double precision appears in two programs only (`dfm`, `dfs`, `dfa`, 219 words), and the double fused forms and compares not at all.
@@ -123,8 +123,45 @@ The roadmap's open question was the reference: binutils dropped the SPU after it
 - 87 `stop` and 8 `stopd`; `heqi` (331) and `hlgti` (41) are the compiler's traps.
 - Not used: `bra`, `brasl`, `iret`, `bisled`, interrupts in general, `sync`, the special-purpose registers, the byte-wise compares and averages, most halfword rotates.
 
+## The SPU control-flow pass (`recomp/src/spu_cfg.*`, `qilin spu-cfg`)
+
+The same job as the PPU pass, on each of the 42 SPU programs. **Every word accounted for: 209,492 words, none unknown.**
+
+| | |
+|---|---|
+| Functions | 2,332 |
+| found by the entry point | 42 |
+| by direct calls (`brsl`) | 1,256 |
+| by tail calls (a branch out of a function) | 197 |
+| by an address loaded with `ila`, or held in data | 23 and 84 |
+| by nothing: unreferenced code at a clean boundary | 730 |
+| Code | 208,634 words |
+| Jump-table entries | 4 |
+| Padding (`nop`, `lnop`, zero) | 854 |
+| Unknown | **0** |
+| Words reached that aren't instructions | 0 |
+
+An SPU program gives less than the PPU program: no descriptors, no unwinding tables, just a statically linked `.text`. So:
+
+- **Calls and returns** are `brsl` and `bi $0`. Function pointers are addresses loaded by `ila` or held in data; both are taken as starts on weak evidence, and one that turns out not to be a function (it reaches a word that isn't an instruction) is dropped. One was: the sound core's jump table, whose address the code loads.
+- **Nearly a third of the functions are called by nothing** (730 of 2,332). The linker kept every function of every object it took, so each program carries library functions it never uses (inline vector-maths functions emitted out of line, most likely). They are real code at clean boundaries (after a return or a jump, and the alignment padding), found one at a time, lowest first, so that a function's own later blocks aren't mistaken for functions. *Whether to lift them is the lifter's choice: nothing reaches them.*
+- **One switch in all of the SPU code**, in the sound core: `bi` through a register, its four absolute addresses in the code at the next 16-byte boundary.
+- `stop` with signal type 0 ends the start-up code (after `exit`, which doesn't return); the other 51 stops are services the program resumes after.
+- 281 functions reach the next function's start without a return or a jump: they end in a call that doesn't return, or run into the function that follows (a tail call by falling through).
+- `.SpuGUID`, 16 bytes marked executable before each program's code, is an identifier, not code. (v0.6.0 counted it: its figure of 209,660 words was 42 × 4 too many.)
+
+**The channels** the programs use, which is the whole of what the runtime must provide in an SPU's place besides memory:
+
+| Channel | Uses | What (by the published channel map) |
+|---|---|---|
+| write 16–21 | 780 each | a memory transfer: local address, effective address (high and low), size, tag, and the command that starts it |
+| write 22, 23; read 24 | 370 each | wait for transfers: the tag mask, the kind of wait, the status |
+| read 27 | 470 | atomic-command status (`getllar`, `putllc`: the lock-free primitives SPURS is built from) |
+| write 28, read 29 | 85, 7 | the outbound and inbound mailboxes |
+| write 30 | 42 | the outbound interrupt mailbox (once in each program: how an SPU calls the system) |
+
 ## Next
 
 1. `verify_decoder.py --game`, where there is both the game and a PowerPC objdump.
 2. ✅ The control-flow pass (v0.4.0, above). Next for it: its output as JSON, and the lifter that reads it.
-3. ✅ The SPU decoder (v0.6.0, above). Next for the SPU: its control-flow pass (branches are relative or through a register; functions start where `brsl` goes), then its lifter.
+3. ✅ The SPU decoder (v0.6.0) and control-flow pass (v0.7.0). Next: the lifters, PPU first.

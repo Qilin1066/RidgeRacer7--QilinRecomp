@@ -21,7 +21,8 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 | The data files: the sound banks' and films' headers, a survey of the archive (`docs/data-files.md`) | ✅ read from the owner's disc: MPEG-2 films at 1280 × 720, ATRAC3plus music in 5.1, PCM speech; the archive's directory is in the program, and read from it: 12,810 files in 2,088 packs, matching `RR7.DAT` to the byte; the 242 compiled shaders are in the program too |
 | Control-flow pass for the PPU code (`docs/recompiler-core.md`) | ✅ on the game: 14,294 functions, 296 switches, 2,845 exception landing pads, all 502 system-call sites numbered; **every one of 1,065,028 words accounted for, none unknown** |
 | SPU decoder: 199 instructions (`docs/recompiler-core.md`) | ✅ identical to objdump (binutils 2.31.1, built by CI) over a 1.66-million-word sweep; on the game's 42 SPU programs all but a four-word jump table decode |
-| SPU control-flow pass; lifters to C++; differential tests | later |
+| SPU control-flow pass (`docs/recompiler-core.md`) | ✅ on the game's 42 SPU programs: 2,332 functions, every one of 209,492 words accounted for |
+| Lifters to C++; differential tests | later |
 | Runtime: the system libraries and system calls replaced natively; the RSX's command stream on Vulkan 1.3; sound, controllers, saves, films | later |
 | The settings menu (F1), the same as the other Qilin recomps' | later, with the window |
 
@@ -89,7 +90,7 @@ With only `EBOOT.BIN` there, `info` prints what its header leaves plain and then
 
 | Path | What |
 |---|---|
-| `recomp/src/` | `elf` (the PS3 program loader), `self` (`EBOOT.BIN`'s plain header), `sfo` (`PARAM.SFO`), `title` (finds the game's files; the known builds), `media` (the sound banks' and films' headers), `spu_image` (the SPU programs inside the program), `import_names` (the imported functions' names), `sha256`, `ppu` (the PPU decoder), `spu` (the SPU decoder), `cfg` (the control-flow pass), `archive` (RR7.DAT's directory), `shaders` (the compiled Cg programs), `main` (the `qilin` CLI) |
+| `recomp/src/` | `elf` (the PS3 program loader), `self` (`EBOOT.BIN`'s plain header), `sfo` (`PARAM.SFO`), `title` (finds the game's files; the known builds), `media` (the sound banks' and films' headers), `spu_image` (the SPU programs inside the program), `import_names` (the imported functions' names), `sha256`, `ppu` (the PPU decoder), `spu` (the SPU decoder), `spu_cfg` (the SPU control-flow pass), `cfg` (the control-flow pass), `archive` (RR7.DAT's directory), `shaders` (the compiled Cg programs), `main` (the `qilin` CLI) |
 | `recomp/tests/` | Unit tests on a program, a SELF and a `PARAM.SFO` built in memory, so they need no game files |
 | `tools/` | `analyse-game.ps1`, behind `Analyse game.bat`; `check/verify_decoder.py` and `check/verify_spu_decoder.py` (the decoders against GNU objdump) |
 | `docs/` | Roadmap and design targets, the program's analysis, the data files, the recompiler's core, prior art, naming |

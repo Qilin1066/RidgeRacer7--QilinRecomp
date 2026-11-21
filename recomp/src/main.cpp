@@ -16,6 +16,7 @@
 //   qilin shaders <game>                     the compiled shader programs the program carries
 //   qilin spu     <game>                     the SPU programs the program carries
 //   qilin cfg     <game>                     the control-flow pass: functions, switches, system calls, coverage
+//   qilin spu-cfg     <game>                 the SPU programs' control flow: functions, coverage, channels
 //   qilin spu-insns   <game>                 every word of the SPU programs' code
 //   qilin spu-profile <game>                 how often the SPU programs use each instruction
 //   qilin spu-disasm  <file> [--base address] [--ignore-reserved]   a file of raw SPU words
@@ -50,6 +51,7 @@
 #include "self.hpp"
 #include "sfo.hpp"
 #include "spu.hpp"
+#include "spu_cfg.hpp"
 #include "shaders.hpp"
 #include "spu_image.hpp"
 #include "title.hpp"
@@ -81,6 +83,7 @@ int usage() {
                "  qilin shaders <game>\n"
                "  qilin spu     <game>\n"
                "  qilin cfg     <game>\n"
+               "  qilin spu-cfg     <game>\n"
                "  qilin spu-insns   <game>\n"
                "  qilin spu-profile <game>\n"
                "  qilin spu-disasm  <file of big-endian words> [--base address] [--ignore-reserved]\n"
@@ -684,7 +687,7 @@ std::vector<SpuCode> spu_code_of(const Elf& elf, const std::vector<SpuImage>& im
     std::vector<SpuCode> code;
     for (const SpuImage& image : images)
         for (const SpuSection& s : image.sections) {
-            if (s.type != kShtProgbits || !(s.flags & kShfExec) || s.size == 0) continue;
+            if (s.type != kShtProgbits || !(s.flags & kShfExec) || s.size == 0 || s.name == ".SpuGUID") continue;  // (16 bytes that aren't code)
             const auto bytes = elf.bytes_at(uint64_t{image.address} + s.offset, s.size);
             if (bytes.empty()) throw Failure{std::format("SPU program {}: its section {} isn't in the file", image.name, s.name)};
             code.push_back({&image, s.address, bytes});
@@ -769,6 +772,20 @@ int cmd_spu_profile(const Args& a) {
     return 0;
 }
 
+int cmd_spu_cfg(const Args& a) {
+    const Elf elf = elf_of(files_of(a));
+    const auto images = find_spu_images(elf);
+    if (!images) throw Failure{images.error()};
+    std::vector<SpuCfg> programs;
+    for (const SpuImage& image : *images) {
+        auto cfg = SpuCfg::build(image, elf.bytes_at(image.address, image.size));
+        if (!cfg) throw Failure{cfg.error()};
+        programs.push_back(std::move(*cfg));
+    }
+    std::print("{}", spu_cfg_summary(programs));
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -792,6 +809,7 @@ int main(int argc, char** argv) {
         if (a.command == "shaders") return cmd_shaders(a);
         if (a.command == "spu") return cmd_spu(a);
         if (a.command == "cfg") return cmd_cfg(a);
+        if (a.command == "spu-cfg") return cmd_spu_cfg(a);
         if (a.command == "spu-insns") return cmd_spu_insns(a);
         if (a.command == "spu-profile") return cmd_spu_profile(a);
         if (a.command == "spu-disasm") return cmd_spu_disasm(a);

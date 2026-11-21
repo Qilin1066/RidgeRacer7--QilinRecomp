@@ -4,6 +4,19 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-21
+
+The SPU control-flow pass.
+
+### Added
+- Control-flow pass for the SPU programs (`recomp/src/spu_cfg.*`, `qilin spu-cfg`): functions from the entry point, calls, tail calls, addresses in `ila` and in data, and unreferenced code at clean boundaries; the one switch; the channels each program uses; word-by-word coverage.
+
+### Checked
+- On the game's 42 SPU programs: 2,332 functions (730 of them called by nothing: library functions the linker kept); **209,492 words: 208,634 code, 4 jump-table entries, 854 padding, 0 unknown**, and no function reaches a word that isn't an instruction.
+
+### Fixed
+- The SPU programs' code was counted with each program's 16-byte `.SpuGUID`, which is marked executable but is an identifier: 209,492 words of code, not the 209,660 of v0.3.0 and v0.6.0.
+
 ## [0.6.0] - 2026-11-21
 
 The SPU decoder.

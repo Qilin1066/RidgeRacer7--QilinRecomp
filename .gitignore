@@ -44,6 +44,7 @@ functions.json.gz
 imports.txt
 profile.txt
 spu-profile.txt
+spu-cfg.txt
 archive.txt
 shaders.txt
 cfg.txt

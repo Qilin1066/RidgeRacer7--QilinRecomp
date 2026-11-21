@@ -194,7 +194,7 @@ What the names say about the game:
 
 ### The SPU programs
 
-`qilin spu`: the section at `0x10052b00` is **42 SPU programs**, each a whole ELF file (32-bit, machine 23), one after another, 1,004,604 bytes and **209,660 words of SPU code** in all: a fifth as much again as the PPU's.
+`qilin spu`: the section at `0x10052b00` is **42 SPU programs**, each a whole ELF file (32-bit, machine 23), one after another, 1,004,604 bytes and **209,492 words of SPU code** in all: a fifth as much again as the PPU's.
 
 | | Programs | |
 |---|---|---|

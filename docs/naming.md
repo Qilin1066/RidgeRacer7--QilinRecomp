@@ -1,6 +1,6 @@
 # Naming
 
-**Qilin** is the author's name. It goes on the *tools*, the things that do the recompiling. It doesn't go on the game. This is the same rule as the other Qilin recomps' (GBTGhoulies-QilinRecomp, ApbArcade-QilinRecomp, BeatTheBeat-QilinRecomp, PunchOutWii-QilinRecomp, WindWakerHD-QilinRecomp).
+**Qilin** is the author's name. It goes on the *tools*, the things that do the recompiling. It doesn't go on the game. This is the same rule as the other Qilin recomps' (GBTGhoulies--QilinRecomp, ApbArcade--QilinRecomp, RhythmHeavenFever--QilinRecomp, PunchOutWii--QilinRecomp, WindWakerHD--QilinRecomp).
 
 | Thing | Name | Why |
 |---|---|---|

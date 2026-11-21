@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Static recompilation of **Ridge Racer 7** (PlayStation 3, USA, `BLUS30001`, version 01.02) to native code. Same requirements and scope as the sister projects (Qilin1066/GBTGhoulies-QilinRecomp, ApbArcade-QilinRecomp, BeatTheBeat-QilinRecomp, PunchOutWii-QilinRecomp, WindWakerHD-QilinRecomp), down to the same settings menu. This repository is Qilin1066/RidgeRacer7--QilinRecomp (two hyphens). The claude.ai Project "Ridge Racer 7 Recomp" holds a short status note (`claude/status.md`); this file and `docs/` are the full record.
+Static recompilation of **Ridge Racer 7** (PlayStation 3, USA, `BLUS30001`, version 01.02) to native code. Same requirements and scope as the sister projects (Qilin1066/GBTGhoulies--QilinRecomp, ApbArcade--QilinRecomp, RhythmHeavenFever--QilinRecomp, PunchOutWii--QilinRecomp, WindWakerHD--QilinRecomp), down to the same settings menu. This repository is Qilin1066/RidgeRacer7--QilinRecomp (two hyphens). The claude.ai Project "Ridge Racer 7 Recomp" holds a short status note (`claude/status.md`); this file and `docs/` are the full record.
 
 ## Requirements (non-negotiable)
 
@@ -21,7 +21,7 @@ Static recompilation of **Ridge Racer 7** (PlayStation 3, USA, `BLUS30001`, vers
 - `tools/analyse-game.ps1` and `Analyse game.bat`: build `qilin` on Windows and write the analysis to `analysis-out/`. Keep the script Windows PowerShell 5.1-compatible and ASCII-only. Run on the owner's PC up to the decrypt message; its steps after that (imports, exports, profile) have not run.
 - `tools/check/verify_decoder.py`: the PPU decoder against GNU objdump (`--sweep` in CI; `--game` needs the decrypted program and a PowerPC objdump).
 - `docs/`: design and results. Keep them current. `roadmap-and-design-targets.md` is the roadmap and every design decision (open ones are marked **open**); `elf-analysis.md` the program and what has been read from the owner's disc; `data-files.md` the sound banks, films and archive; `recompiler-core.md` the decoder and its check; `prior-art.md` what may be taken from where; `naming.md` the names.
-- Still to come, in WindWakerHD-QilinRecomp's layout: `host/` (window, Vulkan, input, audio), `runtime/` (`qilin_rt`), `ridgeracer7/src/` (the game's executable, the system libraries by file, `settings`, `menu`).
+- Still to come, in WindWakerHD--QilinRecomp's layout: `host/` (window, Vulkan, input, audio), `runtime/` (`qilin_rt`), `ridgeracer7/src/` (the game's executable, the system libraries by file, `settings`, `menu`).
 
 ## Build and check
 

@@ -6,11 +6,11 @@ What exists that bears on this port, and what we may take from each. The rule is
 
 | Project | What carries over |
 |---|---|
-| [WindWakerHD-QilinRecomp](https://github.com/Qilin1066/WindWakerHD-QilinRecomp) | The newest of the family and the model for this one: the repository's layout, the tools' shape (`qilin`, the game found however the player holds it), the host layer (SDL3 window, input and audio, Vulkan through volk), the Dear ImGui settings menu, the scheduler for a console with more than one core, the Windows launchers. The Wii U is also the nearest console: an operating system reached through an import table, not hardware registers |
-| [PunchOutWii-QilinRecomp](https://github.com/Qilin1066/PunchOutWii-QilinRecomp) | The PowerPC decoder, control-flow pass and lifter the Wii U project took over. The PS3's PPU is a different PowerPC (64-bit, with VMX and without paired singles), so they are the starting shape, not drop-in files |
-| [BeatTheBeat-QilinRecomp](https://github.com/Qilin1066/BeatTheBeat-QilinRecomp) | The differential test of lifted code, the render thread, the frame pacing and low-latency sound work, the lockstep bot for scripted play |
-| [GBTGhoulies-QilinRecomp](https://github.com/Qilin1066/GBTGhoulies-QilinRecomp) | The requirements and scope all of them share; resolution scaling, widescreen and unlocked frame rate on a game that wasn't written for them; a command-stream GPU (NV2A, the RSX's ancestor) translated to Vulkan with generated shaders |
-| [ApbArcade-QilinRecomp](https://github.com/Qilin1066/ApbArcade-QilinRecomp) | Saved-data protection, input replay, checks against an independent reference |
+| [WindWakerHD--QilinRecomp](https://github.com/Qilin1066/WindWakerHD--QilinRecomp) | The newest of the family and the model for this one: the repository's layout, the tools' shape (`qilin`, the game found however the player holds it), the host layer (SDL3 window, input and audio, Vulkan through volk), the Dear ImGui settings menu, the scheduler for a console with more than one core, the Windows launchers. The Wii U is also the nearest console: an operating system reached through an import table, not hardware registers |
+| [PunchOutWii--QilinRecomp](https://github.com/Qilin1066/PunchOutWii--QilinRecomp) | The PowerPC decoder, control-flow pass and lifter the Wii U project took over. The PS3's PPU is a different PowerPC (64-bit, with VMX and without paired singles), so they are the starting shape, not drop-in files |
+| [RhythmHeavenFever--QilinRecomp](https://github.com/Qilin1066/RhythmHeavenFever--QilinRecomp) | The differential test of lifted code, the render thread, the frame pacing and low-latency sound work, the lockstep bot for scripted play |
+| [GBTGhoulies--QilinRecomp](https://github.com/Qilin1066/GBTGhoulies--QilinRecomp) | The requirements and scope all of them share; resolution scaling, widescreen and unlocked frame rate on a game that wasn't written for them; a command-stream GPU (NV2A, the RSX's ancestor) translated to Vulkan with generated shaders |
+| [ApbArcade--QilinRecomp](https://github.com/Qilin1066/ApbArcade--QilinRecomp) | Saved-data protection, input replay, checks against an independent reference |
 
 ## 2. The game
 

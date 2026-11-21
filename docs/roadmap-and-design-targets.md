@@ -2,7 +2,7 @@
 
 **Guiding principle: efficiency and reliability come first.** Every design choice is judged on whether it makes the game cheaper to run on low-end hardware and whether it fails loudly and predictably instead of silently misbehaving.
 
-The requirements and scope are the same as the other Qilin recomps' (GBTGhoulies-QilinRecomp set them; BeatTheBeat, PunchOutWii and WindWakerHD apply them to Nintendo's consoles), down to the settings menu. Where the PS3 differs, this document says how the same rule applies. Decisions marked **open** wait for the analysis of the game's program; nothing here is assumed about the game that hasn't been read from it or isn't marked as coming from public descriptions.
+The requirements and scope are the same as the other Qilin recomps' (GBTGhoulies--QilinRecomp set them; BeatTheBeat, PunchOutWii and WindWakerHD apply them to Nintendo's consoles), down to the settings menu. Where the PS3 differs, this document says how the same rule applies. Decisions marked **open** wait for the analysis of the game's program; nothing here is assumed about the game that hasn't been read from it or isn't marked as coming from public descriptions.
 
 ## Targets
 - **Game:** *Ridge Racer 7* (Namco Bandai Games, 2006), the **USA** disc (`BLUS30001`, version 01.02; Redump: "Ridge Racer 7 (USA) (En,Ja)"), recognised by SHA-256 (`elf-analysis.md`). Other regions, later patches and the "3D License Version" are other binaries and out of scope for now.
@@ -57,7 +57,7 @@ All enhancements live behind a settings file with presets, as in the other recom
 - *Low-end:* reduced internal resolution, no AF, no MSAA.
 - *Desktop:* scaled resolution, 16× AF, MSAA, widescreen beyond 16:9, high refresh rate.
 
-**The settings menu is the other Qilin recomps' menu** (Dear ImGui; PunchOutWii-QilinRecomp's `menu.cpp` is the model, WindWakerHD-QilinRecomp's the newest copy): F1 or Esc opens it over the game, which pauses (a controller: Back and Start together); Close and Quit top right; closing saves. Three pages:
+**The settings menu is the other Qilin recomps' menu** (Dear ImGui; PunchOutWii--QilinRecomp's `menu.cpp` is the model, WindWakerHD--QilinRecomp's the newest copy): F1 or Esc opens it over the game, which pauses (a controller: Back and Start together); Close and Quit top right; closing saves. Three pages:
 - **Controls:** each PS3 controller button's inputs, press-to-bind (*Add* on a row, then the key, the pad's button or a click; an input already bound elsewhere moves over; click an input to remove it); rumble.
 - **Display:** full screen (also F11 or Alt+Enter) and which display; the picture's size (whole multiples, fit, or fill) and smooth or sharp; its look (plain or the CRT look, kept for parity though this is an HD game); *Look at the picture*; vsync; the enhancement preset, internal resolution and anisotropic filtering; the graphics device; frame times (F3: frame rate, 1% and 0.1% lows, a frame-time graph, the display's refresh).
 - **Game:** the console settings the game reads (**open** until the imports are named; expected: the system language, English or Japanese on this disc; the picture mode the console reports, 480p, 720p or 1080p; the sound output, stereo or 5.1; which button confirms), and Quit.

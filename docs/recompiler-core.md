@@ -1,6 +1,6 @@
 # The recompiler's core
 
-The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.4.0): the PPU decoder and the control-flow pass, both run on the game's code.
+The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.6.0): the PPU decoder and control-flow pass, and the SPU decoder, all run on the game's code.
 
 ## The PPU decoder (`recomp/src/ppu.*`, `qilin::ppu`)
 
@@ -95,8 +95,36 @@ What it works out:
 
 Not done yet: a JSON output for the lifter; proving the last 32 switch sizes; data pointers into code other than descriptors (none are needed for coverage, but vtables point at descriptors, not code, which is worth confirming).
 
+## The SPU decoder (`recomp/src/spu.*`, `qilin::spu`)
+
+An SPU is not a PowerPC: 128 registers of 128 bits, no condition register, 256 KiB of memory of its own, channels to the rest of the machine. Every instruction is one big-endian word whose opcode is its first 4, 7, 8, 9, 10 or 11 bits.
+
+- **199 instructions**, one row each (mnemonic, the opcode and its length, the form, properties), in the PPU decoder's shape. Building the table fails if two opcodes overlap.
+- **Every bit an instruction doesn't define must be zero**, as in the PPU decoder: `clz` with its unused register field set, or `lnop` with anything set, is an invalid word.
+- The text follows objdump's: registers are `$3`, channels `$ch29`, a load is `lqd $3,16($1)`, a branch names the address it reaches, and bits 11 to 13 of the indirect branches, `sync` and `hbr` show in the mnemonic (`bid`, `bie`, `syncc`, `hbrp`). `stop` prints without its signal type, as objdump's does (the decoder has it).
+
+### Checked against binutils 2.31.1
+
+The roadmap's open question was the reference: binutils dropped the SPU after its 2.3x line, so no distribution packages an SPU objdump. **CI builds one**: binutils 2.31.1's source from the GNU server, pinned by SHA-256, configured for `spu-elf`, and kept in a cache. `tools/check/verify_spu_decoder.py` compares the decoder with it word by word.
+
+- `--sweep` (in CI, on every push): 48 random words for each of the 2,048 values of the first 11 bits, then every single-bit neighbour of every word either decoder accepted. **1,664,400 words; 1,476,288 valid and identical; 151,494 invalid for both; none unexplained.**
+- binutils decodes by the opcode alone and ignores every other bit. So for a word qilin rejects, the check asks qilin again to look past reserved bits (`spu-disasm --ignore-reserved`), and if that reading is objdump's, counts it apart: 36,618 words, "reserved bits set". There is no other rule: nothing else differs.
+- The decoder was written from the published instruction set without the reference at hand (binutils' source is not read, only run). The sweep's first run found no fault in any opcode or field, only the two matters of text above.
+- `--game <game>`: every word of the game's SPU code. *Not run: no SPU objdump where the game is.*
+
+### On the game's SPU programs
+
+`qilin spu-profile`: the 42 programs' **209,660 words; 209,656 decode**. The other four are the one jump table in all of the SPU code (four addresses after a `bi`, in the sound core).
+
+- **147 of the 199 instructions are used.** The most frequent: `lqd`, `il`, `stqd`, `shufb`, `ai`, `ori`, `rotqby`, `lqx`: loads, constants and shuffles, as SPU code is.
+- **Floating point is single precision**: `fma` (3,690), `fm`, `fs`, `fcgt`, `fnms`, `fa`, the estimates (`frest`, `frsqest` with `fi`). Double precision appears in two programs only (`dfm`, `dfs`, `dfa`, 219 words), and the double fused forms and compares not at all.
+- **5,547 channel writes and 845 reads**: the programs talk to the system through channels (memory transfers, signals, the mailboxes), which is what the runtime has to provide in place of an SPU's hardware.
+- 4,714 branch hints (`hbra`, `hbr`, `hbrr`): no effect on what a program computes; the lifter drops them.
+- 87 `stop` and 8 `stopd`; `heqi` (331) and `hlgti` (41) are the compiler's traps.
+- Not used: `bra`, `brasl`, `iret`, `bisled`, interrupts in general, `sync`, the special-purpose registers, the byte-wise compares and averages, most halfword rotates.
+
 ## Next
 
 1. `verify_decoder.py --game`, where there is both the game and a PowerPC objdump.
 2. ✅ The control-flow pass (v0.4.0, above). Next for it: its output as JSON, and the lifter that reads it.
-3. The SPU decoder: there are 42 SPU programs and 209,660 words of SPU code, the car's physics among them (`elf-analysis.md`). Its reference is open: binutils dropped the SPU some versions ago (`roadmap-and-design-targets.md`).
+3. ✅ The SPU decoder (v0.6.0, above). Next for the SPU: its control-flow pass (branches are relative or through a register; functions start where `brsl` goes), then its lifter.

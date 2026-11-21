@@ -4,6 +4,19 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-21
+
+The SPU decoder.
+
+### Added
+- SPU decoder (`recomp/src/spu.*`, `qilin::spu`): 199 instructions, in the PPU decoder's table shape, reserved bits required to be zero (`docs/recompiler-core.md`).
+- `qilin spu-insns`, `spu-profile` and `spu-disasm`.
+- `tools/check/verify_spu_decoder.py`, and a CI job that builds its reference: objdump from binutils 2.31.1 for `spu-elf` (pinned by hash, cached), since no current binutils has the SPU.
+
+### Checked
+- Against binutils 2.31.1 in CI: 1,664,400 words swept, 1,476,288 valid and identical, 151,494 invalid for both, 36,618 that differ only in reserved bits binutils ignores, none unexplained. The first run found no fault in any opcode or field.
+- On the game's 42 SPU programs: 209,656 of 209,660 words decode; the other four are a jump table. 147 of the 199 instructions are used; floating point is single precision but for two programs.
+
 ## [0.5.0] - 2026-11-21
 
 The archive's directory, the shaders, and names for the system calls.

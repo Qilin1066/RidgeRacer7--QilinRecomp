@@ -113,6 +113,7 @@ Save-Output "Its SPU programs" $qilin @("spu", $Game) (Join-Path $out "spu.txt")
 Save-Output "Its shaders" $qilin @("shaders", $Game) (Join-Path $out "shaders.txt")
 Save-Output "The archive's directory" $qilin @("archive", $Game, "--files") (Join-Path $out "archive.txt")
 Save-Output "Its control flow" $qilin @("cfg", $Game) (Join-Path $out "cfg.txt")
+Save-Output "Its SPU programs' profile" $qilin @("spu-profile", $Game) (Join-Path $out "spu-profile.txt")
 Save-Output "Its code's profile" $qilin @("profile", $Game) (Join-Path $out "profile.txt")
 
 Write-Host ""

@@ -22,7 +22,8 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 | Control-flow pass for the PPU code (`docs/recompiler-core.md`) | ✅ on the game: 14,294 functions, 296 switches, 2,845 exception landing pads, all 502 system-call sites numbered; **every one of 1,065,028 words accounted for, none unknown** |
 | SPU decoder: 199 instructions (`docs/recompiler-core.md`) | ✅ identical to objdump (binutils 2.31.1, built by CI) over a 1.66-million-word sweep; on the game's 42 SPU programs all but a four-word jump table decode |
 | SPU control-flow pass (`docs/recompiler-core.md`) | ✅ on the game's 42 SPU programs: 2,332 functions, every one of 209,492 words accounted for |
-| Lifters to C++; differential tests | later |
+| PPU lifter, slice 1: integers, loads and stores, branches, calls, switches (`docs/recompiler-core.md`) | 🔨 11,873 of the game's 14,294 functions lift and compile; identical to a separately written reference over 172,896 runs of the differential test, in CI |
+| The rest of the PPU lifter (floating point, VMX, exception landing pads); the SPU lifter | later |
 | Runtime: the system libraries and system calls replaced natively; the RSX's command stream on Vulkan 1.3; sound, controllers, saves, films | later |
 | The settings menu (F1), the same as the other Qilin recomps' | later, with the window |
 
@@ -79,6 +80,7 @@ build/qilin data    <game>                      # the game's own files; the soun
 build/qilin spu     <game>                      # the SPU programs the program carries
 build/qilin cfg     <game>                      # the control-flow pass: functions, switches, system calls, coverage
 build/qilin spu-profile <game>                  # how often the SPU programs use each instruction (spu-insns: every word)
+build/qilin lift    <game> [--out folder]       # lift the PPU code to C++; how much the lifter covers
 build/qilin insns   <game>                      # every word of the program's code: address, word, instruction
 build/qilin profile <game>                      # how often the code uses each instruction
 build/qilin disasm  <file> [--base address]     # a file of raw big-endian PPU words
@@ -90,8 +92,9 @@ With only `EBOOT.BIN` there, `info` prints what its header leaves plain and then
 
 | Path | What |
 |---|---|
-| `recomp/src/` | `elf` (the PS3 program loader), `self` (`EBOOT.BIN`'s plain header), `sfo` (`PARAM.SFO`), `title` (finds the game's files; the known builds), `media` (the sound banks' and films' headers), `spu_image` (the SPU programs inside the program), `import_names` (the imported functions' names), `sha256`, `ppu` (the PPU decoder), `spu` (the SPU decoder), `spu_cfg` (the SPU control-flow pass), `cfg` (the control-flow pass), `archive` (RR7.DAT's directory), `shaders` (the compiled Cg programs), `main` (the `qilin` CLI) |
-| `recomp/tests/` | Unit tests on a program, a SELF and a `PARAM.SFO` built in memory, so they need no game files |
+| `recomp/src/` | `elf` (the PS3 program loader), `self` (`EBOOT.BIN`'s plain header), `sfo` (`PARAM.SFO`), `title` (finds the game's files; the known builds), `media` (the sound banks' and films' headers), `spu_image` (the SPU programs inside the program), `import_names` (the imported functions' names), `sha256`, `ppu` (the PPU decoder), `spu` (the SPU decoder), `spu_cfg` (the SPU control-flow pass), `cfg` (the control-flow pass), `lift` (the PPU lifter), `archive` (RR7.DAT's directory), `shaders` (the compiled Cg programs), `main` (the `qilin` CLI) |
+| `recomp/tests/` | Unit tests on a program, a SELF and a `PARAM.SFO` built in memory, so they need no game files; `difftest/`, the lifter against a reference interpreter |
+| `runtime/` | What lifted code compiles against: the CPU state and its helpers (`cpu.hpp`), the guest's address space (`memory`) |
 | `tools/` | `analyse-game.ps1`, behind `Analyse game.bat`; `check/verify_decoder.py` and `check/verify_spu_decoder.py` (the decoders against GNU objdump) |
 | `docs/` | Roadmap and design targets, the program's analysis, the data files, the recompiler's core, prior art, naming |
 

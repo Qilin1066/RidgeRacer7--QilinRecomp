@@ -20,6 +20,7 @@
 //   qilin spu-insns   <game>                 every word of the SPU programs' code
 //   qilin spu-profile <game>                 how often the SPU programs use each instruction
 //   qilin spu-disasm  <file> [--base address] [--ignore-reserved]   a file of raw SPU words
+//   qilin lift    <game> [--out folder]      lift the PPU code to C++: how many functions the lifter covers, and why not the rest
 //   qilin insns   <game>                     every word of the program's code: address, word, instruction
 //   qilin profile <game>                     how often the code uses each instruction, and what doesn't decode
 //   qilin disasm  <file> [--base address]    a file of raw big-endian PPU words, as `insns` prints them
@@ -46,6 +47,7 @@
 #include "cfg.hpp"
 #include "elf.hpp"
 #include "import_names.hpp"
+#include "lift.hpp"
 #include "media.hpp"
 #include "ppu.hpp"
 #include "self.hpp"
@@ -87,6 +89,7 @@ int usage() {
                "  qilin spu-insns   <game>\n"
                "  qilin spu-profile <game>\n"
                "  qilin spu-disasm  <file of big-endian words> [--base address] [--ignore-reserved]\n"
+               "  qilin lift    <game> [--out folder]\n"
                "  qilin insns   <game>\n"
                "  qilin profile <game>\n"
                "  qilin disasm  <file of big-endian words> [--base address]\n"
@@ -96,7 +99,7 @@ int usage() {
 
 struct Args {
     std::string command, input;
-    std::optional<std::string> json;
+    std::optional<std::string> json, out;
     uint32_t base = 0;
     bool list_files = false, ignore_reserved = false;
 };
@@ -118,6 +121,7 @@ Args parse_args(std::span<char*> argv) {
     for (size_t i = 3; i < argv.size(); ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--json" && i + 1 < argv.size()) a.json = argv[++i];
+        else if (arg == "--out" && i + 1 < argv.size()) a.out = argv[++i];
         else if (arg == "--base" && i + 1 < argv.size()) a.base = parse_address(argv[++i]);
         else if (arg == "--files") a.list_files = true;
         else if (arg == "--ignore-reserved") a.ignore_reserved = true;
@@ -786,6 +790,69 @@ int cmd_spu_cfg(const Args& a) {
     return 0;
 }
 
+// Lifts every function the control-flow pass found. Says how many the
+// lifter's slice covers, and for the rest the reason, most frequent first.
+// With --out, writes the lifted code there (derived from the game: keep it
+// out of the repository), 256 functions to a file.
+int cmd_lift(const Args& a) {
+    const Elf elf = elf_of(files_of(a));
+    const auto cfg = Cfg::build(elf);
+    if (!cfg) throw Failure{cfg.error()};
+    struct Reason {
+        std::string why;
+        size_t functions = 0;
+        uint32_t first = 0;
+    };
+    std::vector<Reason> reasons;
+    size_t lifted = 0, words = 0, lifted_words = 0;
+    std::vector<std::string> code;
+    std::string declarations;
+    for (const auto& [start, f] : cfg->functions()) {
+        words += f.words;
+        const Lifted l = lift(lift_input(*cfg, f));
+        if (l.ok) {
+            ++lifted;
+            lifted_words += f.words;
+            if (a.out) {
+                code.push_back(l.code);
+                declarations += std::format("void {}(Cpu& c);\n", fn_name(start));
+            }
+            continue;
+        }
+        if (a.out) declarations += std::format("void {}(Cpu& c);  // not lifted: {} at {:08X}\n", fn_name(start), l.why, l.why_at);
+        auto it = std::ranges::find(reasons, l.why, &Reason::why);
+        // Reasons that name an address are one reason.
+        if (it == reasons.end()) it = reasons.insert(reasons.end(), Reason{l.why, 0, l.why_at});
+        ++it->functions;
+    }
+    std::ranges::sort(reasons, [](const Reason& x, const Reason& y) { return x.functions > y.functions; });
+    std::println("{} of {} functions lifted ({} of {} instructions)", lifted, cfg->functions().size(), lifted_words, words);
+    std::println("not lifted, by the first instruction outside the slice:");
+    for (size_t i = 0; i < reasons.size() && i < 40; ++i)
+        std::println("  {:6}  {} (first at {:#x})", reasons[i].functions, reasons[i].why, reasons[i].first);
+    if (a.out) {
+        const fs::path folder = *a.out;
+        std::error_code ec;
+        fs::create_directories(folder, ec);
+        const auto write = [&](const fs::path& path, const std::string& text) {
+            std::ofstream f(path, std::ios::binary);
+            f << text;
+            f.close();
+            if (!f) throw Failure{std::format("cannot write {}", path.string())};
+        };
+        write(folder / "functions.hpp", "// Lifted from the game's program by qilin: do not share.\n#pragma once\n#include <bit>\n#include <cstdint>\n"
+                                        "#include \"qilin/rt/cpu.hpp\"\nusing namespace qilin::rt;\n" + declarations);
+        size_t files = 0;
+        for (size_t i = 0; i < code.size(); i += 256) {
+            std::string text = "// Lifted from the game's program by qilin: do not share.\n#include \"functions.hpp\"\n";
+            for (size_t k = i; k < code.size() && k < i + 256; ++k) text += "\n" + code[k];
+            write(folder / std::format("lifted_{:03}.cpp", files++), text);
+        }
+        std::println("{} functions written to {} in {} files", code.size(), folder.string(), files);
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -813,6 +880,7 @@ int main(int argc, char** argv) {
         if (a.command == "spu-insns") return cmd_spu_insns(a);
         if (a.command == "spu-profile") return cmd_spu_profile(a);
         if (a.command == "spu-disasm") return cmd_spu_disasm(a);
+        if (a.command == "lift") return cmd_lift(a);
         if (a.command == "insns") return cmd_insns(a);
         if (a.command == "profile") return cmd_profile(a);
         if (a.command == "disasm") return cmd_disasm(a);

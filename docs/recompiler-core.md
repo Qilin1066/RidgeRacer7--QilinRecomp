@@ -1,6 +1,6 @@
 # The recompiler's core
 
-The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.7.0): the decoders and control-flow passes for both processors, all run on the game's code.
+The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.8.0): the decoders and control-flow passes for both processors, and the first slice of the PPU lifter, all run on the game's code.
 
 ## The PPU decoder (`recomp/src/ppu.*`, `qilin::ppu`)
 
@@ -160,8 +160,45 @@ An SPU program gives less than the PPU program: no descriptors, no unwinding tab
 | write 28, read 29 | 85, 7 | the outbound and inbound mailboxes |
 | write 30 | 42 | the outbound interrupt mailbox (once in each program: how an SPU calls the system) |
 
+## The PPU lifter (`recomp/src/lift.*`, `runtime/include/qilin/rt/cpu.hpp`)
+
+One guest function becomes one C++ function, `void fn_<address>(Cpu& c)`, in the shape the other Qilin recompilers use. `qilin lift <game>` lifts every function the control-flow pass found and says how many the lifter covers.
+
+**Slice 1 (v0.8.0): 11,873 of the game's 14,294 functions lift, 641,755 of 1,059,387 instructions.** What stops the rest is the first instruction outside the slice: floating point (2,053 functions), VMX (363), the time base (5).
+
+How lifted code is shaped:
+
+- **Registers live in host locals.** A function reads the registers it uses from the `Cpu` on entry, works on locals (`uint64_t r3`, a four-bit `cr7`, `lr`, `ctr`, XER's bits one each), and writes them back only where another function can see them: before a call, a return, a trap, a system call; and reads them again after a call.
+- **64-bit mode.** Registers are 64 bits, record forms compare the 64-bit result with zero, carries are out of bit 0 of 64. Only the "word" instructions look at the low 32 (compares with `L` = 0, `mullw`, `divw`, `slw`, `srawi`, the `rlw` rotates, which repeat the rotated word in both halves before masking, as the architecture defines them).
+- **Addresses are 32 bits.** Every effective address is truncated before use; an update form writes the whole 64-bit sum back to its base register.
+- **Memory** is the guest's bytes at `mem + address`, in the guest's order: a load is a `memcpy` and a byte swap.
+- **Direct calls and tail calls are C++ calls** (`fn_00403F14(c)`; a branch out of the function is a call and a return). A return is `return`. `bl` sets `lr` first: the callee may save it.
+- **Indirect calls and jumps** (`bctrl`, a `bctr` that isn't a switch, `blrl`) go through `hooks->call` with the code address.
+- **A switch** is a C++ `switch` on CTR's value, a case for each target address in the table the control-flow pass read; anything else traps.
+- **System calls** (`sc`) go through `hooks->system_call`; traps through `hooks->trap`, which doesn't return.
+- `sync`, `dcbt` and the other cache and ordering instructions need nothing on a host with real threads' memory semantics: *to be revisited with the threading model.*
+- A function that reaches the next function's start without a return (it ends in a call that doesn't return) calls that function and returns.
+
+**Where the architecture leaves a result undefined**, the runtime's helper states its choice (`cpu.hpp`): a divide by zero or of the most negative number by −1 gives 0; the upper half of a word divide is 0 and of `mulhw` the sign extension; `mfocrf` gives the named field and zeros elsewhere. *These are choices, not measurements of the PPU. No code that depends on one is expected; if any is found, RPCS3 running the game is the reference.*
+
+**Not in slice 1, and not skipped silently:** a function with any instruction outside the slice is not lifted, and `qilin lift` counts it under the reason. Floating point and VMX are the next slices; then the time base, `dcbz`, atomic sequences (which this game doesn't use). **Landing pads** are emitted as labels in their functions but nothing can enter at one yet (the open design item in `roadmap-and-design-targets.md`).
+
+With `--out <folder>` the lifted code is written out, 256 functions to a file (derived from the game: keep it out of the repository). All 11,873 functions compile with Visual Studio 2022 (checked on the owner's PC: 47 files, under three minutes).
+
+### The differential test (`recomp/tests/difftest/`, `qilin_difftest`)
+
+The lifter is checked against a **reference interpreter written separately** (`ref.cpp`): from the architecture's definitions, on the raw word's fields, with CR and XER as packed words, carries taken bit by bit, masks built bit by bit, products by long multiplication, memory a byte at a time. It shares only the decoder's naming of the opcode with the lifter. It runs in tests only: nothing interprets at run time.
+
+- `qilin_difftest_gen` (at build time) lifts 24 random valid encodings of each instruction in the slice as a one-instruction function, and small programs for what a single instruction can't show: every conditional branch form the decoder accepts over a spread of condition bits, `bclr`, `bcctr`, traps, a call, a tail call, a system call, a switch.
+- `qilin_difftest` (in `ctest`, so in CI on all six configurations) runs each from 48 random states, weighted towards the edges (zeros, ones, the sign boundaries of each width, a counter about to reach zero), with loads and stores steered into a window of memory and noise above bit 31 of the address. Registers, CR, XER, LR, CTR, the memory, and whether and where it trapped, jumped or called the system must all agree.
+- **3,602 cases, 172,896 runs, all agree.** 135 instructions are covered one at a time.
+- That the test can fail was checked by breaking a helper on purpose (the carry of `sraw`): 179 disagreements, named.
+
+The reference shares the lifter's author and the choices above for undefined results, so it checks the lifter's wiring and arithmetic against the definitions, not the definitions against the hardware.
+
 ## Next
 
 1. `verify_decoder.py --game`, where there is both the game and a PowerPC objdump.
 2. ✅ The control-flow pass (v0.4.0, above). Next for it: its output as JSON, and the lifter that reads it.
-3. ✅ The SPU decoder (v0.6.0) and control-flow pass (v0.7.0). Next: the lifters, PPU first.
+3. ✅ The SPU decoder (v0.6.0) and control-flow pass (v0.7.0).
+4. 🔨 The PPU lifter: slice 1 done (v0.8.0). Next: floating point (bit-exact, `fmadd` as `std::fma`, the FPSCR's rounding mode), then VMX, then landing pads; then the SPU lifter.

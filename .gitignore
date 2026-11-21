@@ -43,6 +43,8 @@ functions.json
 functions.json.gz
 imports.txt
 profile.txt
+lift.txt
+/lifted/
 spu-profile.txt
 spu-cfg.txt
 archive.txt

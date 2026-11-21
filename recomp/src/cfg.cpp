@@ -492,6 +492,7 @@ Function Cfg::explore(uint32_t start, Origin origin, std::vector<uint32_t>& foun
             }
             kind = kCode;
             ++f.words;
+            f.insns.push_back(pc);
             f.end = std::max(f.end, pc + 4);
             const bool always = (in.rd() & 0x14) == 0x14;  // of a conditional branch's BO
             if (in.op == Op::b) {
@@ -548,6 +549,7 @@ Function Cfg::explore(uint32_t start, Origin origin, std::vector<uint32_t>& foun
             if ((in.op == Op::tw || in.op == Op::td || in.op == Op::twi || in.op == Op::tdi) && in.rd() == 31) break;
         }
     }
+    std::ranges::sort(f.insns);
     std::ranges::sort(f.tables, {}, &JumpTable::at);
     std::ranges::sort(f.system_calls, {}, &SystemCall::at);
     if (!f.system_calls.empty()) number_system_calls(f);

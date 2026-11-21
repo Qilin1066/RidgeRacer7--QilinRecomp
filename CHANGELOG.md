@@ -4,6 +4,23 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-21
+
+The PPU lifter's first slice, and the differential test.
+
+### Added
+- The PPU lifter (`recomp/src/lift.*`): a guest function to a C++ function over `qilin::rt::Cpu`, registers in host locals, written back around calls. Slice 1: integer arithmetic and logic in both widths, rotates and shifts, compares and the condition register, loads and stores, LR, CTR and XER, traps, system calls, and every branch, call and switch. A function with anything else is not lifted, and counted under the reason.
+- The runtime's first parts (`runtime/`): the CPU state and the helpers lifted code calls (`cpu.hpp`), and the guest's 4 GiB address space (`memory`).
+- `qilin lift` (with `--out` to write the lifted code).
+- The differential test (`recomp/tests/difftest/`): a reference interpreter written separately from the lifter, a generator of cases, and `qilin_difftest`, in `ctest`.
+
+### Checked
+- On the game: 11,873 of 14,294 functions lift (641,755 of 1,059,387 instructions); the rest wait for floating point (2,053), VMX (363) and the time base (5). All the lifted code compiles with Visual Studio 2022.
+- The differential test: 3,602 cases, 172,896 runs, the lifted code and the reference agree on every register, flag and byte. A fault put into a helper on purpose was caught.
+
+### Not done
+- Floating point, VMX, the time base; entering a function at an exception landing pad; the SPU lifter. Nothing runs yet.
+
 ## [0.7.0] - 2026-11-21
 
 The SPU control-flow pass.

@@ -115,6 +115,7 @@ Save-Output "The archive's directory" $qilin @("archive", $Game, "--files") (Joi
 Save-Output "Its control flow" $qilin @("cfg", $Game) (Join-Path $out "cfg.txt")
 Save-Output "Its SPU programs' control flow" $qilin @("spu-cfg", $Game) (Join-Path $out "spu-cfg.txt")
 Save-Output "Its SPU programs' profile" $qilin @("spu-profile", $Game) (Join-Path $out "spu-profile.txt")
+Save-Output "What the lifter covers" $qilin @("lift", $Game) (Join-Path $out "lift.txt")
 Save-Output "Its code's profile" $qilin @("profile", $Game) (Join-Path $out "profile.txt")
 
 Write-Host ""

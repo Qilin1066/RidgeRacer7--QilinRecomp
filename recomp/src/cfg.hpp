@@ -92,6 +92,7 @@ struct Function {
     bool unwind = false;       // has an unwinding entry, so `bound` is its true end
     const ImportFunction* stub = nullptr;  // an import's stub: a call to it is a call to the system
     uint32_t words = 0;        // instructions reached
+    std::vector<uint32_t> insns;  // their addresses, in order
     std::set<uint32_t> calls;  // direct call targets (bl)
     std::set<uint32_t> tails;  // branch targets outside the function
     std::vector<JumpTable> tables;
@@ -122,6 +123,8 @@ public:
     int rounds() const { return rounds_; }
     // A text report: counts, the system calls made, and everything that needs looking at.
     std::string summary() const;
+    // The decoded word at a code address (invalid outside the code).
+    ppu::Insn insn(uint32_t a) const;
 
 private:
     explicit Cfg(const Elf& elf) : elf_(&elf) {}
@@ -129,7 +132,6 @@ private:
     void run();
     Function explore(uint32_t start, Origin origin, std::vector<uint32_t>& found);
     bool read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out) const;
-    ppu::Insn insn(uint32_t a) const;
     bool in_code(uint32_t a) const;
     uint32_t bound_of(uint32_t start) const;
     void number_system_calls(Function& f) const;

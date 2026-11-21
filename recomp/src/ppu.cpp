@@ -354,7 +354,7 @@ constexpr Row kRows[] = {
     {Op::dstt, with(X(31, 342), kAll), {rA, rB, strm}, kHint},
     {Op::lhax, X(31, 343), {rD, rA0, rB}, kLd},
     {Op::lvxl, X(31, 359), {vD, rA0, rB}, kVL},
-    {Op::mftb, X(31, 371), {rD, tbr}, 0},
+    {Op::mftb, X(31, 371), {rD, tbr}, kTimeBase},
     {Op::lwaux, X(31, 373), {rD, rA, rB}, kLd | k64 | kRaNotZeroOrRd},
     {Op::dstst, without(X(31, 374), kAll), {rA, rB, strm}, kHint},
     {Op::dststt, with(X(31, 374), kAll), {rA, rB, strm}, kHint},
@@ -595,6 +595,7 @@ bool constraints_hold(uint32_t flags, const Insn& in) {
     if ((flags & kBoNoDecrement) && !(in.rd() & 4)) return false;
     if ((flags & kOneCrField) && (in.crm() == 0 || (in.crm() & (in.crm() - 1)) != 0)) return false;
     if ((flags & kSyncKind) && in.ls() == 3) return false;
+    if ((flags & kTimeBase) && in.spr() != 268 && in.spr() != 269) return false;
     return true;
 }
 

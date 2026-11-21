@@ -23,6 +23,7 @@ import argparse
 import collections
 import os
 import random
+import re
 import shutil
 import struct
 import subprocess
@@ -37,7 +38,7 @@ BASE = 0x00010000
 PRIVILEGED = {
     "mfmsr", "mtmsr", "mtmsrd", "rfid", "hrfid", "rfi", "rfsvc",
     "slbie", "slbia", "slbmte", "slbmfev", "slbmfee",
-    "tlbie", "tlbiel", "tlbia", "tlbsync",
+    "tlbie", "tlbiel", "tlbia", "tlbsync", "tlbld", "tlbli", "dcbi",
     "mtsr", "mtsrin", "mfsr", "mfsrin", "mtsrd", "mtsrdin",
 }
 
@@ -50,6 +51,7 @@ PRIVILEGED = {
 def known_difference(word, ours, theirs):
     p = word >> 26
     xo10 = (word >> 1) & 0x3FF
+    xo5 = (word >> 1) & 0x1F
     rd, ra = (word >> 21) & 31, (word >> 16) & 31
     ours_valid = not ours.startswith(".long")
     theirs_valid = not theirs.startswith(".long")
@@ -66,6 +68,30 @@ def known_difference(word, ours, theirs):
         return "bcctr with a BO that decrements CTR (an invalid form)"
     if p == 17 and word & 2 and name == "sc":
         return "sc with reserved bits set (binutils ignores most of them; prints later ISAs' LEV field)"
+    if name in ("lq", "stq"):
+        return "lq/stq: the POWER processors' quadword load and store; not in the PPU"
+    if name == "attn":
+        return "attn: the POWER processors' service-processor call; not in the PPU"
+    if name in ("eciwx", "ecowx"):
+        return "eciwx/ecowx: the optional external control facility; not in the PPU"
+    if name == "dcbzl" and p == 31 and xo10 == 1014 and (word >> 21) & 1:
+        return "dcbz with bit 10 set (the 970's dcbzl; a reserved bit in the architecture the PPU implements)"
+    if p in (10, 11) and (word >> 22) & 1:
+        return "cmpi/cmpli with bit 9 set (reserved; binutils ignores it)"
+    if p == 31 and xo10 in (342, 374) and word & 0x01800001:
+        return "dst/dstst with bits 7-8 or 31 set (reserved; binutils checks none of them)"
+    if p == 31 and xo10 == 822 and word & 0x019FF801:
+        return "dss/dssall with reserved bits set (binutils checks none of them)"
+    if p == 31 and xo10 == 822 and (word >> 25) & 1 and word & 0x00600000:
+        return "dss/dssall with reserved bits set (binutils checks none of them)"
+    if p == 31 and xo10 in (20, 84) and word & 1:
+        return "lwarx/ldarx with bit 31 set (later ISAs' EH hint; reserved on the PPU)"
+    if p == 31 and xo10 == 86 and (word >> 21) & 3:
+        return "dcbf with bits 9-10 set (later ISAs' L field; reserved on the PPU)"
+    if p == 63 and xo10 == 711 and ((word >> 25) & 1 or (word >> 16) & 1):
+        return "mtfsf with bit 6 or 15 set (later ISAs' L and W fields; reserved on the PPU)"
+    if ((p == 59 and xo5 == 24) or (p == 63 and xo5 == 26)) and ra == 1:
+        return "fres/frsqrte with bit 15 set (reserved on the PPU)"
     if p == 31 and xo10 == 597:
         regs = ((((word >> 11) & 31) or 32) + 3) // 4
         if (ra - rd) % 32 < regs:
@@ -105,7 +131,9 @@ def run_objdump(objdump, words, base):
         cols = line.split("\t")
         if len(cols) < 3 or not cols[0].strip().endswith(":"):
             continue
-        result[int(cols[0].strip()[:-1], 16)] = normalise(cols[2])
+        # objdump shows a branch target below zero as a 64-bit address; an LV2
+        # process's addresses are 32 bits wide, and qilin prints those.
+        result[int(cols[0].strip()[:-1], 16)] = re.sub(r"0xffffffff([0-9a-f]{8})$", r"0x\1", normalise(cols[2]))
     return [result[base + 4 * i] for i in range(len(words))]
 
 

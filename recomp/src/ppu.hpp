@@ -232,6 +232,7 @@ enum Flag : uint32_t {
     kLswx = 1u << 22,           // rD differs from rA and rB
     kOneCrField = 1u << 23,     // mfocrf/mtocrf: the mask names exactly one field
     kSyncKind = 1u << 24,       // sync: bits 9-10 are not 3
+    kTimeBase = 1u << 25,       // mftb: the register is the time base (268) or its upper half (269)
 };
 
 struct Spec {

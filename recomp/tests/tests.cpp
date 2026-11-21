@@ -85,6 +85,8 @@ void test_ppu() {
     CHECK(text_of(0x7d908120) == "mtocrf 8,r12");
     CHECK(text_of(0x7d808120) == "mtcrf 8,r12");
     CHECK(!ppu::decode(0x7d918120).valid());               // mtocrf names one field, not two
+    CHECK(text_of(0x7c6c42e6) == "mftb r3,268");
+    CHECK(!ppu::decode(0x7c6102e6).valid());               // mftb reads the time base and nothing else
     // VMX.
     CHECK(text_of(0x10000484) == "vor v0,v0,v0");
     CHECK(text_of(0x7c0000ce) == "lvx v0,0,r0");
@@ -123,6 +125,7 @@ void test_ppu() {
         if (s.flags & ppu::kLswx) word |= 1u << 21;
         if (s.flags & (ppu::kValidBo | ppu::kBoNoDecrement)) word |= 20u << 21;
         if (s.flags & ppu::kOneCrField) word |= 1u << 12;
+        if (s.flags & ppu::kTimeBase) word |= 12u << 16 | 8u << 11;
         const ppu::Insn in = ppu::decode(word);
         if (in.op != s.op) std::println(stderr, "{} doesn't decode from its own bits ({:08x})", s.name, word);
         CHECK(in.op == s.op);

@@ -57,7 +57,7 @@ void cellSpursInitialize(Cpu& c) {
         c.r[3] = kStat;
         return;
     }
-    const Instance instance{spus, static_cast<int32_t>(c.r[5]), static_cast<int32_t>(c.r[6]), c.r[7] != 0};
+    const Instance instance{spus, static_cast<int32_t>(c.r[5]), static_cast<int32_t>(c.r[6]), c.r[7] != 0, {}};
     qilin::rt::log("the game starts SPURS at %08x: %u SPUs, SPU priority %d, PPU priority %d%s", spurs, spus, instance.spu_priority, instance.ppu_priority,
                    instance.exit_if_no_work ? ", exiting when there is no work" : "");
     g_instances.emplace(spurs, instance);

@@ -158,7 +158,26 @@ Made on the owner's PC with RPCS3 0.0.43 (`rpcs3.exe --decrypt <EBOOT.BIN>` does
 | `cellNetCtl` | 4 | | `cellL10n` | 2 |
 | `cellSysmodule` | 2 | | `cellFontFT` | 1 |
 
-Every entry has version 1 and attributes 9. Each stub library of the SDK's list gives one function fewer than it has object files (one object is the library's own entry). The ids are not named yet (`prior-art.md`).
+Every entry has version 1 and attributes 9. Each stub library of the SDK's list gives one function fewer than it has object files (one object is the library's own entry).
+
+### The imports by name
+
+**All 248 are named** (`recomp/src/import_names.*`; `qilin imports` prints them). An id is the first four bytes, read little-endian, of the SHA-1 of the function's name followed by a fixed 16-byte suffix, so an id can't be turned back into a name but a proposed name can be checked. The names proposed were the SDK's own names for each library's functions, as public documentation and homebrew headers give them; each of the 248 was accepted only when its computed id matched. The computation was done outside the repository: **the table holds the pairs, and the suffix is not in this repository** (it is not a key and decrypts nothing, but the project keeps clear of Sony's constants as a matter of course; the owner may decide otherwise, and then a test can recompute every id). PSL1GHT's export lists (MIT) carry 138 of the same ids in the same libraries, under PSL1GHT's own names: an independent check that those ids are real.
+
+What the names say about the game:
+
+- **Graphics** (`cellGcmSys`, 15): initialisation, the display buffers and flips, tiled and Zcull memory, the vertical-blank handler. Everything else is the command stream.
+- **SPUs**: SPURS **tasksets** (`cellSpursCreateTaskset`, `cellSpursCreateTask`, event flags, event queues), so the 41 SPURS-shaped SPU programs are tasks, not jobs; and `sys_spu_image_import` and `sys_spu_image_close`, for an SPU program started outside SPURS (*`bnusCoreSpu.elf`, presumably*; the thread-group calls it needs are system calls).
+- **Sound**: `cellAudio` ports with an event queue; `cellAtrac` (14: the music, with its loops and second buffer); `cellAdec` (7: the films' sound).
+- **Films**: `cellPamf`, `cellDmux`, `cellVdec`: the system's demultiplexer and video decoder, all three to be replaced natively.
+- **Controllers**: `cellPad` with pressure and motion sensors asked for; `cellUsbd` (11) with its own device driver registered (`cellUsbdRegisterExtraLdd`): steering wheels, driven by the game itself.
+- **Saves and the hard disk**: `cellSaveData` in its list, fixed and automatic forms; `cellGameDataCheckCreate2` (the game keeps data on the hard disk); `cellDiscGameGetBootDiscInfo`.
+- **Dialogs**: `cellMsgDialog`, `cellOskDialog` (the on-screen keyboard), `cellNetCtl`'s network-start dialog.
+- **Video and audio output**: `cellVideoOut` (state, resolution, configure) and `cellAudioOut` (availability, configure).
+- **Text**: `cellFont` with FreeType (18 and 1), `cellL10n` (two conversions to UTF-8).
+- **Files** (`cellFs`, 10): open, read, write, seek, stat, directories, unlink. No asynchronous or streaming reads.
+- **Network**: `sceNp` (46: matchmaking, scores, signalling, messages, presence) and five sockets calls. All of it for the online modes, which are out of scope.
+- **The process** (`sysPrxForUser`, 17): threads, lightweight mutexes, memory pools, thread-local storage, exit.
 
 ### The code
 
@@ -192,6 +211,6 @@ Every entry has version 1 and attributes 9. Each stub library of the SDK's list 
 ## Next
 
 1. ✅ The decrypted program read (v0.3.0).
-2. Names for the 248 ids (`prior-art.md`), and for the 78 system calls.
+2. ✅ Names for the 248 ids. Still to do: names for the 78 system calls.
 3. ✅ The PPU decoder (v0.2.0, `recompiler-core.md`), its profile of the real code and the SPU programs found (v0.3.0).
 4. The decoder against objdump over every word of the real code (it needs a PowerPC objdump where the game is); the control-flow pass, which reads the jump tables and the remaining 25 system calls; the SPU decoder.

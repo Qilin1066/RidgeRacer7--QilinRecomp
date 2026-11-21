@@ -10,6 +10,7 @@
 
 #include "elf.hpp"
 #include "elf_builder.hpp"
+#include "import_names.hpp"
 #include "media.hpp"
 #include "ppu.hpp"
 #include "self.hpp"
@@ -322,6 +323,24 @@ void test_self() {
     CHECK(stamps && stamps->size() == 3 && (*stamps)[0].objects == 2 && (*stamps)[1].name == "libstdc++" &&
           (*stamps)[2].name == "libsysutil_np_matching_int_stub_03");
     CHECK(parse_sdk_stamps("") && parse_sdk_stamps("")->empty());
+}
+
+// ---------------------------------------------------------------- import names
+
+void test_import_names() {
+    CHECK(import_name("sys_fs", 0x718bf5f8) == "cellFsOpen");
+    CHECK(import_name("cellGcmSys", 0x15bae46b) == "_cellGcmInitBody");
+    CHECK(import_name("sysPrxForUser", 0x1573dc3f) == "sys_lwmutex_lock");
+    CHECK(import_name("sys_fs", 0x15bae46b).empty());  // an id belongs to its library
+    CHECK(import_name("cellNoSuch", 0x718bf5f8).empty());
+    // No pair twice, no name twice in a library, and nothing empty.
+    const auto names = import_names();
+    CHECK(names.size() == 248);
+    for (size_t i = 0; i < names.size(); ++i) {
+        CHECK(!names[i].library.empty() && !names[i].name.empty());
+        for (size_t k = i + 1; k < names.size(); ++k)
+            CHECK(names[i].library != names[k].library || (names[i].id != names[k].id && names[i].name != names[k].name));
+    }
 }
 
 // ---------------------------------------------------------------- SPU programs
@@ -669,6 +688,7 @@ int main() {
     test_self();
     test_sfo();
     test_media();
+    test_import_names();
     test_spu_image();
     test_title();
     if (failures) {

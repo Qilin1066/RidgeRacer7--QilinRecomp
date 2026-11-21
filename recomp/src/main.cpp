@@ -35,6 +35,7 @@
 
 #include "bytes.hpp"
 #include "elf.hpp"
+#include "import_names.hpp"
 #include "media.hpp"
 #include "ppu.hpp"
 #include "self.hpp"
@@ -280,16 +281,20 @@ int cmd_info(const Args& a) {
         std::println("  (no section names: the table of names is empty in this file, as RPCS3 writes it)");
     if (const auto images = find_spu_images(elf)) std::println("  SPU programs carried: {}", images->size());
     else throw Failure{images.error()};
-    size_t functions = 0, variables = 0, stubs = 0;
+    size_t functions = 0, variables = 0, stubs = 0, named = 0;
     std::println("  imports:");
     for (const ImportLibrary& l : elf.imports()) {
         std::println("    {:28} {:4} functions {:3} variables", l.name, l.functions.size(), l.variables.size());
         functions += l.functions.size();
         variables += l.variables.size() + l.tls_variables;
-        for (const ImportFunction& f : l.functions) stubs += f.stub;
+        for (const ImportFunction& f : l.functions) {
+            stubs += f.stub;
+            named += !import_name(l.name, f.id).empty();
+        }
     }
     std::println("  {} libraries, {} functions, {} variables; {} of the functions' slots point at a stub that calls through them",
                  elf.imports().size(), functions, variables, stubs);
+    std::println("  {} of the functions have a name", named);
     size_t exported = 0;
     for (const ExportLibrary& l : elf.exports()) exported += l.functions.size() + l.variables.size();
     std::println("  exports: {} entries, {} symbols", elf.exports().size(), exported);
@@ -301,9 +306,12 @@ int cmd_imports(const Args& a) {
     const Elf elf = elf_of(files_of(a));
     for (const ImportLibrary& l : elf.imports()) {
         std::println("{} (version {:#x}, attributes {:#x}, entry at {:#x})", l.name, l.version, l.attributes, l.entry);
-        for (const ImportFunction& f : l.functions)
-            std::println("  function {:08x}  slot {:#x}  {}", f.id, f.slot,
-                         f.stub ? std::format("stub {:#x}", f.initial) : std::format("holds {:#x} (not a stub)", f.initial));
+        for (const ImportFunction& f : l.functions) {
+            const std::string_view name = import_name(l.name, f.id);
+            std::println("  function {:08x}  slot {:#x}  {}  {}", f.id, f.slot,
+                         f.stub ? std::format("stub {:#x}", f.initial) : std::format("holds {:#x} (not a stub)", f.initial),
+                         name.empty() ? "(no name)" : name);
+        }
         for (const ImportVariable& v : l.variables) std::println("  variable {:08x}  slot {:#x}", v.id, v.slot);
         if (l.tls_variables) std::println("  {} thread-local variables", l.tls_variables);
     }

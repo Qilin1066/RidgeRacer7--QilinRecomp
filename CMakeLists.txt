@@ -72,6 +72,7 @@ endfunction()
 # only), PARAM.SFO, and finding them in the player's copy.
 add_library(qilin_game STATIC
     recomp/src/elf.cpp
+    recomp/src/import_names.cpp
     recomp/src/media.cpp
     recomp/src/self.cpp
     recomp/src/sfo.cpp

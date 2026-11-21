@@ -252,7 +252,6 @@ private:
             if (record_form || record) s += std::format(" {} = record(r{}, {});", CR(0), dst, SO());
             line(s);
         };
-        const auto ra0 = [&] { return a == 0 ? std::string("0ull") : R(a); };
         // Effective addresses, as the 64-bit sum (an update form writes it back whole) and truncated to an address.
         const auto ea_d = [&](int32_t disp) { return a ? R(a) + plus(disp) : imm64(disp); };
         const auto ea_x = [&] { return a ? std::format("{} + {}", R(a), R(b)) : R(b); };

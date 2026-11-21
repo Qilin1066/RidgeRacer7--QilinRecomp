@@ -1,6 +1,6 @@
 # The recompiler's core
 
-The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.2.0): the PPU decoder.
+The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.3.0): the PPU decoder, run on the game's code.
 
 ## The PPU decoder (`recomp/src/ppu.*`, `qilin::ppu`)
 
@@ -25,7 +25,7 @@ Addresses are 32 bits wide, as an LV2 process's are: a branch target wraps at 4 
 `tools/check/verify_decoder.py` compares the decoder with GNU objdump word by word: the mnemonic and every operand must match, and a word must be valid for both or for neither.
 
 - `--sweep` (in CI, on every push): 24 random words for each of opcode 4's 2048 extended opcodes and each of the 1024 of opcodes 19, 31, 59 and 63, 4096 for every other primary opcode, and then **every single-bit neighbour of every word either decoder accepted**, which tests the edge of each instruction's reserved bits. With binutils 2.42: **4,931,891 words; 4,266,210 valid and identical; 539,096 invalid for both; no unexplained disagreement.**
-- `--game <game>`: every word of the game's code sections. *Not run yet: it needs the decrypted program.*
+- `--game <game>`: every word of the game's code sections. *Not run yet: the decrypted program is on the owner's PC, which has no PowerPC objdump, and CI has no game.*
 
 The rest of the sweep's words are disagreements that have been reviewed, each matched by a rule as narrow as its cause (`known_difference` in the script), so anything new still fails:
 
@@ -47,7 +47,7 @@ The sweep's first run found one fault in the decoder (`mftb` accepted any regist
 
 **Not settled by the sweep**, because binutils can't say what the PPU itself does:
 
-- `dcbzl`, `mcrxr`, `ldbrx` and `stdbrx`: whether the PPU has them is from public descriptions. The first is left out and the other three are in; the profile of the game's code will say whether any of it matters.
+- `dcbzl`, `mcrxr`, `ldbrx` and `stdbrx`: whether the PPU has them is from public descriptions. The first is left out and the other three are in. **None of it matters to this game**: its code uses none of the four, nor `dcbz` (v0.3.0).
 - `vspltb`, `vsplth` and `vspltw` take an element number of 4, 3 and 2 bits, as binutils has them; the bits above are reserved here.
 - `dcbt` and `dcbtst` accept any `TH`: a prefetch hint changes nothing the program can see.
 
@@ -59,10 +59,10 @@ build/qilin profile <game>                  # how often each instruction is used
 build/qilin disasm  <file> [--base 0x10000] # a file of raw big-endian words, as insns prints them
 ```
 
-`insns` and `profile` read the decrypted program's executable sections, and have only met synthetic programs so far. `profile` is the next thing to run on the real one: it says which VMX and 64-bit forms the game uses, which is the lifter's work list.
+`insns` and `profile` read the decrypted program's executable sections. On the real program (v0.3.0, `elf-analysis.md`): 1,065,028 words, 99.47% of which decode; the rest are jump tables and constants lying in the code. The game uses **151 of the 383 instructions**, which is the lifter's work list: a narrow, floating-point part of VMX, no atomic sequences, no cache instructions but `dcbt`.
 
 ## Next
 
-1. The profile of the real code, and `verify_decoder.py --game`.
+1. `verify_decoder.py --game`, where there is both the game and a PowerPC objdump.
 2. The control-flow pass: seeds from the function descriptors and the unwinding tables, the import stubs as known calls, the `sc` sites with their numbers, coverage to 0 unknown words.
-3. The SPU decoder, once the SPU programs are found and counted. Its reference is open: binutils dropped the SPU some versions ago (`roadmap-and-design-targets.md`).
+3. The SPU decoder: there are 42 SPU programs and 209,660 words of SPU code, the car's physics among them (`elf-analysis.md`). Its reference is open: binutils dropped the SPU some versions ago (`roadmap-and-design-targets.md`).

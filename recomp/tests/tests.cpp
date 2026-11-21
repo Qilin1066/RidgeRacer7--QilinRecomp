@@ -15,6 +15,7 @@
 #include "self.hpp"
 #include "sfo.hpp"
 #include "sha256.hpp"
+#include "spu_image.hpp"
 #include "title.hpp"
 
 using namespace qilin;
@@ -323,6 +324,105 @@ void test_self() {
     CHECK(parse_sdk_stamps("") && parse_sdk_stamps("")->empty());
 }
 
+// ---------------------------------------------------------------- SPU programs
+
+// An SPU program: a code segment of four words at 0x3000, a data segment, a
+// name note, and the sections naming them. Laid out as the SPU's linker does:
+// the section headers last.
+Bytes make_spu_elf(std::string_view name = "Test_r.elf") {
+    const uint32_t code_at = 0x100, note_at = 0x120, names_at = 0x160, sections_at = 0x1a0;
+    const std::string_view names("\0.text\0.note.spu_name\0.shstrtab\0", 31);
+    Bytes b(sections_at + 4 * 40);
+    const uint8_t ident[7] = {0x7f, 'E', 'L', 'F', 1, 2, 1};
+    std::memcpy(b.data(), ident, 7);
+    put_be16(b, 16, 2);
+    put_be16(b, 18, 23);
+    put_be32(b, 20, 1);
+    put_be32(b, 24, 0x3004);  // entry
+    put_be32(b, 28, 52);      // program headers
+    put_be32(b, 32, sections_at);
+    put_be16(b, 40, 52);
+    put_be16(b, 42, 32);
+    put_be16(b, 44, 2);
+    put_be16(b, 46, 40);
+    put_be16(b, 48, 4);
+    put_be16(b, 50, 3);
+    const auto segment = [&](size_t i, uint32_t type, uint32_t offset, uint32_t address, uint32_t file, uint32_t memory, uint32_t flags) {
+        const size_t at = 52 + i * 32;
+        put_be32(b, at, type);
+        put_be32(b, at + 4, offset);
+        put_be32(b, at + 8, address);
+        put_be32(b, at + 16, file);
+        put_be32(b, at + 20, memory);
+        put_be32(b, at + 24, flags);
+    };
+    segment(0, 1, code_at, 0x3000, 16, 16, 5);
+    segment(1, 4, note_at, 0, 0x20, 0, 4);
+    put_be32(b, note_at, 8);
+    put_be32(b, note_at + 4, 0x20);
+    put_be32(b, note_at + 8, 1);
+    put_text(b, note_at + 12, "SPUNAME");
+    put_text(b, note_at + 20, name);
+    put_text(b, names_at, names);
+    const auto section = [&](size_t i, uint32_t name_at, uint32_t type, uint32_t flags, uint32_t address, uint32_t offset, uint32_t size) {
+        const size_t at = sections_at + i * 40;
+        put_be32(b, at, name_at);
+        put_be32(b, at + 4, type);
+        put_be32(b, at + 8, flags);
+        put_be32(b, at + 12, address);
+        put_be32(b, at + 16, offset);
+        put_be32(b, at + 20, size);
+    };
+    section(1, 1, 1, 6, 0x3000, code_at, 16);
+    section(2, 7, 7, 0, 0, note_at, 0x34);
+    section(3, 22, 3, 0, 0, names_at, 31);
+    return b;
+}
+
+std::string spu_error(const Bytes& b) {
+    auto image = parse_spu_image(b, 0x10052b00);
+    return image ? std::string() : image.error();
+}
+
+void test_spu_image() {
+    Bytes spu = make_spu_elf();
+    const size_t size = spu.size();
+    spu.resize(size + 0x40);  // what follows it in the program's data
+    const auto image = parse_spu_image(spu, 0x10052b00);
+    CHECK(image.has_value());
+    if (image) {
+        CHECK(image->address == 0x10052b00 && image->size == size && image->entry == 0x3004);
+        CHECK(image->name == "Test_r.elf" && image->code_size() == 16);
+        CHECK(image->segments.size() == 2 && image->segments[0].address == 0x3000);
+        CHECK(image->section(".text") && image->section(".text")->address == 0x3000 && !image->section(".data"));
+    }
+    Bytes bad = spu;
+    put_be16(bad, 18, 21);
+    CHECK(has(spu_error(bad), "not for the SPU"));
+    bad = spu;
+    put_be32(bad, 24, 0x4000);
+    CHECK(has(spu_error(bad), "entry point"));
+    bad = spu;
+    put_be32(bad, 52 + 8, 0x3fff8);  // the code would run off the end of an SPU's memory
+    CHECK(has(spu_error(bad), "doesn't fit an SPU's memory"));
+    bad = spu;
+    put_be32(bad, 32, 0x10000);
+    CHECK(has(spu_error(bad), "tables run past"));
+    bad = spu;
+    put_be32(bad, 0x1a0 + 40 + 20, 14);  // code that isn't whole words
+    CHECK(has(spu_error(bad), "whole number of words"));
+    bad = spu;
+    bad[4] = 2;
+    CHECK(has(spu_error(bad), "not a 32-bit big-endian ELF"));
+    // The test program carries none.
+    const auto elf = Elf::parse(make_elf());
+    CHECK(elf.has_value());
+    if (elf) {
+        const auto none = find_spu_images(*elf);
+        CHECK(none.has_value() && none->empty());
+    }
+}
+
 // ---------------------------------------------------------------- sound banks and films
 
 // A bank of two sounds: one of PCM, one of ATRAC3plus.
@@ -569,6 +669,7 @@ int main() {
     test_self();
     test_sfo();
     test_media();
+    test_spu_image();
     test_title();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);

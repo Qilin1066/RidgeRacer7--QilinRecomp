@@ -1,12 +1,12 @@
 # The program: getting it, its format, and what has been read
 
-How to get the game's program, what a PS3 program is, and what `qilin` reads from it. The owner's disc has been read as far as it can be without decrypting (v0.1.0, below); the decrypted program has not been read yet.
+How to get the game's program, what a PS3 program is, and what `qilin` reads from it. The owner's disc was read as far as it can be without decrypting (v0.1.0), and the decrypted program since (v0.3.0): both below.
 
 ## Getting the program
 
 The game's code is one file on the disc, `PS3_GAME/USRDIR/EBOOT.BIN`. It is a **SELF**: the program encrypted with Sony's keys. This project has no keys and will never carry any, so the player makes the decrypted program from their own disc, once:
 
-1. In RPCS3: **Utilities > Decrypt PS3 Binaries**, and choose your disc's `EBOOT.BIN`. It writes `EBOOT.elf`.
+1. In RPCS3: **Utilities > Decrypt PS3 Binaries**, and choose your disc's `EBOOT.BIN`. It writes `EBOOT.elf`. (Or, from a command line: `rpcs3.exe --decrypt <path to EBOOT.BIN>`. RPCS3 needs no setting up for this, and no firmware.)
 2. Put `EBOOT.elf` beside `EBOOT.BIN`, in `USRDIR`.
 
 `qilin` takes your copy however you point at it: the disc's folder (the one holding `PS3_GAME`), `PS3_GAME` or `USRDIR`, `EBOOT.BIN`, or `EBOOT.elf`. With both files there it checks that the ELF is that `EBOOT.BIN`'s program (the same entry point and program headers) and refuses one that isn't. With only `EBOOT.BIN` it prints what the header leaves plain and says the two steps above.
@@ -29,7 +29,7 @@ On Windows, `Analyse game.bat` builds `qilin` and writes all of this to `analysi
 
 **PARAM.SFO.** A small little-endian table of keys and values: the game's title, id and version, and the picture and sound formats it says it supports.
 
-Every table is validated when a file is opened: a field that doesn't fit is an error naming it, never a guess. The loaders' reading of the formats is tested on synthetic files (`recomp/tests/elf_builder.hpp`), and the SELF and PARAM.SFO readers on the owner's disc. **The ELF loader has not met the real program yet**: each assumption above is a hard error if the real file contradicts it, so the first run says which.
+Every table is validated when a file is opened: a field that doesn't fit is an error naming it, never a guess. The loaders' reading of the formats is tested on synthetic files (`recomp/tests/elf_builder.hpp`), and the SELF and PARAM.SFO readers on the owner's disc. The ELF loader met the real program at v0.3.0 and read it with nothing to fix (below).
 
 ## The owner's disc (read 2026-11-21, v0.1.0)
 
@@ -43,7 +43,7 @@ Every table is validated when a file is opened: a field that doesn't fit is an e
 | `EBOOT.BIN` | 7,821,232 bytes, SHA-256 `095ed6cb8e90538309b57662fb19da1ba2c4bdbac5fd40dc0be6122e76d4c0db` (`qilin` recognises it) |
 | SELF | key revision 1, an application (type 4), every loaded segment encrypted |
 | Entry point | the descriptor at `0x4bb1a0` |
-| The decrypted program's SHA-256 | *to be recorded by the first analysis* (`known_build` in `recomp/src/title.cpp`) |
+| The decrypted program's SHA-256 | `689f9704ee9dbd982c48de646f07d69c193a46513d75b6f95f20a206c7754831`, as RPCS3 0.0.43 writes it (`known_build` in `recomp/src/title.cpp`) |
 
 ### Program headers
 
@@ -62,7 +62,7 @@ The flags above the usual three bits are the PS3's own (which processor a segmen
 
 ### Sections
 
-The SELF keeps the section headers plain but the table of their names encrypted. The names below are **inferred** from each name's length (the headers give every name's offset in the table) and the PS3 linker's usual layout; the decrypted ELF will confirm or correct them.
+The SELF keeps the section headers plain but the table of their names encrypted. The names below are **inferred** from each name's length (the headers give every name's offset in the table) and the PS3 linker's usual layout; the decrypted ELF was expected to confirm or correct them, but RPCS3 writes the table of names as zeros (below), so they stay inferred. What has been confirmed by content: `.text` (the entry point is its first word), the stubs, the import tables, and the nine-letter section, which is the SPU programs.
 
 | Address | Size | Likely name | What it tells us |
 |---|---|---|---|
@@ -86,7 +86,7 @@ The SELF keeps the section headers plain but the table of their names encrypted.
 | `0x004d6880` | `0x2700` | `.got` | |
 | `0x004d8f80` | 4, then `0x1b0` zero | `.tdata`, `.tbss` | thread-local storage |
 | `0x10000000` | `0x52aac` | `.rodata` | |
-| `0x10052b00` | `0xf6200` | (nine letters) | 1,008,128 writable bytes aligned to 128, the alignment SPU program images are given: **probably the embedded SPU programs** |
+| `0x10052b00` | `0xf6200` | (nine letters) | 1,008,128 writable bytes aligned to 128: **the 42 SPU programs** (below) |
 | `0x10150000` | `0x13c598` | `.data` | |
 | `0x1028c5a0` | `0x538c30` | `.bss` | 5.2 MB zero-filled |
 
@@ -127,8 +127,71 @@ The compiler is GCC (the C++ runtime is `libstdc++`, and the program has `.eh_fr
 
 In `USRDIR`: `RR7.DAT` (5.23 GB: the game's own archive), `BGM.nub` (616 MB) and `Game_DJ.nub` (152 MB) (Namco's sound banks: music and the announcer), and seven `.pam` films (`intro`, `ending`, `menu`, `title`, `title2`, `auroravision`, `e3`; 1.19 GB together). Their headers have been read since (v0.2.0): `data-files.md`.
 
+## The decrypted program (read 2026-11-21, v0.3.0)
+
+Made on the owner's PC with RPCS3 0.0.43 (`rpcs3.exe --decrypt <EBOOT.BIN>` does from the command line what the menu does, and writes `EBOOT.elf` beside it). **The loader read it with nothing to fix**: every table was where and what the loader expected, and the ELF's headers match the SELF's plain copy.
+
+| | |
+|---|---|
+| `EBOOT.elf` | 7,818,800 bytes (the SELF less its `0x980`-byte header), SHA-256 `689f9704ee9dbd982c48de646f07d69c193a46513d75b6f95f20a206c7754831` (`qilin` recognises it) |
+| Entry point | the descriptor at `0x4bb1a0`: code at `0x1022c` (the first word of `.text`), `r2` = `0x4de880` |
+| Process parameters | SDK version `0x102002`, main thread priority 1001, stack `0x20000` (128 KiB), heap page size `0x100000` (1 MiB) |
+| Thread-local storage | at `0x4d8f80`: 4 bytes initialised, `0x1b8` in all, aligned to 8 |
+| Imports | 22 libraries, 248 functions, no variables; **all 248 slots hold the address of their stub** |
+| Exports | none: the export table is empty |
+
+**What RPCS3's file lacks.** It writes zeros for the three sections that lie outside every segment: `.comment`, the list of SDK stamps (which the SELF holds plain, and `qilin` reads from there), and **the table of section names**. So the section names above stay inferred, and the PPU compiler's version can't be read from `.comment`. The SPU programs carry their own `.comment` (below), and the whole game was presumably built with one toolchain. *Whether the hash is the same from other versions of RPCS3 is not known*: it should be, since the decryption has one right answer and the rest is zeros.
+
+### The imported libraries
+
+| Library | Functions | | Library | Functions |
+|---|---|---|---|---|
+| `sceNp` | 46 | | `cellPamf` | 10 |
+| `cellSysutil` | 26 | | `cellDmux` | 10 |
+| `cellFont` | 18 | | `sys_io` | 9 |
+| `sysPrxForUser` | 17 | | `cellAudio` | 9 |
+| `cellGcmSys` | 15 | | `sys_net` | 7 |
+| `cellAtrac` | 14 | | `libvdec` | 7 |
+| `cellSpurs` | 13 | | `cellAdec` | 7 |
+| `cellUsbd` | 11 | | `sceNpMatchingInt` | 5 |
+| `sys_fs` | 10 | | `cellRtc` | 5 |
+| `cellNetCtl` | 4 | | `cellL10n` | 2 |
+| `cellSysmodule` | 2 | | `cellFontFT` | 1 |
+
+Every entry has version 1 and attributes 9. Each stub library of the SDK's list gives one function fewer than it has object files (one object is the library's own entry). The ids are not named yet (`prior-art.md`).
+
+### The code
+
+`qilin profile`: **1,065,028 words** in the four executable sections; **1,059,425 decode** (99.47%).
+
+- **The 5,603 that don't are data in the code**: 303 runs of words, 291 of them straight after a `bcctr` and the rest after a function's last instruction. They are **jump tables of signed offsets** (the values are small, positive or negative) and a few floating-point constants. The control-flow pass will read them as such; none is an instruction the decoder lacks, as far as a look at them shows.
+- **151 of the decoder's 383 instructions are used.** 200,564 words are 64-bit-only forms (`ld`, `std`, `rldicl`, `extsw`: the compiler widens and narrows constantly, although every pointer is 32 bits), 66,222 floating-point, 23,511 VMX.
+- **VMX use is narrow**: `lvx`, `stvx`, `vmaddfp` and the rest of the float arithmetic, `vspltw`, `vsldoi`, `vsel`, `vperm`, the word merges, the logical operations, conversions to and from integers. Of integer vector arithmetic only `vadduwm` and `vcmpequw`; no saturating forms, no packs, none of the Cell's own unaligned loads and stores, no data-stream hints.
+- **Not used at all**: `lwarx`/`stwcx.` and `ldarx`/`stdcx.` (the program takes its locks through the system's libraries, never inline), `dcbz` and every other cache instruction except `dcbt` (58), the string and multiple-word loads and stores, the byte-reversed ones, `mcrxr`, `mtcrf` (the one-field `mtocrf` is used, 425 times, and `mfocrf` 617).
+- Of the loads and stores with update, only `stdu` (9,150: the stack frames), `lbzu` and `stbu` (6 each) and `ldu` (1).
+- One each of `sync`, `tw`, `fsqrts`, `mffs` and `mtfsf`; 13 `mftb` (the time base read directly).
+- **502 `sc` instructions**: the program makes system calls directly, from the system-call wrappers linked into it. A scan for the constant put in `r11` just before finds it at 477 of them: **78 different system calls**, among them the families at 90–108 (semaphores, mutexes, condition variables), 128–147 (event queues, timers), 341–352 (memory), 801–834 (files). The other 25 sites need the control-flow pass.
+- 4,943 `bcctrl` (calls through a pointer: virtual calls, callbacks and the import stubs) and 544 `bcctr` (switches and tail calls).
+
+### The SPU programs
+
+`qilin spu`: the section at `0x10052b00` is **42 SPU programs**, each a whole ELF file (32-bit, machine 23), one after another, 1,004,604 bytes and **209,660 words of SPU code** in all: a fifth as much again as the PPU's.
+
+| | Programs | |
+|---|---|---|
+| Particles and effects | 23 | pairs named `...FrameMove` and `...CreateVertex` for after-fire, tyre marks, glass, fireworks, leaves, light blur, nitro, smoke, sparks and water, and one for gravity; 2,300 to 3,800 words each |
+| Collision | 5 | car against car and car against road, checks and reactions; 2,700 to 7,200 words |
+| Car dynamics | 12 | road forces, springs and dampers, friction, torque, the update itself, and six named `CalcCarRI_...` of about 14,000 words each |
+| Sound | 2 | a small one, and `bnusCoreSpu.elf` (17,746 words), by its name Namco's sound core |
+
+- **The car's physics runs on the SPUs.** There is no playing the game without recompiling them, so the SPU decoder and lifter are not optional.
+- 41 are linked at `0x3000` with their entry at `0x3010`: the shape of a SPURS program, loaded by the system's SPURS kernel (which this project replaces natively). `bnusCoreSpu.elf` is linked at `0x80` with its entry at `0x90`: *a program that owns its SPU outright, by the look of it*, started some other way.
+- Each has `.text`, `.rodata`, `.data`, `.bss`, constructor tables, a 16-byte `.SpuGUID`, and a `.note.spu_name` giving the file it was built as. All fit an SPU's 256 KiB with room to spare (the largest reaches `0x2ddd0`, most of it `.bss`).
+- Their `.comment` names the compiler: **GCC 4.0.2** (two builds of Sony's Cell toolchain, `CELL 4.1.7` and `CELL 4.1.13`), and their `.sceversion` the SDK's `libspurs`, at `s102002`.
+
 ## Next
 
-1. The owner decrypts `EBOOT.BIN` (above); `qilin info` on the result. Fix whatever the ELF loader gets wrong on the real file, record the hash, replace the inferred section names, and list the 22 libraries with every id taken from each.
-2. Names for the 248 ids (`prior-art.md`).
-3. ✅ The PPU decoder (v0.2.0, `recompiler-core.md`); its profile of the real code, and the SPU programs found and counted, wait for step 1.
+1. ✅ The decrypted program read (v0.3.0).
+2. Names for the 248 ids (`prior-art.md`), and for the 78 system calls.
+3. ✅ The PPU decoder (v0.2.0, `recompiler-core.md`), its profile of the real code and the SPU programs found (v0.3.0).
+4. The decoder against objdump over every word of the real code (it needs a PowerPC objdump where the game is); the control-flow pass, which reads the jump tables and the remaining 25 system calls; the SPU decoder.

@@ -4,6 +4,27 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
+The decrypted program, read at last.
+
+### Added
+- `qilin spu` and the reader behind it (`recomp/src/spu_image.*`): the SPU programs a PS3 program carries in its data, each a whole ELF file, found and validated, with its name, segments and code. `qilin info` counts them, and says when the file has no section names.
+- The decrypted program's hash among the known builds.
+- `Analyse game.bat` writes the SPU programs' list.
+
+### Checked
+- **The ELF loader on the real program: nothing to fix.** Made with RPCS3 0.0.43 (`rpcs3.exe --decrypt`), it loads, matches `EBOOT.BIN`'s plain headers, and every table is as the loader expected: 22 libraries, 248 functions, every slot holding its stub's address, no exports.
+- The decoder on the real code: 1,065,028 words, 99.47% decode. The 5,603 that don't are jump tables (291 of the 303 runs follow a `bcctr`) and a few constants. The game uses 151 of the decoder's 383 instructions: no atomic sequences, no cache instructions but `dcbt`, a narrow floating-point part of VMX, and none of the instructions whose presence on the PPU was in doubt.
+- 502 `sc` instructions, 78 different system calls found at 477 of them.
+- 42 SPU programs, 209,660 words of code: particles (23), collision (5), the car's dynamics (12, with the bulk of the code), sound (2). Built with GCC 4.0.2.
+
+### Found
+- RPCS3 writes zeros for the sections outside every segment, so the decrypted file has no section names and no `.comment`: the names in `docs/elf-analysis.md` stay inferred.
+
+### Not checked
+- The decoder against objdump over the game's code: no PowerPC objdump where the game is.
+
 ## [0.2.0] - 2026-11-21
 
 The PPU decoder, and the first look inside the data files. The decrypted program still hasn't been read: it wasn't on the owner's PC when this was made.

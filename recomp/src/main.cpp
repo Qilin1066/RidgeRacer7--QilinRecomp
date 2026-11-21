@@ -11,6 +11,7 @@
 //   qilin exports <game>                     what the program offers the system
 //   qilin sfo     <game>                     every entry of PARAM.SFO
 //   qilin data    <game>                     the game's own files, and the headers of its sound banks and films
+//   qilin spu     <game>                     the SPU programs the program carries
 //   qilin insns   <game>                     every word of the program's code: address, word, instruction
 //   qilin profile <game>                     how often the code uses each instruction, and what doesn't decode
 //   qilin disasm  <file> [--base address]    a file of raw big-endian PPU words, as `insns` prints them
@@ -38,6 +39,7 @@
 #include "ppu.hpp"
 #include "self.hpp"
 #include "sfo.hpp"
+#include "spu_image.hpp"
 #include "title.hpp"
 
 #ifndef QILIN_VERSION
@@ -62,6 +64,7 @@ int usage() {
                "  qilin exports <game>\n"
                "  qilin sfo     <game>\n"
                "  qilin data    <game>\n"
+               "  qilin spu     <game>\n"
                "  qilin insns   <game>\n"
                "  qilin profile <game>\n"
                "  qilin disasm  <file of big-endian words> [--base address]\n"
@@ -273,6 +276,10 @@ int cmd_info(const Args& a) {
         std::println("  thread-local   at {:#x}: {:#x} bytes initialised, {:#x} in all, aligned to {}", t->address, t->file_size,
                      t->memory_size, t->align);
     print_layout(elf.layout(), nullptr);
+    if (std::ranges::all_of(elf.sections(), [](const ElfSection& s) { return s.name.empty(); }) && !elf.sections().empty())
+        std::println("  (no section names: the table of names is empty in this file, as RPCS3 writes it)");
+    if (const auto images = find_spu_images(elf)) std::println("  SPU programs carried: {}", images->size());
+    else throw Failure{images.error()};
     size_t functions = 0, variables = 0, stubs = 0;
     std::println("  imports:");
     for (const ImportLibrary& l : elf.imports()) {
@@ -503,6 +510,28 @@ int cmd_data(const Args& a) {
     return 0;
 }
 
+// The SPU programs the program carries: where each lies, its name, its size in an SPU's memory.
+int cmd_spu(const Args& a) {
+    const Elf elf = elf_of(files_of(a));
+    const auto images = find_spu_images(elf);
+    if (!images) throw Failure{images.error()};
+    uint64_t code = 0, bytes = 0;
+    for (const SpuImage& image : *images) {
+        uint32_t low = kSpuMemory, high = 0;
+        for (const SpuSegment& s : image.segments) {
+            if (s.type != kPtLoad) continue;
+            low = std::min(low, s.address);
+            high = std::max(high, s.address + s.memory_size);
+        }
+        std::println("{:#010x} {:#8x} bytes  entry {:#7x}  memory {:#x}-{:#x}  code {:6} words  {}", image.address, image.size, image.entry, low,
+                     high, image.code_size() / 4, image.name.empty() ? "(no name)" : image.name);
+        code += image.code_size();
+        bytes += image.size;
+    }
+    std::println("{} SPU programs, {} bytes, {} words of code", images->size(), bytes, code / 4);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -518,6 +547,7 @@ int main(int argc, char** argv) {
         if (a.command == "exports") return cmd_exports(a);
         if (a.command == "sfo") return cmd_sfo(a);
         if (a.command == "data") return cmd_data(a);
+        if (a.command == "spu") return cmd_spu(a);
         if (a.command == "insns") return cmd_insns(a);
         if (a.command == "profile") return cmd_profile(a);
         if (a.command == "disasm") return cmd_disasm(a);

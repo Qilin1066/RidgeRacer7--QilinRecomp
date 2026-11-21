@@ -43,7 +43,9 @@ Before a milestone commit: tests pass, warnings are clean (`QILIN_WERROR`), and 
 ## Known facts worth not rediscovering
 
 - The owner's copy is the disc's folder on the owner's PC, outside the repository (its path is in the claude.ai Project's `claude/status.md`; local paths are not written here). `RR7.DAT` is 5.23 GB and `BGM.nub` and `ending.pam` are over 600 MB: a cloud session can stage files of up to 400 MB, so those never leave the PC whole. `EBOOT.BIN` (7.8 MB) and `PARAM.SFO` stage fine, and so will `EBOOT.elf`.
-- **`EBOOT.elf` does not exist yet** (v0.2.0): the owner has to make it with RPCS3. On 2026-11-21 the owner's message said it was beside `EBOOT.BIN`, but it was not there, nor anywhere on the PC's `D:` drive or in the user's folder, and RPCS3 was not installed: look before believing either way. Until then the ELF loader has only met synthetic files. Its reading of the PS3's additions (field offsets of the two parameter blocks, the 44-byte import and 28-byte export entries, the stub's eight instructions, slots initially holding their stub's address) is from public descriptions and memory of them: each is a hard error or a reported count if the real file differs, so the first `qilin info` on the real ELF is the check.
+- **`EBOOT.elf` exists** (since 2026-11-21, v0.3.0), beside `EBOOT.BIN` on the owner's PC: SHA-256 `689f9704ee9dbd982c48de646f07d69c193a46513d75b6f95f20a206c7754831`, 7,818,800 bytes. It was made there by a session that installed RPCS3 0.0.43 at the owner's request (the official Windows build, in a folder `RPCS3` beside the game's, outside the repository) and ran `rpcs3.exe --decrypt <EBOOT.BIN>`: no set-up, no firmware, a few seconds. The loader read it with nothing to fix.
+- RPCS3's ELF has zeros where the SELF's non-segment sections were: **no section names, no `.comment`, no SDK stamps** (those come from the SELF). `elf.section("name")` finds nothing on the real file: find sections by address, flags or content. Section names in `docs/elf-analysis.md` stay inferred from name lengths.
+- The real program (`docs/elf-analysis.md`): 99.47% of 1,065,028 code words decode, the rest are jump tables of signed offsets after `bcctr` (291 runs) and constants; 151 instructions used; no `lwarx`/`stwcx.`, no `dcbz`; 502 `sc` sites, 78 system calls by a backwards scan for `li r11` (25 sites unresolved); 42 SPU programs at `0x10052b00` (41 SPURS-shaped at `0x3000`, entry `0x3010`; `bnusCoreSpu.elf` at `0x80`), 209,660 words, the car's physics among them, GCC 4.0.2.
 - A cloud session reaches the PC only while the Claude desktop app is open there, and can run commands there only when the app offers its shell (`device_bash`). In the session that made v0.1.0 it offered listing and staging files, not the shell: nothing was run on the owner's PC, and the owner's sister-project folders were read by staging files.
 - Tags don't reach GitHub from a cloud session (the proxy refuses pushing them: HTTP 403); `main` does. Releases are marked by their commit's title (`vX.Y.Z: ...`) and the changelog until a tag can be pushed from elsewhere.
 - The cloud workspace has GCC 13 and Clang 18, both below the minimums: build there with zig's Clang (`pip install --break-system-packages ziglang==0.17.1`, then wrapper scripts running `python3 -m ziglang cc` / `c++` as `CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER`). It has no PowerPC objdump: a decoder sweep runs in CI.
@@ -57,20 +59,21 @@ Before a milestone commit: tests pass, warnings are clean (`QILIN_WERROR`), and 
 - Other PS3 static recompilations exist (`docs/prior-art.md`: ps3recomp and ports built on it). Their licences are unchecked: don't read their code until they are.
 - Facts about the game not read from the disc (60 frames a second, 1080p, online play, what it shares with Ridge Racer 6) are from public descriptions.
 
-## Status (v0.2.0)
+## Status (v0.3.0)
 
 - The tools find the game, read `PARAM.SFO` and the SELF's plain header, and load a decrypted PS3 program (on synthetic files). Read from the owner's disc: `docs/elf-analysis.md`.
 - The PPU decoder (383 instructions) agrees with binutils 2.42 over CI's sweep of 4.9 million words, with no unexplained difference. `qilin data` reads the sound banks' and films' headers.
 - Checked: unit tests and a warnings-as-errors build on all six CI configurations and with MSVC on the owner's PC; `qilin info` and `qilin data` on the owner's disc folder; `Analyse game.bat`'s script up to the decrypt message.
-- Unchecked: **the ELF loader on the real program**; `insns`, `profile` and `verify_decoder.py --game` (they need it).
+- The decrypted program is read: `info`, `imports`, `exports`, `spu`, `insns`, `profile` and `Analyse game.bat` all run on it on the owner's PC.
+- Unchecked: `verify_decoder.py --game` (no PowerPC objdump where the game is).
 
 ## Next steps, in order
 
-1. The owner: RPCS3, Utilities > Decrypt PS3 Binaries on `EBOOT.BIN`; `EBOOT.elf` beside it in `USRDIR`. Then stage it and run `qilin info` and `imports`. Fix whatever the ELF loader gets wrong on the real file. Record the ELF's SHA-256 in `kBuilds` (`title.cpp`), and in `docs/elf-analysis.md` the real section names, the compiler (`.comment`), the 22 libraries and the count taken from each, how many slots pair with a stub.
-2. Names for the imported ids: the id is derived from the name by a public method (`docs/prior-art.md`); find a clean, permissively licensed list of names, compute, match all 248. Add `qilin imports` names.
+1. ✅ (v0.3.0) The decrypted program read; hash, libraries, stubs recorded. The real section names and the PPU's `.comment` can't be had from RPCS3's file.
+2. Names for the imported ids: the id is derived from the name by a public method (`docs/prior-art.md`); find a clean, permissively licensed list of names, compute, match all 248. Add `qilin imports` names. Names for the 78 system-call numbers likewise. **This is next.**
 3. ✅ The PPU decoder (v0.2.0). Still to do with the real program: `qilin profile` (which VMX and 64-bit forms the game uses; whether `mcrxr`, `ldbrx`, `stdbrx` or anything left out occurs) and `verify_decoder.py --game` (in CI's absence of game files, that needs a PowerPC objdump where the game is).
-4. The SPU programs: find the embedded images (the section aligned to 128), count them, read their headers; the SPU decoder. Its check needs a reference: current binutils has no SPU (**open**, in the roadmap).
-5. The control-flow pass on the PPU code: seeds from the descriptors (`.opd`) and `.eh_frame`; stubs as known import calls; `sc` sites listed with their numbers; coverage to 0 unknown words.
+4. ✅ in part (v0.3.0): the 42 SPU programs are found and read (`qilin spu`). Still to do: the SPU decoder (`qilin::spu`), `qilin spu-insns`/`spu-profile`. Its check needs a reference: current binutils has no SPU (**open**, in the roadmap).
+5. The control-flow pass on the PPU code: seeds from the descriptors (`.opd`, found by address: `0x4bb190`) and `.eh_frame` (`0x420310`); stubs as known import calls; `sc` sites listed with their numbers; the jump tables after `bcctr` read as signed offsets; coverage to 0 unknown words.
 6. ✅ in part (v0.2.0): the `.nub` and `.pam` headers are read (`qilin data`) and the codecs known. Still to do: find `RR7.DAT`'s directory (look in the program's read-only data for a table of sector offsets and sizes), then a `qilin` command that lists the archive; identify its compression and the `ArcL`, `R7T`, `R7W` and `RR7 ` formats; find the shaders. Decide the ATRAC3plus decoder (**open**).
 7. Then, in WindWakerHD's order: lifter and difftest, the runtime skeleton, the window and the settings menu, threads, files, the RSX on Vulkan, sound.
 

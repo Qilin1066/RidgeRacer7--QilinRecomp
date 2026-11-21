@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(RidgeRacer7QilinRecomp VERSION 0.2.0 LANGUAGES CXX)
+project(RidgeRacer7QilinRecomp VERSION 0.3.0 LANGUAGES CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -76,6 +76,7 @@ add_library(qilin_game STATIC
     recomp/src/self.cpp
     recomp/src/sfo.cpp
     recomp/src/sha256.cpp
+    recomp/src/spu_image.cpp
     recomp/src/title.cpp
 )
 target_include_directories(qilin_game PUBLIC recomp/src)

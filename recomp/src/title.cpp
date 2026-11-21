@@ -37,6 +37,9 @@ fs::path folder_in(const fs::path& folder, std::string_view name) {
 constexpr KnownBuild kBuilds[] = {
     {"095ed6cb8e90538309b57662fb19da1ba2c4bdbac5fd40dc0be6122e76d4c0db",
      "Ridge Racer 7 (USA), BLUS30001, version 01.02: EBOOT.BIN as on the disc", true},
+    // As RPCS3 0.0.43 writes it: the sections outside every segment (the names, .comment) are zero-filled.
+    {"689f9704ee9dbd982c48de646f07d69c193a46513d75b6f95f20a206c7754831",
+     "Ridge Racer 7 (USA), BLUS30001, version 01.02: the program decrypted by RPCS3", false},
 };
 
 }  // namespace

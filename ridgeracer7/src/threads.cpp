@@ -60,6 +60,7 @@ void run_thread(Start start) {
     cpu.r[3] = start.argument;
     cpu.r[13] = start.tls + 0x7000u;
     cpu.lr = kReturnToHost;
+    set_current_cpu(&cpu);
     uint64_t value = 0;
     try {
         call_guest(cpu, start.code);
@@ -216,6 +217,35 @@ constexpr NativeImport kImports[] = {
 };
 
 }  // namespace
+
+void become_guest_thread(Cpu& c, uint32_t stack_size, int32_t priority) {
+    const TlsImage image = tls_image();
+    const uint32_t tls = allocate(image.memory_size ? image.memory_size : 16, 16);
+    std::memcpy(guest_memory() + tls, guest_memory() + image.address, image.file_size);
+    uint32_t id, stack_top;
+    {
+        const std::lock_guard lock(g_mutex);
+        const uint32_t size = (stack_size + 0xfff) & ~0xfffu;
+        if (size > kStacksEnd - g_next_stack) qilin::rt::fatal("no room for another thread's stack (%u bytes)", size);
+        commit(g_next_stack, size);
+        stack_top = g_next_stack + size;
+        g_next_stack += size + 0x10000;
+        id = g_next_id++;
+        g_threads[id].priority = priority;
+    }
+    set_current_thread(id);
+    c.mem = guest_memory();
+    c.hooks = &guest_hooks();
+    c.r[1] = stack_top - 0x80;
+    c.r[13] = tls + 0x7000u;
+    set_current_cpu(&c);
+}
+
+void call_descriptor(Cpu& c, uint32_t descriptor) {
+    c.r[2] = load32(descriptor + 4);
+    c.lr = kReturnToHost;
+    call_guest(c, load32(descriptor));
+}
 
 void add_thread(uint32_t id, int32_t priority) {
     const std::lock_guard lock(g_mutex);

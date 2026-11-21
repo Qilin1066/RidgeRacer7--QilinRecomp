@@ -8,7 +8,7 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 
 ## Status
 
-**Early. The game's code is lifted to C++ and runs natively through its start-up as far as graphics initialisation, where it stops, by name, at the first system function the runtime doesn't provide yet. Nothing is on screen.**
+**Early. The game's code is lifted to C++ and runs natively through its start-up, sets the RSX up and opens its font, as far as the start of SPURS, where it stops, by name, at the first system function the runtime doesn't provide yet. Nothing is on screen.**
 
 | Piece | State |
 |---|---|
@@ -22,9 +22,10 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 | Control-flow pass for the PPU code (`docs/recompiler-core.md`) | ✅ on the game: 14,294 functions, 296 switches, 2,845 exception landing pads, all 502 system-call sites numbered; **every one of 1,065,028 words accounted for, none unknown** |
 | SPU decoder: 199 instructions (`docs/recompiler-core.md`) | ✅ identical to objdump (binutils 2.31.1, built by CI) over a 1.66-million-word sweep; on the game's 42 SPU programs all but a four-word jump table decode |
 | SPU control-flow pass (`docs/recompiler-core.md`) | ✅ on the game's 42 SPU programs: 2,332 functions, every one of 209,492 words accounted for |
-| PPU lifter: integers, loads and stores, branches, calls, switches, floating point bit-exact, VMX (`docs/recompiler-core.md`) | 🔨 14,196 of the game's 14,294 functions lift (96% of its instructions); identical to a separately written, integer-only reference over 1.3 million runs of the differential test, in CI |
-| The rest of the PPU lifter (the VMX estimates, exception landing pads); the SPU lifter | later |
-| Runtime skeleton (`docs/runtime.md`): the program loaded at its addresses, the first thread, imports and system calls replaced by name and number, anything missing stops the game naming it | 🔨 the game builds from the owner's copy and runs through its start-up to graphics initialisation (`_cellGcmInitBody`); 40 of 248 imports and 39 of 78 system calls provided: threads, mutexes, semaphores, event queues, timers, memory, the terminal |
+| PPU lifter: integers, loads and stores, branches, calls, switches, floating point bit-exact, VMX (`docs/recompiler-core.md`) | 🔨 14,292 of the game's 14,294 functions lift (all but 21 of its 1,059,387 instructions); identical to a separately written, integer-only reference over 1.3 million runs of the differential test, in CI |
+| The rest of the PPU lifter (the two FPSCR functions, exception landing pads); the SPU lifter | later |
+| Runtime skeleton (`docs/runtime.md`): the program loaded at its addresses, the first thread, imports and system calls replaced by name and number, anything missing stops the game naming it | 🔨 the game builds from the owner's copy and runs through its start-up, the RSX's set-up and its first commands, and its font, to the start of SPURS (`cellSpursInitialize`); 67 of 248 imports and 40 of 78 system calls provided |
+| The host layer (`host/`): window and input on SDL3, Vulkan 1.3 through volk, presentation, frame times: the other Qilin recomps' | ✅ built and tested; the game doesn't draw into it yet |
 | The system libraries and system calls themselves; the RSX's command stream on Vulkan 1.3; sound, controllers, saves, films | later |
 | The settings menu (F1), the same as the other Qilin recomps' | later, with the window |
 

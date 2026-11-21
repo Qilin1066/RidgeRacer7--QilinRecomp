@@ -101,7 +101,7 @@ struct Args {
     std::string command, input;
     std::optional<std::string> json, out;
     uint32_t base = 0;
-    bool list_files = false, ignore_reserved = false;
+    bool list_files = false, ignore_reserved = false, keep_pc = false;
 };
 
 uint32_t parse_address(std::string_view text) {
@@ -124,6 +124,7 @@ Args parse_args(std::span<char*> argv) {
         else if (arg == "--out" && i + 1 < argv.size()) a.out = argv[++i];
         else if (arg == "--base" && i + 1 < argv.size()) a.base = parse_address(argv[++i]);
         else if (arg == "--files") a.list_files = true;
+        else if (arg == "--pc") a.keep_pc = true;
         else if (arg == "--ignore-reserved") a.ignore_reserved = true;
         else throw Failure{std::format("unknown argument {}", arg)};
     }
@@ -810,7 +811,9 @@ int cmd_lift(const Args& a) {
     for (const auto& [start, f] : cfg->functions()) {
         if (a.out) table += std::format("    {{0x{:08X}u, &{}}},\n", start, fn_name(start));
         words += f.words;
-        const Lifted l = lift(lift_input(*cfg, f));
+        LiftInput input = lift_input(*cfg, f);
+        input.keep_pc = a.keep_pc;
+        const Lifted l = lift(input);
         if (l.ok) {
             ++lifted;
             lifted_words += f.words;

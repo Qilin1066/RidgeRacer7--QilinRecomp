@@ -4,6 +4,26 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-21
+
+The game runs to the start of SPURS; the window layer is in.
+
+### Added
+- `host/`: the other Qilin recomps' host layer with this game's names: window and events on SDL3, Vulkan 1.3 through volk, presentation, frame times, with its tests. SDL3, the Vulkan headers and volk are fetched and pinned, as there. The game doesn't draw into it yet.
+- The RSX's set-up (`cellGcmSys`) and the RSX itself: a thread that reads the commands the game writes, keeps the state they set, writes the labels, and stops at any method it doesn't know (`docs/runtime.md`). A vertical-blank thread calls the game's handler at 59.94 Hz.
+- The video output (`cellVideoOut`): one display, taking 1080p, 720p and 480; the game configures 1920 by 1080.
+- The font library (`cellFont`) on FreeType 2.13.3, fetched and pinned. The console's own fonts are the player's to supply from a PS3's system software (`--flash`, or an RPCS3 folder beside the game's): by the owner's decision of 2026-11-21, as is FreeType.
+- `vrefp` and `vrsqrtefp`, as the correctly rounded values: a stated choice within the architecture's bound, checked against a whole-number reference (`docs/recompiler-core.md`). 14,292 of 14,294 functions now lift.
+- A bad memory access is reported with the guest address, the thread and the lifted functions on the stack, where before the process ended silently. `qilin lift --pc` makes the report name the instruction.
+- Development aids: `RR7_WATCH` (where each guest thread is) and `RR7_RSX_SURVEY` (the RSX methods not yet provided).
+
+### Fixed
+- A semaphore's post goes to the thread that has waited longest. The poster could take its own post back, which left the game's text thread drawing before its surface existed.
+- `report.cpp` includes what it uses (macOS's build of v0.11.0 and v0.12.0 failed).
+
+### Checked
+- On the owner's PC: the game runs to `cellSpursInitialize`; the host layer's tests pass (Vulkan device, offscreen frame, virtual controller); the differential test agrees over 5,450 cases and 1,346,784 runs, and fails when either estimate is given a wrong last bit.
+
 ## [0.12.0] - 2026-11-21
 
 The game runs to graphics initialisation.

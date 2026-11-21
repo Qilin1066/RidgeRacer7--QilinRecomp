@@ -66,6 +66,7 @@ struct Cpu {
     double f[32] = {};
     Vec v[32] = {};
     uint32_t fpscr = 0, vscr = 0;
+    uint32_t pc = 0;  // kept only by code lifted with `qilin lift --pc`: the last instruction to touch memory
     uint8_t* mem = nullptr;  // base of the 4 GiB guest address space
     const CpuHooks* hooks = nullptr;
 

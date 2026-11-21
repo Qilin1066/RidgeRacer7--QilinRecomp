@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(RidgeRacer7QilinRecomp VERSION 0.12.0 LANGUAGES CXX)
+project(RidgeRacer7QilinRecomp VERSION 0.13.0 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -217,6 +217,7 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/mempool.cpp
     ridgeracer7/src/pad.cpp
     ridgeracer7/src/rsx.cpp
+    ridgeracer7/src/spu.cpp
     ridgeracer7/src/sync.cpp
     ridgeracer7/src/sync_calls.cpp
     ridgeracer7/src/syscalls.cpp
@@ -229,6 +230,8 @@ add_library(ridgeracer7_machine STATIC
 )
 target_include_directories(ridgeracer7_machine PUBLIC ridgeracer7/src)
 target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt PRIVATE qilin_warnings freetype)
+# FreeType's headers are not ours to warn about.
+target_include_directories(ridgeracer7_machine SYSTEM PRIVATE $<TARGET_PROPERTY:freetype,INTERFACE_INCLUDE_DIRECTORIES>)
 set(QILIN_GEN_DIR "" CACHE PATH "The folder `qilin lift <game> --out` wrote: the lifted code of your own copy")
 if(QILIN_GEN_DIR)
     if(NOT EXISTS "${QILIN_GEN_DIR}/table.cpp")

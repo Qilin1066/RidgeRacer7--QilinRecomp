@@ -16,8 +16,15 @@
 //     never touches the VSCR, so it runs in whatever mode its threads start
 //     in. *To be confirmed against RPCS3*; `kNonJava` below is the switch.
 // The VSCR's saturation bit is not kept, and the instructions that read or
-// write the VSCR are not in the lifter's slice. Nor are vrefp and vrsqrtefp:
-// they are estimates, and their exact values are the hardware's.
+// write the VSCR are not in the lifter's slice.
+//
+// **vrefp and vrsqrtefp are estimates**: the architecture asks only that
+// they be within one part in 4,096 of 1/x and 1/sqrt(x), and what a PPU
+// gives exactly comes from tables of its own, which are not known here.
+// The stated choice: **the correctly rounded value**, which is within the
+// architecture's bound and is one definite thing a reference can check.
+// It can differ from a console's result in the low bits. *If the PPU's
+// tables can be had, they replace this.*
 //
 // Included by cpu.hpp. Runtime code: no std::format here.
 #pragma once
@@ -157,6 +164,54 @@ QILIN_INLINE Vec vnmsubfp(const Vec& a, const Vec& c, const Vec& b) {
     for (unsigned i = 0; i < 4; ++i) r.w[i] = fused32(a.w[i], c.w[i], b.w[i], true, true);
     return r;
 }
+// ---- the estimates (see the top of the file) ----
+// 1/x. A double holds more than twice a single's digits and two more, so its quotient rounds to the single's correctly.
+QILIN_INLINE uint32_t reciprocal32(uint32_t w) {
+    if (nan32(w)) return w | kQuiet32;
+    w = operand(w);
+    const uint32_t sign = w & 0x80000000u, magnitude = w & 0x7fffffffu;
+    if (magnitude == 0) return sign | 0x7f800000u;
+    if (magnitude == 0x7f800000u) return sign;
+    return result(1.0 / value(w));
+}
+// How m * m * x compares with 2^power, exactly: -1 less, 0 equal, 1 greater. (m below 2^26, x below 2^24.)
+QILIN_INLINE int compare_square(uint64_t m, uint32_t x, int power) {
+    const uint64_t square = m * m;  // below 2^52
+    const uint64_t low = (square & 0xffffffffu) * x, high = (square >> 32) * x + (low >> 32);  // the product is high * 2^32 + low's bottom half
+    const uint32_t bottom = static_cast<uint32_t>(low);
+    if (power >= 96) return -1;
+    if (power < 0) return 1;
+    if (power >= 32) {
+        const uint64_t limit = uint64_t{1} << (power - 32);
+        return high < limit ? -1 : high > limit || bottom != 0 ? 1 : 0;
+    }
+    const uint32_t limit = uint32_t{1} << power;
+    return high != 0 || bottom > limit ? 1 : bottom < limit ? -1 : 0;
+}
+// 1/sqrt(x): the double's value is within a hair of it, and the two singles' midpoints either side settle the rounding exactly.
+inline uint32_t reciprocal_root32(uint32_t w) {
+    if (nan32(w)) return w | kQuiet32;
+    w = operand(w);
+    if ((w & 0x7fffffffu) == 0) return (w & 0x80000000u) | 0x7f800000u;
+    if (w >> 31) return kDefaultNan32;
+    if (w == 0x7f800000u) return 0;
+    uint32_t f = std::bit_cast<uint32_t>(static_cast<float>(1.0 / std::sqrt(value(w))));
+    const uint32_t x = (w & 0x007fffffu) | 0x00800000u;  // x = this * 2^ex
+    const int ex = static_cast<int>(w >> 23) - 150;
+    const uint32_t F = (f & 0x007fffffu) | 0x00800000u;  // f = F * 2^q
+    const int q = static_cast<int>(f >> 23) - 150;
+    // The true value is above a midpoint M * 2^g just when M * M * x is below 2^-(2g + ex).
+    if (compare_square(2ull * F + 1, x, -(2 * (q - 1) + ex)) < 0) return f + 1;                    // above the midpoint over f
+    if (F > 0x00800000u ? compare_square(2ull * F - 1, x, -(2 * (q - 1) + ex)) > 0                 // below the midpoint under f
+                        : compare_square(4ull * F - 1, x, -(2 * (q - 2) + ex)) > 0)                // (closer, under a power of two)
+        return f - 1;
+    return f;
+}
+QILIN_INLINE Vec vrefp(const Vec& b) { return {{reciprocal32(b.w[0]), reciprocal32(b.w[1]), reciprocal32(b.w[2]), reciprocal32(b.w[3])}}; }
+QILIN_INLINE Vec vrsqrtefp(const Vec& b) {
+    return {{reciprocal_root32(b.w[0]), reciprocal_root32(b.w[1]), reciprocal_root32(b.w[2]), reciprocal_root32(b.w[3])}};
+}
+
 // The larger, or the smaller: of zeros of both signs, +0 is the larger.
 QILIN_INLINE uint32_t extreme32(uint32_t a, uint32_t b, bool larger) {
     if (nan32(a)) return a | kQuiet32;

@@ -34,6 +34,7 @@ struct LiftInput {
     std::vector<uint32_t> landing_pads;         // labels nothing in the function branches to
     uint32_t falls_into = 0;                    // the next function, if execution runs into it
     std::function<bool(uint32_t)> is_function;  // a known function start (tail and call targets)
+    bool keep_pc = false;                       // note each instruction's address in Cpu::pc before it touches memory (for finding faults: slower)
 };
 
 struct Lifted {

@@ -133,6 +133,48 @@ bool step_vmx(State& s, const Insn& in) {
             return (order == 4) == larger ? a : b;
         });
     }
+    // The estimates, as the runtime states them: the correctly rounded 1/x and 1/sqrt(x). Here by whole numbers only.
+    case Op::vrefp:
+        return words([](uint32_t, uint32_t b, uint32_t) -> uint32_t {
+            if (is_nan(b)) return b | 0x00400000u;
+            b = flushed(b);
+            const uint32_t sign = b & 0x80000000u;
+            if ((b & 0x7fffffffu) == 0) return sign | 0x7f800000u;
+            if ((b & 0x7fffffffu) == 0x7f800000u) return sign;
+            const uint64_t x = (b & 0x007fffffu) | 0x00800000u;  // the value is x * 2^ex
+            const int ex = static_cast<int>((b >> 23) & 0xff) - 150;
+            const uint64_t top = uint64_t{1} << 50, quotient = top / x;  // 26 or 27 digits of 2^50 / x
+            const uint64_t sticky = top % x ? 1 : 0;
+            return packed(soft::from_integer(sign != 0, quotient << 1 | sticky, -51 - ex, true));
+        });
+    case Op::vrsqrtefp:
+        return words([](uint32_t, uint32_t b, uint32_t) -> uint32_t {
+            if (is_nan(b)) return b | 0x00400000u;
+            b = flushed(b);
+            if ((b & 0x7fffffffu) == 0) return (b & 0x80000000u) | 0x7f800000u;
+            if (b >> 31) return 0x7fc00000u;
+            if (b == 0x7f800000u) return 0;
+            // x = m * 2^e with e even and m of 24 or 25 digits; then 1/sqrt(x) = 2^(-e/2) / sqrt(m), and
+            // 2^37 / sqrt(m) is found by its square: the largest n with n * n * m <= 2^74.
+            uint64_t m = (b & 0x007fffffu) | 0x00800000u;
+            int e = static_cast<int>((b >> 23) & 0xff) - 150;
+            if (e & 1) m <<= 1, e -= 1;
+            // n * n * m against 2^74, in two halves: n below 2^26, so n * n below 2^52 and the product below 2^77.
+            const auto over = [m](uint64_t n, bool& exact) {
+                const uint64_t square = n * n;
+                const uint64_t low = (square & 0xffffff) * m, high = (square >> 24) * m + (low >> 24);  // high * 2^24 + low's bottom 24 digits
+                exact = high == (uint64_t{1} << 50) && (low & 0xffffff) == 0;
+                return high > (uint64_t{1} << 50) || (high == (uint64_t{1} << 50) && (low & 0xffffff) != 0);
+            };
+            uint64_t n = 0;
+            bool exact = false;
+            for (uint64_t bit = uint64_t{1} << 26; bit; bit >>= 1) {
+                bool e2;
+                if (!over(n | bit, e2)) n |= bit;
+            }
+            over(n, exact);
+            return packed(soft::from_integer(false, n << 1 | (exact ? 0 : 1), -38 - e / 2, true));
+        });
     case Op::vcfsx:
         return words([va](uint32_t, uint32_t b, uint32_t) {
             const bool negative = b >> 31;

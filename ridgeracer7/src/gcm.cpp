@@ -13,6 +13,8 @@
 #include "gcm.hpp"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
 
@@ -277,7 +279,36 @@ void cellGcmSetFlip(Cpu& c) {
 // cellGcmSetWaitFlip(context): puts "wait until the last flip is shown" in the stream.
 void cellGcmSetWaitFlip(Cpu& c) { put_command(c, static_cast<uint32_t>(c.r[3]), kMethodWaitFlip, 0); }
 
+// The vertical blank: 59.94 times a second, as the display this runtime describes refreshes (video.cpp).
+// One thread keeps the count and, if the game has registered a handler, calls it each time, with the
+// display's head (1) as its argument: on a console that is done by one of the system's own threads.
+std::atomic<uint32_t> g_vblank_handler{0};
+std::atomic<uint64_t> g_vblanks{0};
+std::once_flag g_vblank_started;
+
+void vblank_thread() {
+    Cpu cpu;
+    become_guest_thread(cpu, 0x10000, 0);
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point start = Clock::now();
+    for (uint64_t n = 1;; ++n) {
+        std::this_thread::sleep_until(start + std::chrono::nanoseconds(n * 1001000000ull / 60));
+        g_vblanks.store(n, std::memory_order_relaxed);
+        if (const uint32_t handler = g_vblank_handler.load()) {
+            cpu.r[3] = 1;
+            call_descriptor(cpu, handler);
+        }
+    }
+}
+
+// cellGcmSetVBlankHandler(handler): a function of the game's to call at every vertical blank; null for none.
+void cellGcmSetVBlankHandler(Cpu& c) {
+    g_vblank_handler.store(static_cast<uint32_t>(c.r[3]));
+    std::call_once(g_vblank_started, [] { std::thread(vblank_thread).detach(); });
+}
+
 constexpr NativeImport kImports[] = {
+    {"cellGcmSys", "cellGcmSetVBlankHandler", cellGcmSetVBlankHandler},
     {"cellGcmSys", "_cellGcmInitBody", cellGcmInitBody},
     {"cellGcmSys", "cellGcmGetConfiguration", cellGcmGetConfiguration},
     {"cellGcmSys", "cellGcmAddressToOffset", cellGcmAddressToOffset},

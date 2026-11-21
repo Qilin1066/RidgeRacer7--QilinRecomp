@@ -42,6 +42,7 @@ uintptr_t g_guest_base = 0;
 
 // Prints the lifted functions these host addresses are in, innermost first.
 void print_guest_stack(const uintptr_t* frames, size_t count) {
+    if (const Cpu* cpu = current_cpu(); cpu && cpu->pc) std::fprintf(stderr, "  the last of the game's instructions to touch memory was at %08x\n", cpu->pc);
     if (g_by_host.empty()) return;
     const uintptr_t first = g_by_host.front().host, last = g_by_host.back().host + 0x100000;
     size_t shown = 0;

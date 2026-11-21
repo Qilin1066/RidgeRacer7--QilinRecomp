@@ -1,6 +1,6 @@
 # The runtime
 
-What the lifted game runs on: `runtime/` (what lifted code compiles against) and `ridgeracer7/src/` (the game's machine). Started at v0.11.0; this page says what exists and how it was checked. At v0.12.0 the game runs as far as graphics initialisation.
+What the lifted game runs on: `runtime/` (what lifted code compiles against) and `ridgeracer7/src/` (the game's machine). Started at v0.11.0; this page says what exists and how it was checked. At v0.12.0 the game ran as far as graphics initialisation; at v0.13.0 it runs to the start of SPURS.
 
 ## Building and running the game
 
@@ -23,13 +23,13 @@ The script builds `qilin`, lifts your copy's program to C++ (`qilin lift <game> 
   - each import's slot is given a descriptor whose code address is the import's own, in a range of guest addresses where nothing is, so the game's own import stub (which is lifted like any other code) arrives at `hooks->call` with an address that says which import it is;
   - a system call arrives at `hooks->system_call` with its number in `r11`.
   A function or call the runtime provides is run; any other ends the process with one line: its name, its library and id (or its number), and where it was called from. Nothing is answered with a guess.
-- **Unlifted functions** (the 98 the lifter doesn't cover yet) exist as functions that stop the game with their reason if called.
+- **Unlifted functions** (the 2 the lifter doesn't cover yet) exist as functions that stop the game with their reason if called.
 
 ## What is provided
 
 Each was added when the game reached it, and does what the system's function does as far as the game can tell. The files are in `ridgeracer7/src/`.
 
-**Imports** (40 of the game's 248):
+**Imports** (67 of the game's 248):
 
 | | Functions | What they are here |
 |---|---|---|
@@ -38,28 +38,57 @@ Each was added when the game reached it, and does what the system's function doe
 | `threads.cpp` | `sys_ppu_thread_create`, `sys_ppu_thread_exit` | a guest thread is a host thread with its own Cpu, stack and thread-local storage |
 | `mempool.cpp` | `sys_mempool_create`, `_destroy`, `_allocate_block`, `_try_allocate_block`, `_free_block` | equal blocks from memory the caller gives |
 | `sysutil.cpp` | `cellSysutilGetSystemParamInt`, `cellSysutilGetSystemParamString`, `cellDiscGameGetBootDiscInfo` | the console's settings (fixed for now: US English, cross confirms; the settings menu's Game page will hold them), and the disc's title id and parental level from `PARAM.SFO`. A parameter with no value here stops the game |
-| `pad.cpp` | `cellPadInit`, `cellPadEnd`, `cellPadGetInfo`, `cellPadGetData` and the five others by port | **a console with no controller plugged in**: there is no host input yet, and "no device" is an answer the real system gives |
+| `video.cpp` | `cellVideoOutGetNumberOfDevice`, `GetState`, `GetDeviceInfo`, `GetResolution`, `GetResolutionAvailability`, `Configure` | **the television is the runtime's to define**: one HDMI display, 16:9, 59.94 Hz, taking 1080p, 1080i, 720p and 480; it reports 1080p, the game's best, until the settings menu holds the choice. The game configures 1920 by 1080, pitch 8192. (The display information's modes begin at byte 32: read off the game's loop over them) |
+| `gcm.cpp` | `_cellGcmInitBody`, `cellGcmGetConfiguration`, `AddressToOffset`, `GetControlRegister`, `GetLabelAddress`, `GetTiledPitchSize`, `SetDisplayBuffer`, `SetFlipMode`, `SetTile`, `SetInvalidateTile`, `SetZcull`, `SetFlip`, `SetWaitFlip`, `SetVBlankHandler` | the RSX's set-up (below) |
+| `font.cpp` | `cellFontInitializeWithRevision`, `cellFontInitLibraryFreeTypeWithRevision`, and fourteen more: renderers, font sets, fonts in memory, scale, layout, glyph metrics, glyph images | the font library, on FreeType (below) |
+| `pad.cpp` | `cellPadInit`, `cellPadEnd`, `cellPadGetInfo`, `cellPadGetData` and the five others by port | **a console with no controller plugged in**: host input isn't connected yet, and "no device" is an answer the real system gives |
 | `usbd.cpp` | `cellUsbdInit`, `cellUsbdRegisterExtraLdd`, `cellUsbdUnregisterExtraLdd` | **a USB bus with nothing on it**: the game's own driver (for steering wheels) is registered and, since nothing attaches, never called |
 
-**System calls** (39 of the game's 78):
+**System calls** (40 of the game's 78):
 
 | | Calls | |
 |---|---|---|
 | `memory.cpp` | 348, 349, 352 | memory in pages of 1 MiB or 64 KiB from one range of addresses, first fit. *The total a game may have, 213 MiB, is from public descriptions: the game asks for it, so it is to be confirmed* |
 | `threads.cpp` | 43, 44, 45, 47, 48 | yield, join, detach, priorities |
-| `sync_calls.cpp` | 90-94, 114; 100-104; 105-108; 141, 142, 145, 147 | semaphores, mutexes, condition variables; sleeping, the calendar's time, the time base's frequency |
+| `sync_calls.cpp` | 90-94, 114; 100-104; 105-108; 141, 142, 145, 147 | semaphores, mutexes, condition variables; sleeping, the calendar's time, the time base's frequency. **A semaphore's post goes to the thread that has waited longest**: the game's threads greet each other by posting and then waiting on the same semaphore, and a post the poster could take back itself left the game reading a null pointer |
 | `events.cpp` | 128-130, 134-138 | event queues and ports. The receive call returns its event in `r4` to `r7`: read off the game's code after each `sc` |
 | `timers.cpp` | 70, 71, 73-76 | timers that send an event when due, served by one host thread. (Their names were among the ten unconfirmed; the game's use of them fits) |
 | `tty.cpp` | 402, 403 | the console's terminal: what the game prints goes to the log as `[the game] ...` |
+| `spu.cpp` | 169 | the process says how many SPUs it will use (six, none raw) |
 
-**Not yet as designed: the scheduler.** Every guest thread simply runs as a host thread; priorities are kept and reported but decide nothing, and waiters are woken in the host's order. The roadmap's design lets two guest threads run guest code at once, by priority, as the console's two hardware threads do. Until that exists, a game that leans on the console's order of running could go wrong here: when something looks like a race, this is the first suspect.
+**Not yet as designed: the scheduler.** Every guest thread simply runs as a host thread; priorities are kept and reported but decide nothing, and apart from semaphores waiters are woken in the host's order. The roadmap's design lets two guest threads run guest code at once, by priority, as the console's two hardware threads do. Until that exists, a game that leans on the console's order of running could go wrong here: when something looks like a race, this is the first suspect.
+
+## The RSX (`gcm.cpp`, `rsx.cpp`)
+
+The game writes the RSX's commands itself (that code is the game's, and lifted), into a buffer in its own memory which `cellGcmInit` maps for the RSX: 64 KiB of commands in 49 MiB at `0x20100000`. The layout handed out is the console's by public descriptions: the RSX's own memory (249 MiB) at `0xC0000000`, the mapped memory at offset 0, the first 4 KiB kept back, the command buffer in 32 KiB pieces of which the context holds one, and a callback (a function of the runtime's the game can call: `native_function`) that moves to the next piece when one is full.
+
+- **The RSX is a thread** that runs the commands between `get` and `put` in the control register: jumps, calls and returns, and methods with their arguments. A jump to itself is the game's way of holding the RSX, and is waited on.
+- **Methods that only set state are kept in a table** (`kState`: the chip's public names for them); the few that act read it. So far the acting ones are the labels (`SEMAPHORE_OFFSET`, `RELEASE`, `ACQUIRE`; `BACK_END_WRITE_SEMAPHORE_RELEASE`, which exchanges two of its argument's bytes as the chip does; `TEXTURE_READ_SEMAPHORE_RELEASE`) and `SET_REFERENCE`. **A method that is neither stops the game with its number**: nothing is skipped. Drawing is not provided yet.
+- **Flips** reach the RSX as two commands of the runtime's own (`0xE940`, `0xE944`, outside the chip's methods), put in the stream by `cellGcmSetFlip` and `cellGcmSetWaitFlip` so that they happen in order with the drawing. Waiting for a flip when none is pending does nothing; showing one is not provided yet.
+- **The vertical blank** is a thread at 59.94 Hz which calls the handler the game registers, as one of the system's own threads does on a console.
+- Tiles and zcull regions are speed on a console, not results: their parameters are kept and change nothing. `cellGcmSetTile` stops the game on parameters out of the ordinary, because the library's own answer to them isn't known here.
+
+## Fonts (`font.cpp`)
+
+The game draws its text with the system's font library: it opens one of the console's own font sets (`0x101`, the default gothic set), sets a size, and has glyphs drawn, which it copies into its own buffers itself. (What the calls take and leave was read off the game's own loop around `cellFontRenderCharGlyphImage`.)
+
+- The console's library is built on **FreeType**, and so is this: FreeType 2.13.3, fetched and pinned by CMake.
+- **The console's fonts are the player's to supply, as the game is**: the `data/font` folder of a PS3's system software. Sony publishes the system software file (`PS3UPDAT.PUP`) on its support site; RPCS3 installs it (`rpcs3 --installfw PS3UPDAT.PUP`) and leaves a `dev_flash` folder beside itself. `ridgeracer7 <game> --flash <dev_flash>` names it; without the option, an `RPCS3` folder beside the game's is looked in. Nothing stands in for a missing font: the game stops and says what it needs.
+- *Stated choices, to be compared with the console's picture:* glyphs are loaded unhinted; "scale pixel" is the em's size in pixels; glyphs sit on whole pixels; font set `0x101` is New Rodin's Japanese font with the extension font behind it. A character the font doesn't have stops the game (the library's answer to that isn't known here).
+
+## When something goes wrong
+
+- **A bad memory access is reported** (`fault.cpp`): the guest address, the thread, and the lifted functions on the stack, found from the host's return addresses. Then the process stops, as for any other unknown. Before this a fault ended the process without a word.
+- `qilin lift --pc` makes lifted code note each instruction's address before it touches memory (`Cpu::pc`), and the report then names the instruction. It is slower, so it is for finding faults, not for playing.
+- Two aids in the environment, neither a way to play: `RR7_WATCH=<seconds>` prints what system function each guest thread is inside after that long, and stops; `RR7_RSX_SURVEY` counts the RSX methods not yet provided up to the first flip, without running them, prints the list and stops.
 
 ## Where it stops now
 
-At v0.12.0: **`_cellGcmInitBody`**, the start of the graphics library: the game has run its C and C++ start-up, loaded its system modules, initialised controllers and the USB library, started its force-feedback library (which printed its version: the first of the game's own words in the log), created its event queues, timers and first threads, and now wants the RSX. The next work is the window and the RSX on Vulkan.
+At v0.13.0: **`cellSpursInitialize`**. The game has set the RSX and the video output up, sent its first state to the RSX, opened its font, registered its vertical-blank handler, said it will use six SPUs, and now starts SPURS, the system's manager of SPU work. From here it needs its SPU programs running, which is the SPU lifter (`docs/roadmap-and-design-targets.md`); and, for a picture, the RSX's drawing on Vulkan, for which the window is in place (`host/`).
 
 ## Checked
 
 - The first run on the owner's PC (2026-11-21): the program loads, its entry point and start-up code run as lifted native code, and the process stops, by name, at the first system function not provided. With `sys_initialize_tls` provided it runs on to the next.
 - v0.12.0, on the owner's PC: with 40 imports and 39 system calls provided, the game runs through its start-up to `_cellGcmInitBody`, printing its force-feedback library's version on the way.
+- v0.13.0, on the owner's PC: with 67 imports and 40 system calls provided, the game runs to `cellSpursInitialize`. The host layer's tests pass there (a Vulkan 1.3 device, an offscreen frame read back, a virtual controller).
 - `ridgeracer7_machine` is compiled in CI on all six configurations; the executable itself needs the game and is built only on the owner's PC.

@@ -69,9 +69,8 @@ bool in_slice(const Insn& in, std::string* why) {
         case Op::lvx: case Op::stvx: case Op::lvsl: case Op::lvsr: case Op::vand: case Op::vandc: case Op::vor: case Op::vxor: case Op::vnor:
         case Op::vmrghw: case Op::vmrglw: case Op::vadduwm: case Op::vaddfp: case Op::vsubfp: case Op::vmaxfp: case Op::vminfp:
         case Op::vcmpequw: case Op::vcmpeqfp: case Op::vsel: case Op::vperm: case Op::vsldoi: case Op::vmaddfp: case Op::vnmsubfp:
-        case Op::vspltw: case Op::vspltisw: case Op::vcfsx: case Op::vctsxs:
+        case Op::vspltw: case Op::vspltisw: case Op::vcfsx: case Op::vctsxs: case Op::vrefp: case Op::vrsqrtefp:
             return true;
-        case Op::vrefp: case Op::vrsqrtefp: return no(std::format("a VMX estimate ({})", s.name));
         default: return no(std::format("VMX ({})", s.name));
         }
     }
@@ -139,6 +138,7 @@ public:
                 out.why_at = a;
                 return out;
             }
+            if (f_.keep_pc && (line.find("read") != std::string::npos || line.find("write") != std::string::npos)) body += std::format("    c.pc = 0x{:08X}u;\n", a);
             body += line;
             const bool last = k + 1 == f_.insns.size();
             const uint32_t next = last ? 0 : f_.insns[k + 1].first;
@@ -603,6 +603,8 @@ private:
         case Op::vnmsubfp: line(std::format("{} = vmx::vnmsubfp({}, {}, {});", V(d), V(a), V(in.rc_reg()), V(b))); return true;
         case Op::vspltw: line(std::format("{} = vmx::vspltw({}, {}u);", V(d), V(b), a & 3)); return true;
         case Op::vspltisw: line(std::format("{} = vmx::vspltisw({});", V(d), in.vsimm())); return true;
+        case Op::vrefp: line(std::format("{} = vmx::vrefp({});", V(d), V(b))); return true;
+        case Op::vrsqrtefp: line(std::format("{} = vmx::vrsqrtefp({});", V(d), V(b))); return true;
         case Op::vcfsx: line(std::format("{} = vmx::vcfsx({}, {}u);", V(d), V(b), a)); return true;
         case Op::vctsxs: line(std::format("{} = vmx::vctsxs({}, {}u);", V(d), V(b), a)); return true;
 

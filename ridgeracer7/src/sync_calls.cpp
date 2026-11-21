@@ -8,6 +8,7 @@
 // one.
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <thread>
 
 #include "kernel.hpp"
@@ -228,9 +229,16 @@ void sys_cond_signal(Cpu& c) {
 
 // ---------------------------------------------------------------- semaphores
 
+// A post goes to the thread that has waited longest, if any waits: a thread that posts and then
+// waits itself does not take its own post back from one already waiting. (The game's threads greet
+// each other this way.) The console's other order, by priority, is the scheduler's, to come.
 struct Semaphore {
+    struct Waiter {
+        bool granted = false;
+    };
     std::mutex mutex;
     std::condition_variable posted;
+    std::deque<Waiter*> waiters;  // longest first
     int32_t value = 0, maximum = 0;
 };
 ObjectTable<Semaphore> g_semaphores(0x96000001u);
@@ -254,8 +262,24 @@ void sys_semaphore_create(Cpu& c) {
     c.r[3] = kOk;
 }
 
-// sys_semaphore_destroy(id)
-void sys_semaphore_destroy(Cpu& c) { c.r[3] = g_semaphores.remove(static_cast<uint32_t>(c.r[3])) ? kOk : kEsrch; }
+// sys_semaphore_destroy(id): busy while anyone waits on it.
+void sys_semaphore_destroy(Cpu& c) {
+    const uint32_t id = static_cast<uint32_t>(c.r[3]);
+    const auto object = g_semaphores.find(id);
+    if (!object) {
+        c.r[3] = kEsrch;
+        return;
+    }
+    {
+        const std::lock_guard lock(object->mutex);
+        if (!object->waiters.empty()) {
+            c.r[3] = kEbusy;
+            return;
+        }
+    }
+    g_semaphores.remove(id);
+    c.r[3] = kOk;
+}
 
 // sys_semaphore_wait(id, timeout), sys_semaphore_trywait(id)
 void semaphore_wait(Cpu& c, bool waiting) {
@@ -265,17 +289,22 @@ void semaphore_wait(Cpu& c, bool waiting) {
         return;
     }
     std::unique_lock lock(object->mutex);
-    if (object->value <= 0) {
-        if (!waiting) {
-            c.r[3] = kEbusy;
-            return;
-        }
-        if (!wait(object->posted, lock, c.r[4], [&] { return object->value > 0; })) {
-            c.r[3] = kEtimedout;
-            return;
-        }
+    if (object->value > 0 && object->waiters.empty()) {
+        --object->value;
+        c.r[3] = kOk;
+        return;
     }
-    --object->value;
+    if (!waiting) {
+        c.r[3] = kEbusy;
+        return;
+    }
+    Semaphore::Waiter self;
+    object->waiters.push_back(&self);
+    if (!wait(object->posted, lock, c.r[4], [&] { return self.granted; })) {
+        std::erase(object->waiters, &self);  // (not granted: so still queued)
+        c.r[3] = kEtimedout;
+        return;
+    }
     c.r[3] = kOk;
 }
 void sys_semaphore_wait(Cpu& c) { semaphore_wait(c, true); }
@@ -284,7 +313,7 @@ void sys_semaphore_trywait(Cpu& c) { semaphore_wait(c, false); }
 // sys_semaphore_post(id, count): busy if that would pass the maximum.
 void sys_semaphore_post(Cpu& c) {
     const auto object = g_semaphores.find(static_cast<uint32_t>(c.r[3]));
-    const int32_t count = static_cast<int32_t>(c.r[4]);
+    int32_t count = static_cast<int32_t>(c.r[4]);
     if (!object) {
         c.r[3] = kEsrch;
         return;
@@ -295,9 +324,13 @@ void sys_semaphore_post(Cpu& c) {
     }
     {
         const std::lock_guard lock(object->mutex);
-        if (count > object->maximum - object->value) {
+        if (count > object->maximum - object->value + static_cast<int32_t>(object->waiters.size())) {
             c.r[3] = kEbusy;
             return;
+        }
+        for (; count > 0 && !object->waiters.empty(); --count) {
+            object->waiters.front()->granted = true;
+            object->waiters.pop_front();
         }
         object->value += count;
     }

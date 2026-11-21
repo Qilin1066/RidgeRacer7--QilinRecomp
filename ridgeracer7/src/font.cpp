@@ -61,7 +61,10 @@ struct FontSet {
     const char* files[4];
 };
 constexpr FontSet kFontSets[] = {
-    {0xffffffffu, {nullptr}},  // (none yet: each is added when the game asks for it)
+    // 0x101, the SDK's "New Rodin gothic, Latin set" (its default gothic): New Rodin's own letters, with
+    // its Japanese and the extra symbols behind them. *Which files the console makes this set of is
+    // taken from the fonts' names, and to be compared with the console's picture.*
+    {0x101, {"SCE-PS3-NR-R-JPN.TTF", "SCE-PS3-NR-R-EXT.TTF", nullptr}},
 };
 
 float float_at(uint32_t address) { return std::bit_cast<float>(load32(address)); }
@@ -190,7 +193,7 @@ void cellFontOpenFontset(Cpu& c) {
     for (const FontSet& s : kFontSets)
         if (s.type == type) set = &s;
     if (!set) fatal("the game opens the console's font set %#x (map %#x), which this runtime doesn't know yet", type, map);
-    if (map != 0) fatal("the game opens font set %#x with character map %#x, which this runtime doesn't know (only Unicode, 0)", type, map);
+    if (map != 1) fatal("the game opens font set %#x with character map %#x, which this runtime doesn't know (only Unicode, 1)", type, map);
     if (game().flash.empty())
         fatal("the game needs the console's own fonts, and no system software folder was given or found: start with --flash <dev_flash> (docs/runtime.md says how to get one)");
     const std::lock_guard lock(g_mutex);

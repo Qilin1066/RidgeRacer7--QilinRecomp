@@ -56,6 +56,7 @@ std::span<const NativeSystemCall> sync_system_calls();    // sync_calls.cpp
 std::span<const NativeSystemCall> tty_system_calls();     // tty.cpp
 std::span<const NativeSystemCall> event_system_calls();   // events.cpp
 std::span<const NativeSystemCall> timer_system_calls();   // timers.cpp
+std::span<const NativeSystemCall> spu_system_calls();  // spu.cpp
 // Makes a thread known to the system (threads.cpp).
 void add_thread(uint32_t id, int32_t priority);
 std::span<const NativeImport> thread_imports();  // threads.cpp
@@ -98,6 +99,11 @@ void call_guest(Cpu& c, uint32_t code);
 // game may be handed as a callback. (At most kNativeFunctions of them, for the life of the process.)
 inline constexpr uint32_t kNativeFunctions = 64;
 uint32_t native_function(void (*handler)(Cpu&));
+// For a host thread of the runtime's that must call the game's functions (a handler the game has
+// registered): makes it a guest thread, with an id, a stack and thread-local storage of its own (threads.cpp).
+void become_guest_thread(Cpu& c, uint32_t stack_size, int32_t priority);
+// Calls the game's function behind a descriptor, with the arguments already in the registers.
+void call_descriptor(Cpu& c, uint32_t descriptor);
 // The program's thread-local image: each thread gets a copy.
 struct TlsImage {
     uint32_t address = 0, file_size = 0, memory_size = 0;

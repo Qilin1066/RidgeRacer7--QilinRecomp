@@ -230,6 +230,7 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
         cpu.r[12] = elf.process_param() ? elf.process_param()->malloc_page_size : 0x100000u;
     }
     start_watch();
+    set_current_cpu(&cpu);
     const qilin::rt::GuestFn entry = find_function(elf.entry_code());
     if (!entry) fatal("the program's entry point %08x is not among the lifted functions", elf.entry_code());
     entry(cpu);

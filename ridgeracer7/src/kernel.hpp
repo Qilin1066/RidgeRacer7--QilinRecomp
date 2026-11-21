@@ -27,6 +27,9 @@ void set_current_thread(uint32_t id);
 // environment, after that long the runtime prints what system function each thread is inside, and stops).
 // `what` is a name that lives for ever, or null on the way out; `number` a system call's, `from` the caller's address.
 void thread_enters(const char* what, uint32_t number, uint32_t from);
+// The Cpu of the guest thread this host thread runs (for the fault report), or null.
+void set_current_cpu(const Cpu* cpu);
+const Cpu* current_cpu();
 void thread_leaves();
 void start_watch();
 

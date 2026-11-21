@@ -22,6 +22,7 @@ struct Where {
 };
 thread_local uint32_t t_thread = 0;
 thread_local Where* t_where = nullptr;
+thread_local const Cpu* t_cpu = nullptr;
 std::mutex g_where_mutex;
 std::deque<Where> g_where;  // one for each guest thread there has been
 
@@ -42,6 +43,9 @@ void thread_enters(const char* what, uint32_t number, uint32_t from) {
     t_where->what.store(what, std::memory_order_relaxed);
     t_where->calls.fetch_add(1, std::memory_order_relaxed);
 }
+void set_current_cpu(const Cpu* cpu) { t_cpu = cpu; }
+const Cpu* current_cpu() { return t_cpu; }
+
 void thread_leaves() {
     if (t_where) t_where->what.store(nullptr, std::memory_order_relaxed);
 }

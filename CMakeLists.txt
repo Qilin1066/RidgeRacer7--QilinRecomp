@@ -78,6 +78,7 @@ add_library(qilin_game STATIC
     recomp/src/sfo.cpp
     recomp/src/sha256.cpp
     recomp/src/spu_image.cpp
+    recomp/src/syscall_names.cpp
     recomp/src/title.cpp
 )
 target_include_directories(qilin_game PUBLIC recomp/src)

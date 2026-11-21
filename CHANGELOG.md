@@ -5,6 +5,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ## [Unreleased]
 
 ### Added
+- Names for the 78 system calls the game makes directly (`recomp/src/syscall_names.*`); `qilin cfg` lists them. 68 are confirmed by PSL1GHT's headers; 10 are flagged as unconfirmed.
 - `import_id` and `qilin id <name>`: the id of a system function, computed from its name (SHA-1 of the name and the scheme's fixed suffix). The unit tests now recompute all 248 ids in the table of names, so it is checked on every push. The suffix is a constant of the naming scheme, not a key; it is in the repository by the owner's decision.
 
 ## [0.4.0] - 2026-11-21

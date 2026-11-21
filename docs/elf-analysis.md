@@ -189,7 +189,7 @@ What the names say about the game:
 - **Not used at all**: `lwarx`/`stwcx.` and `ldarx`/`stdcx.` (the program takes its locks through the system's libraries, never inline), `dcbz` and every other cache instruction except `dcbt` (58), the string and multiple-word loads and stores, the byte-reversed ones, `mcrxr`, `mtcrf` (the one-field `mtocrf` is used, 425 times, and `mfocrf` 617).
 - Of the loads and stores with update, only `stdu` (9,150: the stack frames), `lbzu` and `stbu` (6 each) and `ldu` (1).
 - One each of `sync`, `tw`, `fsqrts`, `mffs` and `mtfsf`; 13 `mftb` (the time base read directly).
-- **502 `sc` instructions**: the program makes system calls directly, from the system-call wrappers linked into it. The control-flow pass numbers every one (v0.4.0): **78 different system calls**: 43–48, 70–76, 90–94, 100–108, 114, 128–130, 134–138, 141, 142, 145, 147, 169–173, 178, 181, 182, 190–194, 341, 342, 348, 349, 352, 402, 403, 801–815, 817, 818, 820, 831, 832, 834. By public descriptions of the system-call table these are threads and scheduling, timers, semaphores, mutexes, condition variables, event queues and ports, SPU threads and thread groups, memory, the console, and files. *They are not named in the code yet.*
+- **502 `sc` instructions**: the program makes system calls directly, from the system-call wrappers linked into it. The control-flow pass numbers every one (v0.4.0): **78 different system calls**: 43–48, 70–76, 90–94, 100–108, 114, 128–130, 134–138, 141, 142, 145, 147, 169–173, 178, 181, 182, 190–194, 341, 342, 348, 349, 352, 402, 403, 801–815, 817, 818, 820, 831, 832, 834. **All 78 have a name** (`recomp/src/syscall_names.*`; `qilin cfg` lists each with its number of sites). A system call's number can't be checked against its name by computation, as an import's id can, so each name carries whether it is confirmed: **68 are**, by PSL1GHT's headers (MIT), which wrap the same number as the same operation. The other 10 are from public descriptions of the table, recalled, and flagged: the timer calls (70, 71, 73–76), memory containers (341, 342; at one site the arguments are a pointer and a size of 4 MiB, which fits creating one), 352 and 817. What the calls are: threads (yield, join, priority), semaphores, mutexes, condition variables, event queues and ports, sleeping and the clock, **SPU thread groups** (create, initialise, start, join, their mailboxes and event queues: how `bnusCoreSpu.elf` is run), memory allocation, the console, and **files through `sys_fs` directly** (open, read, seek, directories, rename, unlink) beside the `cellFs` imports.
 - 4,943 `bcctrl` (calls through a pointer: virtual calls, callbacks and the import stubs) and 544 `bcctr` (switches and tail calls).
 
 ### The SPU programs
@@ -211,7 +211,7 @@ What the names say about the game:
 ## Next
 
 1. ✅ The decrypted program read (v0.3.0).
-2. ✅ Names for the 248 ids. Still to do: names for the 78 system calls.
+2. ✅ Names for the 248 ids and the 78 system calls (10 of those to be confirmed).
 3. ✅ The PPU decoder (v0.2.0, `recompiler-core.md`), its profile of the real code and the SPU programs found (v0.3.0).
 4. ✅ The control-flow pass (v0.4.0, `recompiler-core.md`): every word accounted for.
 5. The decoder against objdump over every word of the real code (it needs a PowerPC objdump where the game is); names for the system calls; the SPU decoder; the archive's directory.

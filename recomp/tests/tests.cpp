@@ -18,6 +18,7 @@
 #include "sfo.hpp"
 #include "sha256.hpp"
 #include "spu_image.hpp"
+#include "syscall_names.hpp"
 #include "title.hpp"
 
 using namespace qilin;
@@ -462,6 +463,21 @@ void test_import_names() {
     }
 }
 
+// ---------------------------------------------------------------- system-call names
+
+void test_syscall_names() {
+    const auto names = system_call_names();
+    CHECK(names.size() == 78);
+    for (size_t i = 0; i < names.size(); ++i) {
+        CHECK(!names[i].name.empty());
+        CHECK(i == 0 || names[i - 1].number < names[i].number);  // in order, none twice
+        CHECK(system_call_name(names[i].number) == &names[i]);
+    }
+    CHECK(system_call_name(801) && system_call_name(801)->name == "sys_fs_open" && system_call_name(801)->confirmed);
+    CHECK(system_call_name(341) && !system_call_name(341)->confirmed);
+    CHECK(!system_call_name(0) && !system_call_name(46) && !system_call_name(9999));
+}
+
 // ---------------------------------------------------------------- SPU programs
 
 // An SPU program: a code segment of four words at 0x3000, a data segment, a
@@ -807,6 +823,7 @@ int main() {
     test_self();
     test_sfo();
     test_media();
+    test_syscall_names();
     test_cfg();
     test_import_names();
     test_spu_image();

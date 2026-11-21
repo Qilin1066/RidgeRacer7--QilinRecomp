@@ -4,6 +4,7 @@
 #include <format>
 
 #include "bytes.hpp"
+#include "syscall_names.hpp"
 
 namespace qilin {
 
@@ -743,9 +744,10 @@ std::string Cfg::summary() const {
     line(std::format("{} functions reach their end without a return or jump (a call that doesn't return, or the next function); {} of them have no unwinding entry to say where they end; their last instructions:{}",
                      runs_off, runs_off_unknown, some(open_ended)));
     line(std::format("{} system call sites; the number is known at {}: {} different calls", sites, numbered, numbers.size()));
-    std::string list;
-    for (const auto& [number, count] : numbers) list += std::format(" {}x{}", number, count);
-    if (!list.empty()) line(" " + list);
+    for (const auto& [number, count] : numbers) {
+        const SystemCallName* name = system_call_name(number);
+        line(std::format("  {:4} {:3} sites  {}{}", number, count, name ? name->name : "(no name)", name && !name->confirmed ? " (name unconfirmed)" : ""));
+    }
     line(std::format("{} places where a function reaches a word that isn't an instruction, or leaves the code:{}", bad.size(), some(bad)));
     const Coverage& c = coverage_;
     line(std::format("{} words: {} code, {} jump-table entries, {} padding, {} dead after a trap, {} unknown in {} spans", c.words, c.code,

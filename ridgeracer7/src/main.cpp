@@ -1,6 +1,9 @@
 // ridgeracer7: the game, recompiled.
 //
-//   ridgeracer7 <game>     <game>: your copy: the disc's folder (the one holding PS3_GAME), or EBOOT.elf
+//   ridgeracer7 <game> [--flash <dev_flash>]
+//     <game>: your copy: the disc's folder (the one holding PS3_GAME), or EBOOT.elf
+//     --flash: a PS3's system software, for the console's own fonts (the dev_flash folder RPCS3 makes when it
+//              installs Sony's system software file). Without it, an RPCS3 folder beside the game's is looked in.
 //
 // The executable is built from your own copy of the game (tools/build-ridgeracer7.ps1):
 // it holds the lifted code of that copy's program, and at start-up checks
@@ -9,6 +12,7 @@
 // repository.
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 #include "machine.hpp"
@@ -19,8 +23,8 @@
 
 int main(int argc, char** argv) {
     using qilin::rt::fatal;
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: ridgeracer7 <game>   (the disc's folder, the one holding PS3_GAME, or the decrypted EBOOT.elf)\n");
+    if (argc != 2 && !(argc == 4 && std::strcmp(argv[2], "--flash") == 0)) {
+        std::fprintf(stderr, "usage: ridgeracer7 <game> [--flash <dev_flash>]   (<game>: the disc's folder, the one holding PS3_GAME, or the decrypted EBOOT.elf)\n");
         return 2;
     }
     const auto files = qilin::find_game(argv[1]);
@@ -33,6 +37,15 @@ int main(int argc, char** argv) {
     // The disc's description of the game: the system hands parts of it to the game.
     rr7::GameInfo info;
     info.usrdir = files->usrdir;
+    if (argc == 4) {
+        info.flash = argv[3];
+        if (!std::filesystem::is_directory(info.flash / "data" / "font")) fatal("%s holds no data/font folder: it is not a PS3's system software", argv[3]);
+    } else if (!files->usrdir.empty()) {
+        // <disc>/PS3_GAME/USRDIR -> the folder the disc's folder is in, then RPCS3/dev_flash.
+        std::error_code error;
+        const auto beside = std::filesystem::weakly_canonical(files->usrdir, error).parent_path().parent_path().parent_path() / "RPCS3" / "dev_flash";
+        if (!error && std::filesystem::is_directory(beside / "data" / "font", error)) info.flash = beside;
+    }
     if (files->sfo.empty()) fatal("%s: no PARAM.SFO was found for this copy (give the disc's folder, the one holding PS3_GAME)", argv[1]);
     const auto sfo = qilin::Sfo::load(files->sfo);
     if (!sfo) fatal("%s", sfo.error().c_str());

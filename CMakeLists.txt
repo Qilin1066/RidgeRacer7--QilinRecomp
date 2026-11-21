@@ -130,14 +130,93 @@ set_tests_properties(qilin_usage PROPERTIES WILL_FAIL TRUE)
 # code, which is made from the player's own copy and is never in the
 # repository: `qilin lift <game> --out <folder>`, then configure with
 # -DQILIN_GEN_DIR=<folder> (tools/build-ridgeracer7.ps1 does both).
+# ---- The host platform: window, input and audio (SDL3), Vulkan ----
+# The other Qilin recomps' host layer (host/), with this game's names. Fetched at
+# configure time, pinned, built statically: SDL3, the Vulkan headers and volk
+# (which loads Vulkan at run time, so no SDK is needed to build or run).
+option(QILIN_HOST "Build the host platform layer (window, Vulkan, input, audio)" ON)
+if(QILIN_HOST)
+    include(FetchContent)
+    set(FETCHCONTENT_QUIET ON)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)  # synthetic input: not needed
+    FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL GIT_TAG release-3.4.20 GIT_SHALLOW ON)
+    FetchContent_Declare(VulkanHeaders GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers
+                         GIT_TAG vulkan-sdk-1.4.363.0 GIT_SHALLOW ON)
+    # volk is one C file: fetched without its own CMake project (SOURCE_SUBDIR points nowhere).
+    FetchContent_Declare(volk GIT_REPOSITORY https://github.com/zeux/volk GIT_TAG vulkan-sdk-1.4.363.0 GIT_SHALLOW ON
+                         SOURCE_SUBDIR no-cmake)
+    FetchContent_MakeAvailable(SDL3 VulkanHeaders volk)
+    add_library(qilin_volk STATIC ${volk_SOURCE_DIR}/volk.c)
+    target_include_directories(qilin_volk PUBLIC ${volk_SOURCE_DIR})
+    target_link_libraries(qilin_volk PUBLIC Vulkan::Headers ${CMAKE_DL_LIBS})
+    target_compile_definitions(qilin_volk PUBLIC VK_NO_PROTOTYPES)
+
+    add_library(qilin_host STATIC host/src/vulkan.cpp host/src/display.cpp host/src/audio.cpp host/src/paths.cpp)
+    target_include_directories(qilin_host PUBLIC host/include)
+    target_link_libraries(qilin_host PUBLIC qilin_volk PRIVATE SDL3::SDL3-static qilin_warnings)
+    # Vulkan structures are written {sType} with the rest zeroed: that's the idiom, not a mistake.
+    # (On the sources, so it comes after -Wextra on the command line.)
+    if(NOT MSVC)
+        set_source_files_properties(host/src/vulkan.cpp host/src/display.cpp host/src/audio.cpp host/src/paths.cpp host/tests/vktest.cpp
+                                    PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
+    endif()
+
+    # The Vulkan layer's own test: a device, an offscreen frame, read back. Skips
+    # (exit 77) where there's no Vulkan 1.3 device, as on CI runners.
+    add_executable(qilin_vktest host/tests/vktest.cpp)
+    target_link_libraries(qilin_vktest PRIVATE qilin_host qilin_warnings)
+    add_test(NAME qilin_vktest COMMAND qilin_vktest)
+    set_tests_properties(qilin_vktest PROPERTIES SKIP_RETURN_CODE 77)
+
+    # A controller reaches the game (SDL's virtual gamepad). Needs a window:
+    # skips where there's no display, as on CI runners.
+    add_executable(qilin_padtest host/tests/padtest.cpp)
+    target_link_libraries(qilin_padtest PRIVATE qilin_host SDL3::SDL3-static qilin_warnings)
+    add_test(NAME qilin_padtest COMMAND qilin_padtest)
+    set_tests_properties(qilin_padtest PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+add_executable(qilin_layout_test host/tests/layout_test.cpp)
+target_include_directories(qilin_layout_test PRIVATE host/include)
+target_link_libraries(qilin_layout_test PRIVATE qilin_warnings)
+add_test(NAME qilin_layout_test COMMAND qilin_layout_test)
+add_executable(qilin_frame_times_test host/tests/frame_times_test.cpp)
+target_include_directories(qilin_frame_times_test PRIVATE host/include)
+target_link_libraries(qilin_frame_times_test PRIVATE qilin_warnings)
+add_test(NAME qilin_frame_times_test COMMAND qilin_frame_times_test)
+
+# FreeType (the FreeType Licence), for the system's font library, which is built on it on the console
+# too: fetched, pinned, built statically, with none of its optional parts.
+include(FetchContent)
+set(FETCHCONTENT_QUIET ON)
+foreach(part ZLIB BZIP2 PNG HARFBUZZ BROTLI)
+    set(FT_DISABLE_${part} ON CACHE BOOL "" FORCE)
+endforeach()
+FetchContent_Declare(freetype
+    URL https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz
+    URL_HASH SHA256=0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289)
+set(qilin_saved_shared ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
+FetchContent_MakeAvailable(freetype)
+set(BUILD_SHARED_LIBS ${qilin_saved_shared})
+
 add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/events.cpp
+    ridgeracer7/src/fault.cpp
+    ridgeracer7/src/font.cpp
+    ridgeracer7/src/gcm.cpp
     ridgeracer7/src/imports.cpp
     ridgeracer7/src/kernel.cpp
     ridgeracer7/src/machine.cpp
     ridgeracer7/src/memory.cpp
     ridgeracer7/src/mempool.cpp
     ridgeracer7/src/pad.cpp
+    ridgeracer7/src/rsx.cpp
     ridgeracer7/src/sync.cpp
     ridgeracer7/src/sync_calls.cpp
     ridgeracer7/src/syscalls.cpp
@@ -146,9 +225,10 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/timers.cpp
     ridgeracer7/src/tty.cpp
     ridgeracer7/src/usbd.cpp
+    ridgeracer7/src/video.cpp
 )
 target_include_directories(ridgeracer7_machine PUBLIC ridgeracer7/src)
-target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt PRIVATE qilin_warnings)
+target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt PRIVATE qilin_warnings freetype)
 set(QILIN_GEN_DIR "" CACHE PATH "The folder `qilin lift <game> --out` wrote: the lifted code of your own copy")
 if(QILIN_GEN_DIR)
     if(NOT EXISTS "${QILIN_GEN_DIR}/table.cpp")

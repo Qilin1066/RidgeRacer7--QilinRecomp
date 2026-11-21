@@ -1,9 +1,12 @@
 #include "machine.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -35,6 +38,9 @@ struct Machine {
     uint32_t next_allocation = kRuntimeArea;
     GameInfo info;
     TlsImage tls;
+    std::array<std::atomic<void (*)(Cpu&)>, kNativeFunctions> natives{};
+    std::mutex natives_mutex;
+    uint32_t natives_count = 0;
 };
 Machine* g_machine = nullptr;
 
@@ -52,7 +58,15 @@ void on_call(Cpu& c, uint32_t target) {
         if (!import.handler)
             fatal("the game called %s (%s, id %08x), which this runtime doesn't provide yet; it would return to %08x", import.name.empty() ? "a function with no name" : import.name.c_str(),
                   import.library.c_str(), import.id, static_cast<uint32_t>(c.lr));
+        thread_enters(import.name.c_str(), 0, static_cast<uint32_t>(c.lr));
         import.handler(c);
+        thread_leaves();
+        return;
+    }
+    if (target >= kNativeCode && target < kNativeCode + 4 * kNativeFunctions && target % 4 == 0) {
+        const auto handler = g_machine->natives[(target - kNativeCode) / 4].load();
+        if (!handler) fatal("a call to %08x, where the runtime has no function (it would return to %08x)", target, static_cast<uint32_t>(c.lr));
+        handler(c);
         return;
     }
     if (target == kReturnToHost) fatal("a jump to the address a thread's first function returns to (LR %08x)", static_cast<uint32_t>(c.lr));
@@ -64,7 +78,9 @@ void on_call(Cpu& c, uint32_t target) {
 void on_system_call(Cpu& c, uint32_t pc) {
     const uint32_t number = static_cast<uint32_t>(c.r[11]);
     if (const auto handler = find_native_system_call(number)) {
+        thread_enters("a system call", number, pc);
         handler(c);
+        thread_leaves();
         return;
     }
     const qilin::SystemCallName* name = qilin::system_call_name(number);
@@ -108,11 +124,27 @@ void call_guest(Cpu& c, uint32_t code) {
 
 TlsImage tls_image() { return g_machine->tls; }
 
+uint32_t native_function(void (*handler)(Cpu&)) {
+    uint32_t index;
+    {
+        const std::lock_guard lock(g_machine->natives_mutex);
+        if (g_machine->natives_count == kNativeFunctions) fatal("the runtime has made more of its functions callable than it has room for");
+        index = g_machine->natives_count++;
+    }
+    g_machine->natives[index].store(handler);
+    const uint32_t descriptor = allocate(8, 8);
+    store32(descriptor, kNativeCode + 4 * index);
+    store32(descriptor + 4, 0);
+    return descriptor;
+}
+
 void commit(uint32_t address, uint32_t size) {
     if (!g_machine->space.commit(address, size)) fatal("the host refused %u bytes of memory for the guest at %08x", size, address);
 }
 
 uint32_t allocate(uint32_t size, uint32_t alignment) {
+    static std::mutex mutex;
+    const std::lock_guard lock(mutex);
     const uint32_t at = (g_machine->next_allocation + alignment - 1) & ~(alignment - 1);
     if (size > kRuntimeAreaEnd - at) fatal("the runtime's own area of guest memory is full (%u more bytes wanted)", size);
     commit(at, size ? size : 1);
@@ -128,6 +160,7 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
     machine.started = std::chrono::steady_clock::now();
     if (!machine.space.base()) fatal("the host refused the 4 GiB of address space the guest's memory needs");
     uint8_t* const memory = machine.space.base();
+    report_faults(functions);
 
     // The program, at the addresses it was linked for.
     for (const qilin::ElfSegment& s : elf.segments()) {
@@ -196,6 +229,7 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
         }
         cpu.r[12] = elf.process_param() ? elf.process_param()->malloc_page_size : 0x100000u;
     }
+    start_watch();
     const qilin::rt::GuestFn entry = find_function(elf.entry_code());
     if (!entry) fatal("the program's entry point %08x is not among the lifted functions", elf.entry_code());
     entry(cpu);

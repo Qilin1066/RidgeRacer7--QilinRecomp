@@ -27,6 +27,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq g++-14 ${{ startsWith(matrix.cc, 'clang') && matrix.cc || '' }} ${{ matrix.sweep && 'binutils-powerpc-linux-gnu' || '' }}
+          # What SDL3 (fetched by CMake) builds against on Linux: without X11 or Wayland it refuses to configure.
+          sudo apt-get install -y -qq libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev \
+            libxtst-dev libxfixes-dev libxkbcommon-dev libwayland-dev libdecor-0-dev libegl-dev libdrm-dev libgbm-dev \
+            libasound2-dev libpulse-dev libudev-dev libdbus-1-dev
       - name: Configure
         shell: bash
         run: |
@@ -67,4 +71,10 @@ jobs:
         run: OBJDUMP_SPU="$HOME/spu-binutils/bin/spu-elf-objdump" python3 tools/check/verify_spu_decoder.py --qilin build/qilin --sweep
       - name: Scripts compile
         if: matrix.sweep
-        run: python3 -m py_compile tools/check/verify_decoder.py tools/check/verify_spu_decoder.py
+        run: python3 -m py_compile tools/check/verify_decoder.py tools/check/verify_spu_decoder.py tools/build_shaders.py
+      # The window's shaders are committed as SPIR-V; check that it matches the sources and that they compile.
+      - name: Shaders up to date
+        if: matrix.sweep
+        run: |
+          sudo apt-get install -y glslang-tools
+          python3 tools/build_shaders.py --check

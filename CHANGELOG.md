@@ -4,6 +4,9 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+### Added
+- `import_id` and `qilin id <name>`: the id of a system function, computed from its name (SHA-1 of the name and the scheme's fixed suffix). The unit tests now recompute all 248 ids in the table of names, so it is checked on every push. The suffix is a constant of the naming scheme, not a key; it is in the repository by the owner's decision.
+
 ## [0.4.0] - 2026-11-21
 
 The control-flow pass: every word of the game's code accounted for.

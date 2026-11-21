@@ -443,6 +443,15 @@ void test_import_names() {
     CHECK(import_name("sysPrxForUser", 0x1573dc3f) == "sys_lwmutex_lock");
     CHECK(import_name("sys_fs", 0x15bae46b).empty());  // an id belongs to its library
     CHECK(import_name("cellNoSuch", 0x718bf5f8).empty());
+    // The method, on ids known from elsewhere (PSL1GHT lists both).
+    CHECK(import_id("cellFsOpen") == 0x718bf5f8);
+    CHECK(import_id("_cellGcmInitBody") == 0x15bae46b);
+    CHECK(import_id("cellFsopen") != 0x718bf5f8);
+    // Every name in the table gives its id.
+    for (const ImportName& n : import_names()) {
+        if (import_id(n.name) != n.id) std::println(stderr, "{} is not {:08x}", n.name, n.id);
+        CHECK(import_id(n.name) == n.id);
+    }
     // No pair twice, no name twice in a library, and nothing empty.
     const auto names = import_names();
     CHECK(names.size() == 248);

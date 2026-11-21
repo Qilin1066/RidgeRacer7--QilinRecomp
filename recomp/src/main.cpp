@@ -10,6 +10,7 @@
 //   qilin imports <game>                     every library imported and each function id taken from it
 //   qilin exports <game>                     what the program offers the system
 //   qilin sfo     <game>                     every entry of PARAM.SFO
+//   qilin id      <name>                     the id a system function of that name has
 //   qilin data    <game>                     the game's own files, and the headers of its sound banks and films
 //   qilin spu     <game>                     the SPU programs the program carries
 //   qilin cfg     <game>                     the control-flow pass: functions, switches, system calls, coverage
@@ -66,6 +67,7 @@ int usage() {
                "  qilin imports <game>\n"
                "  qilin exports <game>\n"
                "  qilin sfo     <game>\n"
+               "  qilin id      <function name>\n"
                "  qilin data    <game>\n"
                "  qilin spu     <game>\n"
                "  qilin cfg     <game>\n"
@@ -565,6 +567,10 @@ int main(int argc, char** argv) {
         if (a.command == "imports") return cmd_imports(a);
         if (a.command == "exports") return cmd_exports(a);
         if (a.command == "sfo") return cmd_sfo(a);
+        if (a.command == "id") {
+            std::println("{:08x} {}", import_id(a.input), a.input);
+            return 0;
+        }
         if (a.command == "data") return cmd_data(a);
         if (a.command == "spu") return cmd_spu(a);
         if (a.command == "cfg") return cmd_cfg(a);

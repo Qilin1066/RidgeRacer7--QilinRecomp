@@ -1,8 +1,49 @@
 #include "import_names.hpp"
 
+#include <array>
+#include <bit>
+#include <vector>
+
 namespace qilin {
 
 namespace {
+
+// What follows the name in the text an id is the hash of.
+constexpr uint8_t kSuffix[16] = {0x67, 0x59, 0x65, 0x99, 0x04, 0x25, 0x04, 0x90, 0x56, 0x64, 0x27, 0x49, 0x94, 0x89, 0x74, 0x1a};
+
+// SHA-1 (FIPS 180-4). Only the ids use it.
+std::array<uint32_t, 5> sha1(const std::vector<uint8_t>& message) {
+    std::array<uint32_t, 5> h = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0};
+    std::vector<uint8_t> data = message;
+    data.push_back(0x80);
+    while (data.size() % 64 != 56) data.push_back(0);
+    const uint64_t bits = uint64_t{message.size()} * 8;
+    for (int shift = 56; shift >= 0; shift -= 8) data.push_back(static_cast<uint8_t>(bits >> shift));
+    for (size_t block = 0; block < data.size(); block += 64) {
+        uint32_t w[80];
+        for (size_t i = 0; i < 16; ++i) {
+            const uint8_t* p = data.data() + block + 4 * i;
+            w[i] = uint32_t{p[0]} << 24 | uint32_t{p[1]} << 16 | uint32_t{p[2]} << 8 | uint32_t{p[3]};
+        }
+        for (size_t i = 16; i < 80; ++i) w[i] = std::rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (size_t i = 0; i < 80; ++i) {
+            uint32_t f, k;
+            if (i < 20) f = (b & c) | (~b & d), k = 0x5a827999;
+            else if (i < 40) f = b ^ c ^ d, k = 0x6ed9eba1;
+            else if (i < 60) f = (b & c) | (b & d) | (c & d), k = 0x8f1bbcdc;
+            else f = b ^ c ^ d, k = 0xca62c1d6;
+            const uint32_t next = std::rotl(a, 5) + f + e + k + w[i];
+            e = d;
+            d = c;
+            c = std::rotl(b, 30);
+            b = a;
+            a = next;
+        }
+        h[0] += a, h[1] += b, h[2] += c, h[3] += d, h[4] += e;
+    }
+    return h;
+}
 
 constexpr ImportName kNames[] = {
     // cellGcmSys
@@ -280,6 +321,12 @@ constexpr ImportName kNames[] = {
 }  // namespace
 
 std::span<const ImportName> import_names() { return kNames; }
+
+uint32_t import_id(std::string_view name) {
+    std::vector<uint8_t> text(name.begin(), name.end());
+    text.insert(text.end(), std::begin(kSuffix), std::end(kSuffix));
+    return std::byteswap(sha1(text)[0]);  // the digest's first four bytes, read little-endian
+}
 
 std::string_view import_name(std::string_view library, uint32_t id) {
     for (const ImportName& n : kNames)

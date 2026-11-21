@@ -29,7 +29,7 @@ The script builds `qilin`, lifts your copy's program to C++ (`qilin lift <game> 
 
 Each was added when the game reached it, and does what the system's function does as far as the game can tell. The files are in `ridgeracer7/src/`.
 
-**Imports** (67 of the game's 248):
+**Imports** (94 of the game's 248):
 
 | | Functions | What they are here |
 |---|---|---|
@@ -37,18 +37,23 @@ Each was added when the game reached it, and does what the system's function doe
 | `sync.cpp` | `sys_lwmutex_create`, `_destroy`, `_lock`, `_trylock`, `_unlock` | lightweight mutexes: a host lock found by the id kept in the guest's structure, whose owner and count are written back as the library would leave them |
 | `threads.cpp` | `sys_ppu_thread_create`, `sys_ppu_thread_exit` | a guest thread is a host thread with its own Cpu, stack and thread-local storage |
 | `mempool.cpp` | `sys_mempool_create`, `_destroy`, `_allocate_block`, `_try_allocate_block`, `_free_block` | equal blocks from memory the caller gives |
-| `sysutil.cpp` | `cellSysutilGetSystemParamInt`, `cellSysutilGetSystemParamString`, `cellDiscGameGetBootDiscInfo` | the console's settings (fixed for now: US English, cross confirms; the settings menu's Game page will hold them), and the disc's title id and parental level from `PARAM.SFO`. A parameter with no value here stops the game |
-| `video.cpp` | `cellVideoOutGetNumberOfDevice`, `GetState`, `GetDeviceInfo`, `GetResolution`, `GetResolutionAvailability`, `Configure` | **the television is the runtime's to define**: one HDMI display, 16:9, 59.94 Hz, taking 1080p, 1080i, 720p and 480; it reports 1080p, the game's best, until the settings menu holds the choice. The game configures 1920 by 1080, pitch 8192. (The display information's modes begin at byte 32: read off the game's loop over them) |
+| `sysutil.cpp` | `cellSysutilGetSystemParamInt`, `cellSysutilGetSystemParamString`, `cellDiscGameGetBootDiscInfo`, `cellSysutilRegisterCallback`, `UnregisterCallback`, `CheckCallback` | the console's settings (fixed for now: US English, cross confirms; the settings menu's Game page will hold them), and the disc's title id and parental level from `PARAM.SFO`. A parameter with no value here stops the game. The system's events (the player asks to quit) are a queue the runtime can put to (`system_event`), handed to the game's registered functions at its per-frame check; nothing puts to it yet |
+| `gamedata.cpp` | `cellGameDataCheckCreate2` | the game's folder on the hard disk (below) |
+| `fs.cpp` | `cellFsOpen`, `Close`, `Read`, `Write`, `Lseek`, `Fstat`, `Opendir`, `Readdir`, `Closedir`, `Unlink` | the file system (below) |
+| `spurs.cpp` | `cellSpursInitialize`, `cellSpursAttachLv2EventQueue`, `cellSpursCreateTaskset` | the SPURS instance (4 SPUs) and its tasksets (the game makes four). `cellSpursCreateTask` stops the game and says which SPU program it was handed: that needs the SPU lifter |
+| `net.cpp` | `sys_net_initialize_network_ex`, `sys_net_finalize_network`, `cellNetCtlInit`, `cellNetCtlTerm` | **a console with no network cable**: the libraries start, as they do on one. Sockets and the connection dialog are not provided yet |
+| `np.cpp` | `sceNpInit`, `sceNpTerm`, `sceNpManagerGetStatus` | PlayStation Network on **a console that is not signed in**: the status is "offline" |
+| `video.cpp` | `cellVideoOutGetNumberOfDevice`, `GetState`, `GetDeviceInfo`, `GetResolution`, `GetResolutionAvailability`, `Configure` | **the television is the runtime's to define**: one HDMI display, 16:9, 59.94 Hz, taking 1080p, 1080i, 720p and 480; it reports 1080p, the game's best, until the settings menu holds the choice. The game configures 1920 by 1080, pitch 8192. The sound output (`cellAudioOutGetSoundAvailability`, `cellAudioOutConfigure`, in the same file) is likewise defined: **two channels of linear PCM at 48 kHz** and nothing else, which the game takes (down-mixer 2). (The display information's modes begin at byte 32: read off the game's loop over them) |
 | `gcm.cpp` | `_cellGcmInitBody`, `cellGcmGetConfiguration`, `AddressToOffset`, `GetControlRegister`, `GetLabelAddress`, `GetTiledPitchSize`, `SetDisplayBuffer`, `SetFlipMode`, `SetTile`, `SetInvalidateTile`, `SetZcull`, `SetFlip`, `SetWaitFlip`, `SetVBlankHandler` | the RSX's set-up (below) |
 | `font.cpp` | `cellFontInitializeWithRevision`, `cellFontInitLibraryFreeTypeWithRevision`, and fourteen more: renderers, font sets, fonts in memory, scale, layout, glyph metrics, glyph images | the font library, on FreeType (below) |
 | `pad.cpp` | `cellPadInit`, `cellPadEnd`, `cellPadGetInfo`, `cellPadGetData` and the five others by port | **a console with no controller plugged in**: host input isn't connected yet, and "no device" is an answer the real system gives |
 | `usbd.cpp` | `cellUsbdInit`, `cellUsbdRegisterExtraLdd`, `cellUsbdUnregisterExtraLdd` | **a USB bus with nothing on it**: the game's own driver (for steering wheels) is registered and, since nothing attaches, never called |
 
-**System calls** (40 of the game's 78):
+**System calls** (42 of the game's 78):
 
 | | Calls | |
 |---|---|---|
-| `memory.cpp` | 348, 349, 352 | memory in pages of 1 MiB or 64 KiB from one range of addresses, first fit. *The total a game may have, 213 MiB, is from public descriptions: the game asks for it, so it is to be confirmed* |
+| `memory.cpp` | 341, 342; 348, 349, 352 | memory containers (part of the process's memory set aside to lend a system utility: the game makes one of 3 MiB for its game-data check); memory in pages of 1 MiB or 64 KiB from one range of addresses, first fit. *The total a game may have, 213 MiB, is from public descriptions: the game asks for it, so it is to be confirmed* |
 | `threads.cpp` | 43, 44, 45, 47, 48 | yield, join, detach, priorities |
 | `sync_calls.cpp` | 90-94, 114; 100-104; 105-108; 141, 142, 145, 147 | semaphores, mutexes, condition variables; sleeping, the calendar's time, the time base's frequency. **A semaphore's post goes to the thread that has waited longest**: the game's threads greet each other by posting and then waiting on the same semaphore, and a post the poster could take back itself left the game reading a null pointer |
 | `events.cpp` | 128-130, 134-138 | event queues and ports. The receive call returns its event in `r4` to `r7`: read off the game's code after each `sc` |
@@ -76,6 +81,21 @@ The game draws its text with the system's font library: it opens one of the cons
 - **The console's fonts are the player's to supply, as the game is**: the `data/font` folder of a PS3's system software. Sony publishes the system software file (`PS3UPDAT.PUP`) on its support site; RPCS3 installs it (`rpcs3 --installfw PS3UPDAT.PUP`) and leaves a `dev_flash` folder beside itself. `ridgeracer7 <game> --flash <dev_flash>` names it; without the option, an `RPCS3` folder beside the game's is looked in. Nothing stands in for a missing font: the game stops and says what it needs.
 - *Stated choices, to be compared with the console's picture:* glyphs are loaded unhinted; "scale pixel" is the em's size in pixels; glyphs sit on whole pixels; font set `0x101` is New Rodin's Japanese font with the extension font behind it. A character the font doesn't have stops the game (the library's answer to that isn't known here).
 
+## Files (`fs.cpp`, `gamedata.cpp`)
+
+A game names files by the console's mount points, and each is a folder of the host's:
+
+| | |
+|---|---|
+| `/dev_bdvd` | the disc: the player's copy (the folder holding `PS3_GAME`). Read only |
+| `/app_home` | where the program started from: the disc's `PS3_GAME/USRDIR`. Read only |
+| `/dev_hdd0` | the hard disk: `dev_hdd0` in the port's data folder (`qilin/ridgeracer7` in the per-user application data, or `RIDGERACER7_SAVE_DIR`), laid out as a console's |
+| `/dev_flash` | the system software, if the player gave one. Read only |
+
+A path is kept inside its mount point (`..` can't climb out), and a name under no mount point is "not mounted". A directory's entries come in the names' order, the same on every host. The structures' layout is the SDK's as the game's own code reads it: a file's size at byte 36 of a packed, 52-byte `CellFsStat`. *Times are left at 0 until the game is seen to read them.* The file-system system calls (801 on: the C library's files) are not provided yet.
+
+**Game data** is a folder of the game's on the hard disk (`/dev_hdd0/game/<name>`, described by a `PARAM.SFO` as on a console; `qilin_game`'s reader gained a writer). The utility works through a function of the game's: it is told what is there and answers whether to go on. The layout of what it is told (5,192 bytes; the description at byte 2,144) agrees with the game's own two functions. **The game asks for `BLJS10001`**, the Japanese release's name: the disc is the American one, the program the same. At start-up it only looks (its function answers "cancel"), finds nothing, and goes on.
+
 ## When something goes wrong
 
 - **A bad memory access is reported** (`fault.cpp`): the guest address, the thread, and the lifted functions on the stack, found from the host's return addresses. Then the process stops, as for any other unknown. Before this a fault ended the process without a word.
@@ -84,7 +104,9 @@ The game draws its text with the system's font library: it opens one of the cons
 
 ## Where it stops now
 
-At v0.13.0: **`cellSpursInitialize`**. The game has set the RSX and the video output up, sent its first state to the RSX, opened its font, registered its vertical-blank handler, said it will use six SPUs, and now starts SPURS, the system's manager of SPU work. From here it needs its SPU programs running, which is the SPU lifter (`docs/roadmap-and-design-targets.md`); and, for a picture, the RSX's drawing on Vulkan, for which the window is in place (`host/`).
+After v0.13.0: **`cellAudioInit`**. By then the game has started SPURS (4 SPUs) and made four tasksets, entered its main loop's system-event check, looked for its game data on the hard disk, opened a directory on the disc, started the network and PlayStation Network libraries (and been told: no cable, not signed in), and set the sound output to stereo. Next is the audio library itself: ports of mixed samples the system takes every 256 samples, out through `host/`'s sound output.
+
+Still ahead, and large: **the SPU lifter** (the first SPURS task or SPU thread the game starts needs its program lifted; all 42 programs end with the system's "thread exit" stop, `0x102`, so they are built as plain SPU threads, whatever SPURS is handed), and **the RSX's drawing on Vulkan**.
 
 ## Checked
 

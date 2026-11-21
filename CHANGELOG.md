@@ -4,6 +4,15 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+### Added
+- The file system (`cellFs...`): the console's mount points as folders of the host's, with the hard disk in the port's own data folder (`docs/runtime.md`).
+- The game data utility (`cellGameDataCheckCreate2`), and a `PARAM.SFO` writer beside the reader.
+- The start of SPURS: the instance, event-queue attachment, tasksets.
+- The system's event callbacks, memory containers (system calls 341, 342), the sound output's description (stereo linear PCM at 48 kHz), and the network and PlayStation Network libraries as a console with no cable and not signed in.
+
+### Checked
+- On the owner's PC: the game runs on to `cellAudioInit`, with 94 of its 248 imports and 42 of its 78 system calls provided.
+
 ## [0.13.0] - 2026-11-21
 
 The game runs to the start of SPURS; the window layer is in.

@@ -40,6 +40,10 @@ std::span<const NativeImport> pad_imports();      // pad.cpp
 std::span<const NativeImport> usbd_imports();     // usbd.cpp
 std::span<const NativeImport> mempool_imports();  // mempool.cpp
 std::span<const NativeImport> gcm_imports();      // gcm.cpp
+std::span<const NativeImport> np_imports();  // np.cpp
+std::span<const NativeImport> net_imports();  // net.cpp
+std::span<const NativeImport> fs_imports();  // fs.cpp
+std::span<const NativeImport> gamedata_imports();  // gamedata.cpp
 std::span<const NativeImport> spurs_imports();  // spurs.cpp
 std::span<const NativeImport> font_imports();  // font.cpp
 std::span<const NativeImport> video_imports();  // video.cpp
@@ -77,6 +81,7 @@ struct GameInfo {
     uint32_t parental_level = 0;   // likewise
     std::filesystem::path usrdir;  // the game's own files
     std::filesystem::path flash;   // a PS3's system software (dev_flash), for the console's fonts; empty if there is none
+    std::filesystem::path hdd;     // the console's hard disk (dev_hdd0): a folder of the port's own
 };
 const GameInfo& game();
 

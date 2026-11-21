@@ -27,6 +27,9 @@ struct Sfo {
     static std::expected<Sfo, std::string> parse(std::span<const uint8_t> file);
     static std::expected<Sfo, std::string> load(const std::filesystem::path& path);
 
+    // The file's bytes for these entries, in their order (a console's are in the keys' order).
+    std::vector<uint8_t> bytes() const;
+
     std::optional<std::string> text(std::string_view key) const;
     std::optional<uint32_t> number(std::string_view key) const;
 };

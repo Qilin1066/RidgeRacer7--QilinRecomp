@@ -16,6 +16,7 @@
 #include <string>
 
 #include "machine.hpp"
+#include "qilin/host/paths.hpp"
 #include "qilin/rt/lifted.hpp"
 #include "qilin/rt/report.hpp"
 #include "sfo.hpp"
@@ -45,6 +46,12 @@ int main(int argc, char** argv) {
         std::error_code error;
         const auto beside = std::filesystem::weakly_canonical(files->usrdir, error).parent_path().parent_path().parent_path() / "RPCS3" / "dev_flash";
         if (!error && std::filesystem::is_directory(beside / "data" / "font", error)) info.flash = beside;
+    }
+    info.hdd = qilin::host::user_folder() / "dev_hdd0";
+    {
+        std::error_code error;
+        std::filesystem::create_directories(info.hdd / "game", error);
+        if (error) fatal("can't create %s: %s", (info.hdd / "game").string().c_str(), error.message().c_str());
     }
     if (files->sfo.empty()) fatal("%s: no PARAM.SFO was found for this copy (give the disc's folder, the one holding PS3_GAME)", argv[1]);
     const auto sfo = qilin::Sfo::load(files->sfo);

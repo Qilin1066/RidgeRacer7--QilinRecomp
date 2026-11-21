@@ -209,12 +209,16 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/events.cpp
     ridgeracer7/src/fault.cpp
     ridgeracer7/src/font.cpp
+    ridgeracer7/src/fs.cpp
+    ridgeracer7/src/gamedata.cpp
     ridgeracer7/src/gcm.cpp
     ridgeracer7/src/imports.cpp
     ridgeracer7/src/kernel.cpp
     ridgeracer7/src/machine.cpp
     ridgeracer7/src/memory.cpp
     ridgeracer7/src/mempool.cpp
+    ridgeracer7/src/net.cpp
+    ridgeracer7/src/np.cpp
     ridgeracer7/src/pad.cpp
     ridgeracer7/src/rsx.cpp
     ridgeracer7/src/spu.cpp
@@ -241,7 +245,7 @@ if(QILIN_GEN_DIR)
     file(GLOB qilin_lifted CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")
     add_executable(ridgeracer7 ridgeracer7/src/main.cpp ${qilin_lifted})
     target_include_directories(ridgeracer7 PRIVATE "${QILIN_GEN_DIR}")
-    target_link_libraries(ridgeracer7 PRIVATE ridgeracer7_machine qilin_warnings)
+    target_link_libraries(ridgeracer7 PRIVATE ridgeracer7_machine qilin_host qilin_warnings)
     # Lifted code is generated: its unused labels and the like are not warnings worth reading.
     if(MSVC)
         set_source_files_properties(${qilin_lifted} PROPERTIES COMPILE_OPTIONS "/w;/bigobj")

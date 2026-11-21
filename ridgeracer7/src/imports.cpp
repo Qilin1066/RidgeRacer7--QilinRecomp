@@ -66,7 +66,7 @@ constexpr NativeImport kImports[] = {
 }  // namespace
 
 void (*find_native_import(std::string_view library, std::string_view name))(Cpu&) {
-    for (const std::span<const NativeImport> table : {std::span<const NativeImport>(kImports), sync_imports(), sysutil_imports(), pad_imports(), usbd_imports(), mempool_imports(), thread_imports(), gcm_imports(), spurs_imports(), font_imports(), video_imports()})
+    for (const std::span<const NativeImport> table : {std::span<const NativeImport>(kImports), sync_imports(), sysutil_imports(), pad_imports(), usbd_imports(), mempool_imports(), thread_imports(), gcm_imports(), np_imports(), net_imports(), fs_imports(), gamedata_imports(), spurs_imports(), font_imports(), video_imports()})
         for (const NativeImport& import : table)
             if (library == import.library && name == import.name) return import.handler;
     return nullptr;

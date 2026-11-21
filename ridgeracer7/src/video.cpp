@@ -140,7 +140,33 @@ void cellVideoOutGetDeviceInfo(Cpu& c) {
     c.r[3] = kOk;
 }
 
+// ---- the sound output (cellAudioOut...) ----
+// Like the television, the amplifier is the runtime's to define: **two channels of linear PCM at 48 kHz**
+// on the primary output, and nothing else (no Dolby Digital, no DTS, no 5.1), until the host's sound
+// output offers more and the settings menu holds the choice.
+
+// cellAudioOutGetSoundAvailability(output, coding type, sampling rate, option): how many channels the output takes of that kind; 0 if none.
+void cellAudioOutGetSoundAvailability(Cpu& c) {
+    const uint32_t output = static_cast<uint32_t>(c.r[3]), type = static_cast<uint32_t>(c.r[4]), rate = static_cast<uint32_t>(c.r[5]);
+    constexpr uint32_t kLinearPcm = 0, k48kHz = 4;
+    if (output != kPrimary) fatal("cellAudioOutGetSoundAvailability: sound output %u, where there is nothing", output);
+    c.r[3] = type == kLinearPcm && rate == k48kHz ? 2 : 0;
+}
+
+// cellAudioOutConfigure(output, CellAudioOutConfiguration* {channels, encoder, ten bytes kept back, down-mixer}, option*, wait)
+void cellAudioOutConfigure(Cpu& c) {
+    const uint32_t output = static_cast<uint32_t>(c.r[3]), config = static_cast<uint32_t>(c.r[4]);
+    if (output != kPrimary) fatal("cellAudioOutConfigure: sound output %u, where there is nothing", output);
+    const uint8_t* const p = guest_memory() + config;
+    const uint32_t channels = p[0], encoder = p[1], down_mixer = load32(config + 12);
+    qilin::rt::log("the game sets the sound output: %u channels, encoder %u, down-mixer %u", channels, encoder, down_mixer);
+    if (channels != 2 || encoder != 0) fatal("cellAudioOutConfigure: %u channels with encoder %u, which the output doesn't take", channels, encoder);
+    c.r[3] = kOk;
+}
+
 constexpr NativeImport kImports[] = {
+    {"cellSysutil", "cellAudioOutGetSoundAvailability", cellAudioOutGetSoundAvailability},
+    {"cellSysutil", "cellAudioOutConfigure", cellAudioOutConfigure},
     {"cellSysutil", "cellVideoOutGetDeviceInfo", cellVideoOutGetDeviceInfo},
     {"cellSysutil", "cellVideoOutGetNumberOfDevice", cellVideoOutGetNumberOfDevice},
     {"cellSysutil", "cellVideoOutGetState", cellVideoOutGetState},

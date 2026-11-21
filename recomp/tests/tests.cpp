@@ -966,6 +966,18 @@ void test_sfo() {
     if (!sfo) return;
     CHECK(sfo->entries.size() == 6);
     CHECK(sfo->text("TITLE") == "A Test Game" && sfo->text("TITLE_ID") == "TEST00001" && sfo->text("VERSION") == "01.02");
+    // Written out and read again, it is the same; and an empty text and a number survive.
+    Sfo more = *sfo;
+    more.entries.push_back({"EMPTY", false, 0, ""});
+    more.entries.push_back({"NUMBER", true, 0xfedcba98u, {}});
+    const auto again = Sfo::parse(more.bytes());
+    CHECK(again.has_value());
+    if (again) {
+        CHECK(again->entries.size() == more.entries.size());
+        for (size_t i = 0; i < again->entries.size() && i < more.entries.size(); ++i)
+            CHECK(again->entries[i].key == more.entries[i].key && again->entries[i].integer == more.entries[i].integer &&
+                  again->entries[i].number == more.entries[i].number && again->entries[i].text == more.entries[i].text);
+    }
     CHECK(sfo->number("RESOLUTION") == 29u && sfo->number("BOOTABLE") == 1u);
     CHECK(!sfo->text("RESOLUTION") && !sfo->number("TITLE") && !sfo->text("NOTHING"));
     CHECK(sfo_resolutions(29) == "480, 720, 1080, 480 (16:9)");

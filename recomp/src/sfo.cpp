@@ -48,6 +48,45 @@ std::expected<Sfo, std::string> Sfo::parse(std::span<const uint8_t> file) {
     return sfo;
 }
 
+std::vector<uint8_t> Sfo::bytes() const {
+    const auto le16 = [](std::vector<uint8_t>& b, size_t at, uint32_t v) { b[at] = static_cast<uint8_t>(v), b[at + 1] = static_cast<uint8_t>(v >> 8); };
+    const auto le32 = [&](std::vector<uint8_t>& b, size_t at, uint32_t v) { le16(b, at, v), le16(b, at + 2, v >> 16); };
+    std::vector<uint8_t> index(entries.size() * 16), keys, data;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const SfoEntry& e = entries[i];
+        le16(index, i * 16, static_cast<uint32_t>(keys.size()));
+        keys.insert(keys.end(), e.key.begin(), e.key.end());
+        keys.push_back(0);
+        le32(index, i * 16 + 12, static_cast<uint32_t>(data.size()));
+        if (e.integer) {
+            le16(index, i * 16 + 2, 0x0404);
+            le32(index, i * 16 + 4, 4);
+            le32(index, i * 16 + 8, 4);
+            data.resize(data.size() + 4);
+            le32(data, data.size() - 4, e.number);
+        } else {
+            // The text and its zero, in room that is a whole number of words.
+            const uint32_t length = static_cast<uint32_t>(e.text.size() + 1), room = (length + 3) & ~3u;
+            le16(index, i * 16 + 2, 0x0204);
+            le32(index, i * 16 + 4, length);
+            le32(index, i * 16 + 8, room);
+            data.insert(data.end(), e.text.begin(), e.text.end());
+            data.resize(data.size() + room - e.text.size());
+        }
+    }
+    while (keys.size() % 4) keys.push_back(0);
+    std::vector<uint8_t> file(20);
+    file[1] = 'P', file[2] = 'S', file[3] = 'F';
+    le32(file, 4, 0x101);
+    le32(file, 8, static_cast<uint32_t>(20 + index.size()));
+    le32(file, 12, static_cast<uint32_t>(20 + index.size() + keys.size()));
+    le32(file, 16, static_cast<uint32_t>(entries.size()));
+    file.insert(file.end(), index.begin(), index.end());
+    file.insert(file.end(), keys.begin(), keys.end());
+    file.insert(file.end(), data.begin(), data.end());
+    return file;
+}
+
 std::optional<std::string> Sfo::text(std::string_view key) const {
     for (const SfoEntry& e : entries)
         if (e.key == key && !e.integer) return e.text;

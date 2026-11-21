@@ -405,11 +405,11 @@ bool Cfg::read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out
     };
     const auto on_greater = [](const Insn& in, unsigned options) { return in.op == Op::bc && !in.lk() && (in.rd() & ~3u) == options && in.ra() % 4 == 1; };
     // Either `bgt crN, default` on the straight line into the switch ...
-    std::optional<uint32_t> checked;
+    uint32_t checked = 0;  // how many entries the code allows; 0: no check found
     uint32_t head = table_load;  // the first instruction of that straight line
     for (uint32_t back = table_load - 4; back >= start; back -= 4) {
         const Insn in = insn(back);
-        if (on_greater(in, 12)) checked = bound_above(back, in.ra() / 4);
+        if (on_greater(in, 12)) checked = bound_above(back, in.ra() / 4).value_or(0);
         if (!in.valid() || (ppu::spec(in.op).flags & ppu::kBranch)) break;
         head = back;
         if (back == start) break;
@@ -425,10 +425,10 @@ bool Cfg::read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out
             const uint32_t to = in.branch_target(from);
             if (to < head || to > table_load) continue;
             const auto n = on_greater(in, 4) ? bound_above(from, in.ra() / 4) : std::nullopt;
-            if (!n || (checked && *checked != *n)) agreed = false;
-            checked = n;
+            if (!n || (checked && checked != *n)) agreed = false;
+            checked = n.value_or(0);
         }
-        if (!agreed) checked.reset();
+        if (!agreed) checked = 0;
     }
 
     // Entries are offsets from the table. Its end, where the code doesn't
@@ -436,7 +436,7 @@ bool Cfg::read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out
     out = JumpTable{at, table, {}, false};
     uint32_t limit = bound;
     for (uint32_t entry = table; entry < limit; entry += 4) {
-        if (checked && out.targets.size() == *checked) break;
+        if (checked && out.targets.size() == checked) break;
         if (entry != table && starts_.contains(entry)) break;
         const auto offset = elf_->read32(entry);
         if (!offset) break;
@@ -446,7 +446,7 @@ bool Cfg::read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out
         out.targets.push_back(to);
     }
     if (out.targets.empty()) return false;
-    out.proven = checked && out.targets.size() == *checked;
+    out.proven = checked && out.targets.size() == checked;
     return true;
 }
 

@@ -18,6 +18,7 @@
 #include "self.hpp"
 #include "sfo.hpp"
 #include "sha256.hpp"
+#include "spu.hpp"
 #include "shaders.hpp"
 #include "spu_image.hpp"
 #include "syscall_names.hpp"
@@ -139,6 +140,60 @@ void test_ppu() {
         CHECK(in.op == s.op);
         CHECK(ppu::mnemonic(in) == s.name);
     }
+}
+
+// ---------------------------------------------------------------- the SPU decoder
+
+std::string spu_text(uint32_t word, uint32_t pc = 0x3000) { return spu::disasm(spu::decode(word), pc); }
+
+void test_spu() {
+    using spu::Op;
+    // What an SPU function begins and ends with.
+    CHECK(spu_text(0x24004080) == "stqd $0,16($1)");
+    CHECK(spu_text(0x24ff8081) == "stqd $1,-32($1)");
+    CHECK(spu_text(0x1cf80081) == "ai $1,$1,-32");
+    CHECK(spu_text(0x34004080) == "lqd $0,16($1)");
+    CHECK(spu_text(0x35000000) == "bi $0");
+    CHECK(spu_text(0x35080000) == "bi $0");                 // bid: interrupts disabled on the way
+    CHECK(spu::decode(0x35080000).d() && !spu::decode(0x35080000).e());
+    // Each length of opcode.
+    CHECK(spu_text(0x18010183) == "a $3,$3,$4");            // 11 bits
+    CHECK(spu_text(0x76804183) == "csflt $3,$3,154");       // 10
+    CHECK(spu_text(0x40800083) == "il $3,1");               // 9
+    CHECK(spu_text(0x40ffff83) == "il $3,-1");
+    CHECK(spu_text(0x1c004183) == "ai $3,$3,1");            // 8
+    CHECK(spu_text(0x42000803) == "ila $3,16");             // 7
+    CHECK(spu_text(0x80a10283) == "selb $5,$5,$4,$3");      // 4: the target is the first field
+    // Branches and loads take addresses: relative to themselves, or absolute.
+    CHECK(spu_text(0x32000200) == "br 0x3010");
+    CHECK(spu_text(0x33000803) == "brsl $3,0x3040");
+    CHECK(spu_text(0x327ffe00, 0x3010) == "br 0x3000");
+    CHECK(spu_text(0x30000800) == "bra 0x40");
+    CHECK(spu_text(0x20000183) == "brz $3,0x300c");
+    CHECK(spu::decode(0x32000200).relative(0x3000) == 0x3010);
+    CHECK(spu::decode(0x327ffe00).relative(0) == 0x3fff0);  // an SPU's memory wraps at 256 KiB
+    // Channels, and the rest.
+    CHECK(spu_text(0x01a00e83) == "rdch $3,$ch29");
+    CHECK(spu_text(0x21a00e83) == "wrch $ch29,$3");
+    CHECK(spu_text(0x00200000) == "lnop");
+    CHECK(spu_text(0x40200000) == "nop $0");
+    CHECK(spu_text(0x00000000) == "stop 0");
+    CHECK(spu_text(0x00002000) == "stop 8192");
+    // Reserved bits set don't decode, unless asked to look past them.
+    CHECK(!spu::decode(0x00200001).valid());                // lnop has no operands
+    CHECK(!spu::decode(0x54a04183).valid());                // clz has no rb
+    CHECK(spu::decode(0x54a04183, true).op == Op::clz);
+    CHECK(!spu::decode(0x07000000).valid());                // no instruction has this opcode
+    // Every spec decodes from its own opcode, under its own name.
+    for (const spu::Spec& s : spu::specs()) {
+        const uint32_t word = static_cast<uint32_t>(s.opcode) << (32 - s.bits);
+        const spu::Insn in = spu::decode(word);
+        if (in.op != s.op) std::println(stderr, "SPU {} doesn't decode from its own opcode ({:08x})", s.name, word);
+        CHECK(in.op == s.op);
+        CHECK(spu::disasm(in, 0).starts_with(s.name));
+    }
+    CHECK(spu::spec(Op::brsl).flags & spu::kCall);
+    CHECK(spu::spec(Op::fma).flags & spu::kFloat);
 }
 
 // ---------------------------------------------------------------- the program
@@ -961,6 +1016,7 @@ void test_title() {
 int main() {
     test_sha256();
     test_ppu();
+    test_spu();
     test_elf();
     test_self();
     test_sfo();

@@ -90,6 +90,7 @@ add_library(qilin_recomp STATIC
     recomp/src/cfg.cpp
     recomp/src/ppu.cpp
     recomp/src/shaders.cpp
+    recomp/src/spu.cpp
 )
 target_include_directories(qilin_recomp PUBLIC recomp/src)
 target_link_libraries(qilin_recomp PUBLIC qilin_game PRIVATE qilin_warnings)

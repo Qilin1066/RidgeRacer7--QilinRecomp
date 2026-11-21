@@ -43,6 +43,28 @@ jobs:
       - name: Decoder sweep
         if: matrix.sweep
         run: python3 tools/check/verify_decoder.py --qilin build/qilin --sweep
+      # The SPU decoder's reference: binutils dropped the SPU after 2.3x, so its
+      # objdump is built from the GNU source (pinned by hash, kept in a cache).
+      - name: SPU binutils (cached)
+        if: matrix.sweep
+        id: spu-binutils
+        uses: actions/cache@v4
+        with:
+          path: ~/spu-binutils
+          key: spu-binutils-2.31.1-${{ runner.os }}-${{ runner.arch }}-1
+      - name: SPU binutils (build)
+        if: matrix.sweep && steps.spu-binutils.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL -o binutils.tar.xz https://ftp.gnu.org/gnu/binutils/binutils-2.31.1.tar.xz
+          echo "5d20086ecf5752cc7d9134246e9588fa201740d540f7eb84d795b1f7a93bca86  binutils.tar.xz" | sha256sum -c
+          tar xf binutils.tar.xz
+          cd binutils-2.31.1
+          ./configure --target=spu-elf --prefix="$HOME/spu-binutils" --disable-nls --disable-werror > /dev/null
+          make -j4 all-binutils MAKEINFO=true > /dev/null
+          make install-binutils MAKEINFO=true > /dev/null
+      - name: SPU decoder sweep
+        if: matrix.sweep
+        run: OBJDUMP_SPU="$HOME/spu-binutils/bin/spu-elf-objdump" python3 tools/check/verify_spu_decoder.py --qilin build/qilin --sweep
       - name: Scripts compile
         if: matrix.sweep
-        run: python3 -m py_compile tools/check/verify_decoder.py
+        run: python3 -m py_compile tools/check/verify_decoder.py tools/check/verify_spu_decoder.py

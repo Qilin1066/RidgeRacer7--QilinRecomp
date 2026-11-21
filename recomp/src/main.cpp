@@ -16,6 +16,9 @@
 //   qilin shaders <game>                     the compiled shader programs the program carries
 //   qilin spu     <game>                     the SPU programs the program carries
 //   qilin cfg     <game>                     the control-flow pass: functions, switches, system calls, coverage
+//   qilin spu-insns   <game>                 every word of the SPU programs' code
+//   qilin spu-profile <game>                 how often the SPU programs use each instruction
+//   qilin spu-disasm  <file> [--base address] [--ignore-reserved]   a file of raw SPU words
 //   qilin insns   <game>                     every word of the program's code: address, word, instruction
 //   qilin profile <game>                     how often the code uses each instruction, and what doesn't decode
 //   qilin disasm  <file> [--base address]    a file of raw big-endian PPU words, as `insns` prints them
@@ -46,6 +49,7 @@
 #include "ppu.hpp"
 #include "self.hpp"
 #include "sfo.hpp"
+#include "spu.hpp"
 #include "shaders.hpp"
 #include "spu_image.hpp"
 #include "title.hpp"
@@ -77,6 +81,9 @@ int usage() {
                "  qilin shaders <game>\n"
                "  qilin spu     <game>\n"
                "  qilin cfg     <game>\n"
+               "  qilin spu-insns   <game>\n"
+               "  qilin spu-profile <game>\n"
+               "  qilin spu-disasm  <file of big-endian words> [--base address] [--ignore-reserved]\n"
                "  qilin insns   <game>\n"
                "  qilin profile <game>\n"
                "  qilin disasm  <file of big-endian words> [--base address]\n"
@@ -88,7 +95,7 @@ struct Args {
     std::string command, input;
     std::optional<std::string> json;
     uint32_t base = 0;
-    bool list_files = false;
+    bool list_files = false, ignore_reserved = false;
 };
 
 uint32_t parse_address(std::string_view text) {
@@ -110,6 +117,7 @@ Args parse_args(std::span<char*> argv) {
         if (arg == "--json" && i + 1 < argv.size()) a.json = argv[++i];
         else if (arg == "--base" && i + 1 < argv.size()) a.base = parse_address(argv[++i]);
         else if (arg == "--files") a.list_files = true;
+        else if (arg == "--ignore-reserved") a.ignore_reserved = true;
         else throw Failure{std::format("unknown argument {}", arg)};
     }
     return a;
@@ -642,6 +650,125 @@ int cmd_shaders(const Args& a) {
     return 0;
 }
 
+// ---- the SPU programs' code ----
+
+void print_spu_insns(uint32_t address, std::span<const uint8_t> bytes, bool ignore_reserved) {
+    std::string out;
+    for (size_t i = 0; i + 4 <= bytes.size(); i += 4) {
+        const uint32_t pc = address + static_cast<uint32_t>(i), word = read_be32(bytes.data() + i);
+        out += std::format("{:08x} {:08x} {}\n", pc, word, spu::disasm(spu::decode(word, ignore_reserved), pc));
+        if (out.size() >= 1 << 16) {
+            std::fwrite(out.data(), 1, out.size(), stdout);
+            out.clear();
+        }
+    }
+    std::fwrite(out.data(), 1, out.size(), stdout);
+}
+
+int cmd_spu_disasm(const Args& a) {
+    const auto file = read_file(a.input);
+    if (!file) throw Failure{file.error()};
+    if (file->size() % 4) throw Failure{std::format("{} is {} bytes: not a whole number of words", a.input, file->size())};
+    print_spu_insns(a.base, *file, a.ignore_reserved);
+    return 0;
+}
+
+// Each SPU program's executable sections: the image, the section's address in an SPU's memory, its bytes.
+struct SpuCode {
+    const SpuImage* image;
+    uint32_t address;
+    std::span<const uint8_t> bytes;
+};
+
+std::vector<SpuCode> spu_code_of(const Elf& elf, const std::vector<SpuImage>& images) {
+    std::vector<SpuCode> code;
+    for (const SpuImage& image : images)
+        for (const SpuSection& s : image.sections) {
+            if (s.type != kShtProgbits || !(s.flags & kShfExec) || s.size == 0) continue;
+            const auto bytes = elf.bytes_at(uint64_t{image.address} + s.offset, s.size);
+            if (bytes.empty()) throw Failure{std::format("SPU program {}: its section {} isn't in the file", image.name, s.name)};
+            code.push_back({&image, s.address, bytes});
+        }
+    return code;
+}
+
+int cmd_spu_insns(const Args& a) {
+    const Elf elf = elf_of(files_of(a));
+    const auto images = find_spu_images(elf);
+    if (!images) throw Failure{images.error()};
+    for (const SpuCode& c : spu_code_of(elf, *images)) {
+        std::println("# {} {}", c.image->name, c.image->section(".text") && c.image->section(".text")->address == c.address ? ".text" : "(code)");
+        std::fflush(stdout);
+        print_spu_insns(c.address, c.bytes, false);
+    }
+    return 0;
+}
+
+int cmd_spu_profile(const Args& a) {
+    const Elf elf = elf_of(files_of(a));
+    const auto images = find_spu_images(elf);
+    if (!images) throw Failure{images.error()};
+    std::vector<size_t> count(static_cast<size_t>(spu::Op::count_));
+    std::vector<size_t> programs_using(count.size());
+    size_t words = 0, invalid = 0, zero = 0;
+    std::vector<std::string> first_invalid;
+    const SpuImage* current = nullptr;
+    std::vector<bool> seen(count.size());
+    for (const SpuCode& c : spu_code_of(elf, *images)) {
+        if (c.image != current) {
+            current = c.image;
+            seen.assign(count.size(), false);
+        }
+        for (size_t i = 0; i + 4 <= c.bytes.size(); i += 4) {
+            const uint32_t word = read_be32(c.bytes.data() + i);
+            const spu::Insn in = spu::decode(word);
+            ++words;
+            if (!in.valid()) {
+                ++invalid;
+                if (word == 0) ++zero;
+                else if (first_invalid.size() < 16)
+                    first_invalid.push_back(std::format("{} {:#x} {:08x}", c.image->name, c.address + i, word));
+                continue;
+            }
+            const auto op = static_cast<size_t>(in.op);
+            ++count[op];
+            if (!seen[op]) {
+                seen[op] = true;
+                ++programs_using[op];
+            }
+        }
+    }
+    std::vector<size_t> order;
+    size_t unused = 0;
+    for (size_t i = 1; i < count.size(); ++i) {
+        if (count[i]) order.push_back(i);
+        else ++unused;
+    }
+    std::ranges::sort(order, [&](size_t x, size_t y) { return count[x] != count[y] ? count[x] > count[y] : x < y; });
+    std::println("{} SPU programs, {} words of code: {} decode, {} don't ({} of those are zero)", images->size(), words, words - invalid, invalid,
+                 zero);
+    std::println("{} of the decoder's {} instructions are used; {} are not", order.size(), count.size() - 1, unused);
+    for (const size_t i : order)
+        std::println("{:9} {:10} in {:2} programs", count[i], spu::spec(static_cast<spu::Op>(i)).name, programs_using[i]);
+    if (!first_invalid.empty()) {
+        std::println("the first non-zero words that don't decode:");
+        for (const std::string& line : first_invalid) std::println("  {}", line);
+    }
+    std::println("not used:");
+    std::string line;
+    for (size_t i = 1; i < count.size(); ++i) {
+        if (count[i]) continue;
+        const std::string_view name = spu::spec(static_cast<spu::Op>(i)).name;
+        if (line.size() + name.size() > 96) {
+            std::println(" {}", line);
+            line.clear();
+        }
+        line += std::format(" {}", name);
+    }
+    if (!line.empty()) std::println(" {}", line);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -665,6 +792,9 @@ int main(int argc, char** argv) {
         if (a.command == "shaders") return cmd_shaders(a);
         if (a.command == "spu") return cmd_spu(a);
         if (a.command == "cfg") return cmd_cfg(a);
+        if (a.command == "spu-insns") return cmd_spu_insns(a);
+        if (a.command == "spu-profile") return cmd_spu_profile(a);
+        if (a.command == "spu-disasm") return cmd_spu_disasm(a);
         if (a.command == "insns") return cmd_insns(a);
         if (a.command == "profile") return cmd_profile(a);
         if (a.command == "disasm") return cmd_disasm(a);

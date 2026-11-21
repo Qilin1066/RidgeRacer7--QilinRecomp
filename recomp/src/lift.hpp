@@ -7,9 +7,11 @@
 // cache and synchronisation instructions that need nothing done, and all
 // branches and calls, switches among them. Slice 2 (v0.9.0): floating point,
 // bit-exact (runtime/include/qilin/rt/fp.hpp): loads and stores, arithmetic
-// in both precisions, the fused forms, conversions, compares, fsel. Anything
-// else (VMX, the FPSCR, the estimates, floating-point record forms, the time
-// base, atomic sequences, the overflow-enable and string forms) makes the
+// in both precisions, the fused forms, conversions, compares, fsel; the time
+// base. Slice 3 (v0.10.0): the part of VMX the game uses
+// (runtime/include/qilin/rt/vmx.hpp). Anything else (the rest of VMX and
+// its two estimates, the FPSCR, the scalar estimates, floating-point record
+// forms, atomic sequences, the overflow-enable and string forms) makes the
 // function one that isn't lifted yet, with the reason: nothing is skipped
 // silently (docs/recompiler-core.md).
 #pragma once

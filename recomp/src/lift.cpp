@@ -64,7 +64,17 @@ bool in_slice(const Insn& in, std::string* why) {
     };
     if (!in.valid()) return no("an invalid word");
     const ppu::Spec& s = ppu::spec(in.op);
-    if (s.flags & ppu::kVector) return no("VMX");
+    if (s.flags & ppu::kVector) {
+        switch (in.op) {
+        case Op::lvx: case Op::stvx: case Op::lvsl: case Op::lvsr: case Op::vand: case Op::vandc: case Op::vor: case Op::vxor: case Op::vnor:
+        case Op::vmrghw: case Op::vmrglw: case Op::vadduwm: case Op::vaddfp: case Op::vsubfp: case Op::vmaxfp: case Op::vminfp:
+        case Op::vcmpequw: case Op::vcmpeqfp: case Op::vsel: case Op::vperm: case Op::vsldoi: case Op::vmaddfp: case Op::vnmsubfp:
+        case Op::vspltw: case Op::vspltisw: case Op::vcfsx: case Op::vctsxs:
+            return true;
+        case Op::vrefp: case Op::vrsqrtefp: return no(std::format("a VMX estimate ({})", s.name));
+        default: return no(std::format("VMX ({})", s.name));
+        }
+    }
     if (s.flags & ppu::kFloat) {
         switch (in.op) {
         case Op::mffs: case Op::mtfsf: case Op::mtfsfi: case Op::mtfsb0: case Op::mtfsb1: case Op::mcrfs:
@@ -162,6 +172,10 @@ private:
         fprs_.insert(n);
         return std::format("f{}", n);
     }
+    std::string V(unsigned n) {
+        vrs_.insert(n);
+        return std::format("v{}", n);
+    }
     std::string use(const char* n) {
         specials_.insert(n);
         return n;
@@ -177,6 +191,7 @@ private:
         for (const unsigned n : gprs_) p += std::format("    uint64_t r{0} = c.r[{0}];\n", n);
         for (const unsigned n : crs_) p += std::format("    uint32_t cr{0} = (c.cr >> {1}) & 15u;\n", n, 28 - 4 * n);
         for (const unsigned n : fprs_) p += std::format("    double f{0} = c.f[{0}];\n", n);
+        for (const unsigned n : vrs_) p += std::format("    Vec v{0} = c.v[{0}];\n", n);
         if (specials_.contains("lr")) p += "    uint64_t lr = c.lr;\n";
         if (specials_.contains("ctr")) p += "    uint64_t ctr = c.ctr;\n";
         if (specials_.contains("so")) p += "    uint32_t so = c.xer_so;\n";
@@ -199,6 +214,10 @@ private:
         for (const unsigned n : fprs_) {
             out_s += std::format("c.f[{0}] = f{0}; ", n);
             in_s += std::format("f{0} = c.f[{0}]; ", n);
+        }
+        for (const unsigned n : vrs_) {
+            out_s += std::format("c.v[{0}] = v{0}; ", n);
+            in_s += std::format("v{0} = c.v[{0}]; ", n);
         }
         if (!crs_.empty()) {
             uint32_t keep = 0xFFFFFFFFu;
@@ -320,6 +339,12 @@ private:
         const auto fp1 = [&](const char* fn) { line(std::format("{} = fp::{}({});", F(d), fn, F(b))); };
         const auto fp2 = [&](const char* fn, unsigned x, unsigned y) { line(std::format("{} = fp::{}({}, {});", F(d), fn, F(x), F(y))); };
         const auto fp3 = [&](const char* fn) { line(std::format("{} = fp::{}({}, {}, {});", F(d), fn, F(a), F(in.rc_reg()), F(b))); };
+        // A two-operand vector operation; a recording compare also sets CR6 from its result.
+        const auto vx2 = [&](const char* fn, bool compare = false) {
+            std::string s = std::format("{} = vmx::{}({}, {});", V(d), fn, V(a), V(b));
+            if (compare && in.oe()) s += std::format(" {} = vmx::cr6(v{});", CR(6), d);
+            line(s);
+        };
         const auto s32 = [&](unsigned n) { return std::format("static_cast<int32_t>({})", R(n)); };
         const auto s64 = [&](unsigned n) { return std::format("static_cast<int64_t>({})", R(n)); };
         const auto u32 = [&](unsigned n) { return std::format("static_cast<uint32_t>({})", R(n)); };
@@ -552,6 +577,35 @@ private:
             line(std::format("{} = fp::fcompare({}, {});", CR(in.crfd()), F(a), F(b)));
             return true;
 
+        // ---------------------------------------------------------------- VMX (vmx.hpp)
+        case Op::lvx: line(std::format("{} = vmx::lvx(c, {});", V(d), addr(ea_x()))); return true;
+        case Op::stvx: line(std::format("vmx::stvx(c, {}, {});", addr(ea_x()), V(d))); return true;
+        case Op::lvsl: line(std::format("{} = vmx::lvsl({});", V(d), addr(ea_x()))); return true;
+        case Op::lvsr: line(std::format("{} = vmx::lvsr({});", V(d), addr(ea_x()))); return true;
+        case Op::vand: vx2("vand"); return true;
+        case Op::vandc: vx2("vandc"); return true;
+        case Op::vor: vx2("vor"); return true;
+        case Op::vxor: vx2("vxor"); return true;
+        case Op::vnor: vx2("vnor"); return true;
+        case Op::vmrghw: vx2("vmrghw"); return true;
+        case Op::vmrglw: vx2("vmrglw"); return true;
+        case Op::vadduwm: vx2("vadduwm"); return true;
+        case Op::vaddfp: vx2("vaddfp"); return true;
+        case Op::vsubfp: vx2("vsubfp"); return true;
+        case Op::vmaxfp: vx2("vmaxfp"); return true;
+        case Op::vminfp: vx2("vminfp"); return true;
+        case Op::vcmpequw: vx2("vcmpequw", true); return true;
+        case Op::vcmpeqfp: vx2("vcmpeqfp", true); return true;
+        case Op::vsel: line(std::format("{} = vmx::vsel({}, {}, {});", V(d), V(a), V(b), V(in.rc_reg()))); return true;
+        case Op::vperm: line(std::format("{} = vmx::vperm({}, {}, {});", V(d), V(a), V(b), V(in.rc_reg()))); return true;
+        case Op::vsldoi: line(std::format("{} = vmx::vsldoi({}, {}, {}u);", V(d), V(a), V(b), in.shb())); return true;
+        case Op::vmaddfp: line(std::format("{} = vmx::vmaddfp({}, {}, {});", V(d), V(a), V(in.rc_reg()), V(b))); return true;
+        case Op::vnmsubfp: line(std::format("{} = vmx::vnmsubfp({}, {}, {});", V(d), V(a), V(in.rc_reg()), V(b))); return true;
+        case Op::vspltw: line(std::format("{} = vmx::vspltw({}, {}u);", V(d), V(b), a & 3)); return true;
+        case Op::vspltisw: line(std::format("{} = vmx::vspltisw({});", V(d), in.vsimm())); return true;
+        case Op::vcfsx: line(std::format("{} = vmx::vcfsx({}, {}u);", V(d), V(b), a)); return true;
+        case Op::vctsxs: line(std::format("{} = vmx::vctsxs({}, {}u);", V(d), V(b), a)); return true;
+
         // ---------------------------------------------------------------- LR, CTR, XER
         case Op::mfspr:
             if (in.spr() == kLr) result(d, LR());
@@ -667,7 +721,7 @@ private:
     const LiftInput& f_;
     std::set<uint32_t> present_, labels_;
     std::map<uint32_t, const JumpTable*> tables_;
-    std::set<unsigned> gprs_, crs_, fprs_;
+    std::set<unsigned> gprs_, crs_, fprs_, vrs_;
     std::set<std::string> specials_;
     std::string error_;
 };

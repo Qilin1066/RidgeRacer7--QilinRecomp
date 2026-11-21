@@ -293,6 +293,15 @@ uint32_t double_to_single(uint64_t b) {
 
 }  // namespace
 
+namespace soft {
+uint64_t fused(uint64_t a, uint64_t c, uint64_t b, bool subtract, bool single) { return ref::fused(a, c, b, subtract, single); }
+uint64_t from_integer(bool negative, uint64_t magnitude, int exponent, bool single) { return round_pack(negative, {0, magnitude}, exponent, false, single); }
+uint64_t to_integer(uint64_t value, unsigned bits, bool truncate) { return ref::to_integer(value, bits, truncate); }
+uint32_t compare(uint64_t a, uint64_t b) { return ref::compare(a, b); }
+uint64_t single_to_double(uint32_t word) { return ref::single_to_double(word); }
+uint32_t double_to_single(uint64_t value) { return ref::double_to_single(value); }
+}  // namespace soft
+
 bool step_fp(State& s, const Insn& in) {
     const uint32_t w = in.word;
     const unsigned rt = (w >> 21) & 31, ra = (w >> 16) & 31, rb = (w >> 11) & 31, rc = (w >> 6) & 31;
@@ -379,7 +388,7 @@ bool step_fp(State& s, const Insn& in) {
     case Op::fctiwz: f[rt] = 0xfff8000000000000ull | to_integer(f[rb], 32, true); return true;
     case Op::fctid: f[rt] = to_integer(f[rb], 64, false); return true;
     case Op::fctidz: f[rt] = to_integer(f[rb], 64, true); return true;
-    default: return false;
+    default: return step_vmx(s, in);
     }
 }
 

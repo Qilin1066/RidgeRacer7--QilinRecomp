@@ -1,6 +1,6 @@
 # The recompiler's core
 
-The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.9.0): the decoders and control-flow passes for both processors, and the PPU lifter for everything but VMX, all run on the game's code.
+The parts of `qilin` that turn the game's code into C++: decoders, control-flow passes, lifters. So far (v0.10.0): the decoders and control-flow passes for both processors, and the PPU lifter for 96% of the game's code, all run on the game's code.
 
 ## The PPU decoder (`recomp/src/ppu.*`, `qilin::ppu`)
 
@@ -207,13 +207,31 @@ The floating-point helpers are `runtime/include/qilin/rt/fp.hpp`. A register hol
 - **4,765 cases, 1,085,808 runs, all agree.**
 - It found one fault on its first run, in the slow path: a product that underflows in double lost its error term, and a tie was rounded the wrong way. Fixed, with the same hazard in the division path.
 
+### Slice 3 (v0.10.0): VMX
+
+**14,196 of 14,294 functions now lift, 1,016,630 of 1,059,387 instructions (96%).** What is left: 96 functions that use the two VMX estimates, and the two FPSCR functions.
+
+The game uses a narrow part of VMX, and the slice is that part: `lvx`, `stvx`, `lvsl`, `lvsr`; the logical operations, `vsel`, `vperm`, `vsldoi`, the word merges and splats; `vadduwm`, `vcmpequw`; and single-precision `vaddfp`, `vsubfp`, `vmaddfp`, `vnmsubfp`, `vmaxfp`, `vminfp`, `vcmpeqfp`, `vcfsx`, `vctsxs`. Any other VMX instruction is outside the slice, by name.
+
+The helpers are `runtime/include/qilin/rt/vmx.hpp`. A vector register is four words, element 0 first, each a host integer; bytes are numbered as the guest numbers them. All of it is portable C++ on fixed-size arrays (no host intrinsics, by the portability rule).
+
+- Floating point is element by element and bit-exact by the same means as the scalar code: a NaN operand gives the first NaN operand made quiet, an invalid operation the default NaN; `vmaddfp` and `vnmsubfp` are fused, with the product taken exactly in a double and one sum rounded once.
+- A recording compare sets CR6: "all true" and "none true".
+- `lvx` and `stvx` drop the low four bits of the address.
+
+**Assumed: non-Java mode.** VMX has a mode bit (VSCR's NJ) under which a denormal operand is taken as zero and a denormal result becomes zero. The game never touches the VSCR, so it runs in whatever mode its threads start in, and public descriptions say an LV2 thread starts with NJ set. `vmx.hpp` implements that, behind one switch (`kNonJava`). ***To be confirmed against RPCS3.*** The order of operands in the choice of a NaN for the three-operand forms (vA, vB, vC) is taken from the scalar rule: *likewise to be confirmed.* The VSCR's saturation bit is not kept, and `mfvscr` and `mtvscr` are outside the slice.
+
+**Not lifted: `vrefp` and `vrsqrtefp`** (170 uses in 96 functions). They are estimates: the architecture bounds their error but their exact values are the hardware's own, and this project has no source for them that it may use. A correctly rounded reciprocal would be a guess at the hardware's bits, so the functions are left unlifted and counted. ***Open:*** *how to learn the PPU's estimates (measure them through RPCS3's behaviour, as the reference; or find a published description of the PPU's algorithm).*
+
+The reference (`ref_vmx.cpp`) works on sixteen bytes in the guest's order, with arithmetic by the integer soft-float. Vector cases run from 400 states each. **5,403 cases, 1,327,632 runs in all, all agree**; a fault put into `vmaxfp` on purpose gave 426 disagreements.
+
 ### The differential test (`recomp/tests/difftest/`, `qilin_difftest`)
 
 The lifter is checked against a **reference interpreter written separately** (`ref.cpp`): from the architecture's definitions, on the raw word's fields, with CR and XER as packed words, carries taken bit by bit, masks built bit by bit, products by long multiplication, memory a byte at a time. It shares only the decoder's naming of the opcode with the lifter. It runs in tests only: nothing interprets at run time.
 
 - `qilin_difftest_gen` (at build time) lifts 24 random valid encodings of each instruction in the slice as a one-instruction function, and small programs for what a single instruction can't show: every conditional branch form the decoder accepts over a spread of condition bits, `bclr`, `bcctr`, traps, a call, a tail call, a system call, a switch.
 - `qilin_difftest` (in `ctest`, so in CI on all six configurations) runs each from 48 random states, weighted towards the edges (zeros, ones, the sign boundaries of each width, a counter about to reach zero), with loads and stores steered into a window of memory and noise above bit 31 of the address. Registers, CR, XER, LR, CTR, the memory, and whether and where it trapped, jumped or called the system must all agree.
-- **3,602 cases, 172,896 runs, all agree.** 135 instructions are covered one at a time.
+- Slice 1 alone: 3,602 cases, 172,896 runs, all agree, 135 instructions covered one at a time. With the later slices: **5,403 cases, 1,327,632 runs, 210 instructions.**
 - That the test can fail was checked by breaking a helper on purpose (the carry of `sraw`): 179 disagreements, named.
 
 The reference shares the lifter's author and the choices above for undefined results, so it checks the lifter's wiring and arithmetic against the definitions, not the definitions against the hardware.
@@ -223,4 +241,4 @@ The reference shares the lifter's author and the choices above for undefined res
 1. `verify_decoder.py --game`, where there is both the game and a PowerPC objdump.
 2. ✅ The control-flow pass (v0.4.0, above). Next for it: its output as JSON, and the lifter that reads it.
 3. ✅ The SPU decoder (v0.6.0) and control-flow pass (v0.7.0).
-4. 🔨 The PPU lifter: integers and control flow (v0.8.0), floating point and the time base (v0.9.0). Next: VMX, then landing pads; then the SPU lifter.
+4. 🔨 The PPU lifter: integers and control flow (v0.8.0), floating point and the time base (v0.9.0), VMX (v0.10.0). Left: the VMX estimates (their values are the hardware's: open), the FPSCR, landing pads as entries. Then the SPU lifter.

@@ -53,13 +53,18 @@ struct CpuHooks {
     uint64_t (*time_base)(Cpu&);                       // mftb: the time base, which counts 79,800,000 to the second on a PS3
 };
 
+// A vector register: four words, element 0 first (the guest's order), each a host integer.
+struct Vec {
+    uint32_t w[4];
+};
+
 struct Cpu {
     uint64_t r[32] = {};
     uint64_t lr = 0, ctr = 0;
     uint32_t cr = 0;  // CR0 in the top four bits, as mfcr reads it
     uint32_t xer_so = 0, xer_ov = 0, xer_ca = 0, xer_bc = 0;  // XER's bits, one per word
     double f[32] = {};
-    uint8_t v[32][16] = {};  // vector registers, in the guest's byte order
+    Vec v[32] = {};
     uint32_t fpscr = 0, vscr = 0;
     uint8_t* mem = nullptr;  // base of the 4 GiB guest address space
     const CpuHooks* hooks = nullptr;
@@ -217,3 +222,5 @@ QILIN_INLINE bool trap_on(unsigned to, int64_t a, int64_t b) {
 }
 
 }  // namespace qilin::rt
+
+#include "qilin/rt/vmx.hpp"

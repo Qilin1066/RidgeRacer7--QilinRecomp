@@ -22,7 +22,7 @@ using difftest::Kind;
 namespace {
 
 constexpr uint32_t kWin = 0x30100000u, kWinSize = 0x2000u;  // the memory tests touch
-constexpr int kTrials = 48, kFloatTrials = 1200;
+constexpr int kTrials = 48, kFloatTrials = 1200, kVectorTrials = 400;
 
 struct Trapped {};
 bool g_did_call = false, g_did_system_call = false;
@@ -83,6 +83,23 @@ uint64_t interesting_double() {
     }
 }
 
+// A vector's element: the single-precision special values, moderate numbers, small integers, and noise.
+uint32_t interesting_word() {
+    static constexpr uint32_t kSpecial[] = {
+        0x00000000u, 0x80000000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00000u, 0x7f800001u, 0xffa00000u, 0x7fc12345u,  // zeros, infinities, NaNs
+        0x3f800000u, 0xbf800000u, 0x3f000000u, 0x40000000u, 0x7f7fffffu, 0xff7fffffu,                                         // 1, -1, 0.5, 2, the largest
+        0x00800000u, 0x80800000u, 0x007fffffu, 0x00000001u, 0x80000001u, 0x00800001u,                                         // the smallest normal, denormals
+        0x4f000000u, 0xcf000000u, 0x4effffffu, 0xcf000001u, 0x4f800000u,                                                      // 2^31 and its neighbours, 2^32
+        0x00000001u, 0xffffffffu, 0x7fffffffu, 0x0000001fu,
+    };
+    switch (rng() % 6) {
+    case 0: case 1: return kSpecial[rng() % std::size(kSpecial)];
+    case 2: return (static_cast<uint32_t>(rng()) & 0x807fffffu) | ((127 - 12 + static_cast<uint32_t>(rng() % 24)) << 23);  // near 1 in magnitude
+    case 3: return std::bit_cast<uint32_t>(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) * 0.25f);
+    default: return static_cast<uint32_t>(rng());
+    }
+}
+
 bool has(const ppu::Spec& s, ppu::Opnd wanted) {
     for (const ppu::Opnd o : s.operands)
         if (o == wanted) return true;
@@ -107,6 +124,11 @@ void compare(const Case& c, const rt::Cpu& cpu, const ref::State& s, const std::
     for (unsigned i = 0; i < 32; ++i)
         if (std::bit_cast<uint64_t>(cpu.f[i]) != s.fpr[i])
             fail(c, std::format("f{}: lifted {:#018x}, reference {:#018x}{}", i, std::bit_cast<uint64_t>(cpu.f[i]), s.fpr[i], operands));
+    for (unsigned i = 0; i < 32; ++i)
+        for (unsigned k = 0; k < 4; ++k) {
+            const uint32_t reference = uint32_t{s.vr[i][4 * k]} << 24 | uint32_t{s.vr[i][4 * k + 1]} << 16 | uint32_t{s.vr[i][4 * k + 2]} << 8 | s.vr[i][4 * k + 3];
+            if (cpu.v[i].w[k] != reference) fail(c, std::format("v{} word {}: lifted {:#010x}, reference {:#010x}{}", i, k, cpu.v[i].w[k], reference, operands));
+        }
     if (cpu.cr != s.cr) fail(c, std::format("CR: lifted {:#x}, reference {:#x}", cpu.cr, s.cr));
     if (cpu.xer() != s.xer) fail(c, std::format("XER: lifted {:#x}, reference {:#x}", cpu.xer(), s.xer));
     if (cpu.lr != s.lr) fail(c, std::format("LR: lifted {:#x}, reference {:#x}", cpu.lr, s.lr));
@@ -131,14 +153,18 @@ int main() {
         const ppu::Insn in = ppu::decode(c.word);
         const ppu::Spec& spec = ppu::spec(in.op);
         // Floating-point arithmetic gets many more states: its hard cases (ties, cancellation, the edges of a format) are rare.
-        const bool arithmetic = (spec.flags & ppu::kFloat) && !(spec.flags & (ppu::kLoad | ppu::kStore));
-        const int trials = arithmetic ? kFloatTrials : kTrials;
+        const bool memory = spec.flags & (ppu::kLoad | ppu::kStore);
+        const int trials = memory ? kTrials : (spec.flags & ppu::kFloat) ? kFloatTrials : (spec.flags & ppu::kVector) ? kVectorTrials : kTrials;
         for (int trial = 0; trial < trials; ++trial, ++runs) {
             rt::Cpu cpu;
             cpu.mem = space.base();
             cpu.hooks = &kHooks;
             for (uint64_t& r : cpu.r) r = interesting();
             for (double& f : cpu.f) f = std::bit_cast<double>(interesting_double());
+            for (rt::Vec& v : cpu.v)
+                for (uint32_t& w : v.w) w = interesting_word();
+            if ((spec.flags & ppu::kVector) && rng() % 4 == 0)  // elements that cancel, or are equal
+                for (unsigned e = 0; e < 4; ++e) cpu.v[in.rb()].w[e] = cpu.v[in.ra()].w[e] ^ (rng() % 2 ? 0x80000000u : 0u);
             if (spec.flags & ppu::kFloat) {  // operands that nearly cancel, and a multiplier of one, come up often
                 if (rng() % 4 == 0) cpu.f[in.rb()] = std::bit_cast<double>((std::bit_cast<uint64_t>(cpu.f[in.ra()]) ^ 0x8000000000000000ull) + rng() % 3 - 1);
                 if (rng() % 8 == 0) cpu.f[in.rc_reg()] = 1.0;
@@ -171,12 +197,18 @@ int main() {
             if (c.kind == Kind::Bc || c.kind == Kind::Bclr || c.kind == Kind::Bcctr || c.kind == Kind::Trap) cpu.r[3] = 7;
 
             // What a floating-point instruction started from, for a failure's message.
-            const std::string operands = !(spec.flags & ppu::kFloat) ? std::string() :
+            const std::string operands = (spec.flags & ppu::kVector) ?
+                std::format(" (from vA {:08x} {:08x} {:08x} {:08x}, vB {:08x} {:08x} {:08x} {:08x}, vC {:08x} {:08x} {:08x} {:08x})", cpu.v[in.ra()].w[0], cpu.v[in.ra()].w[1],
+                            cpu.v[in.ra()].w[2], cpu.v[in.ra()].w[3], cpu.v[in.rb()].w[0], cpu.v[in.rb()].w[1], cpu.v[in.rb()].w[2], cpu.v[in.rb()].w[3],
+                            cpu.v[in.rc_reg()].w[0], cpu.v[in.rc_reg()].w[1], cpu.v[in.rc_reg()].w[2], cpu.v[in.rc_reg()].w[3]) :
+                !(spec.flags & ppu::kFloat) ? std::string() :
                 std::format(" (from frA {:#018x}, frB {:#018x}, frC {:#018x})", std::bit_cast<uint64_t>(cpu.f[in.ra()]), std::bit_cast<uint64_t>(cpu.f[in.rb()]),
                             std::bit_cast<uint64_t>(cpu.f[in.rc_reg()]));
             ref::State s;
             for (unsigned i = 0; i < 32; ++i) s.gpr[i] = cpu.r[i];
             for (unsigned i = 0; i < 32; ++i) s.fpr[i] = std::bit_cast<uint64_t>(cpu.f[i]);
+            for (unsigned i = 0; i < 32; ++i)
+                for (unsigned e = 0; e < 16; ++e) s.vr[i][e] = static_cast<uint8_t>(cpu.v[i].w[e / 4] >> (24 - 8 * (e % 4)));
             s.cr = cpu.cr;
             s.xer = cpu.xer();
             s.lr = cpu.lr;

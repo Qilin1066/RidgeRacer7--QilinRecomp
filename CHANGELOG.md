@@ -4,6 +4,22 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-21
+
+The lifter's third slice: VMX.
+
+### Added
+- VMX in the PPU lifter, the part the game uses, and its runtime (`runtime/include/qilin/rt/vmx.hpp`): vector loads and stores, logical operations, select, permute, shifts by bytes, merges, splats, word add and compare, and single-precision add, subtract, fused multiply-add, maximum, minimum, compare and conversions, element by element and bit-exact. Portable C++, no host intrinsics.
+- The reference's VMX (`recomp/tests/difftest/ref_vmx.cpp`), on bytes and the integer soft-float.
+
+### Checked
+- On the game: 14,196 of 14,294 functions lift (1,016,630 of 1,059,387 instructions).
+- The differential test: 5,403 cases, 1,327,632 runs, all agree. A fault put into `vmaxfp` on purpose was caught.
+
+### Not done, and why
+- `vrefp` and `vrsqrtefp` (96 functions): estimates whose exact values are the hardware's. Left unlifted until there is a source for them.
+- Assumed from public descriptions, to be confirmed against RPCS3: VMX's non-Java mode (denormals as zeros), and the order of operands in a NaN's choice.
+
 ## [0.9.0] - 2026-11-21
 
 The lifter's second slice: floating point, bit-exact.

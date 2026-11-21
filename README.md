@@ -22,8 +22,8 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 | Control-flow pass for the PPU code (`docs/recompiler-core.md`) | ✅ on the game: 14,294 functions, 296 switches, 2,845 exception landing pads, all 502 system-call sites numbered; **every one of 1,065,028 words accounted for, none unknown** |
 | SPU decoder: 199 instructions (`docs/recompiler-core.md`) | ✅ identical to objdump (binutils 2.31.1, built by CI) over a 1.66-million-word sweep; on the game's 42 SPU programs all but a four-word jump table decode |
 | SPU control-flow pass (`docs/recompiler-core.md`) | ✅ on the game's 42 SPU programs: 2,332 functions, every one of 209,492 words accounted for |
-| PPU lifter: integers, loads and stores, branches, calls, switches, floating point bit-exact (`docs/recompiler-core.md`) | 🔨 13,732 of the game's 14,294 functions lift; identical to a separately written, integer-only reference over a million runs of the differential test, in CI |
-| The rest of the PPU lifter (VMX, exception landing pads); the SPU lifter | later |
+| PPU lifter: integers, loads and stores, branches, calls, switches, floating point bit-exact, VMX (`docs/recompiler-core.md`) | 🔨 14,196 of the game's 14,294 functions lift (96% of its instructions); identical to a separately written, integer-only reference over 1.3 million runs of the differential test, in CI |
+| The rest of the PPU lifter (the VMX estimates, exception landing pads); the SPU lifter | later |
 | Runtime: the system libraries and system calls replaced natively; the RSX's command stream on Vulkan 1.3; sound, controllers, saves, films | later |
 | The settings menu (F1), the same as the other Qilin recomps' | later, with the window |
 

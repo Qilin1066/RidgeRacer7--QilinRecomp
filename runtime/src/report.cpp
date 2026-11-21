@@ -1,7 +1,9 @@
 #include "qilin/rt/report.hpp"
 
 #include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <mutex>
 
 namespace qilin::rt {

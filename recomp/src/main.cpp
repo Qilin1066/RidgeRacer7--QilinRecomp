@@ -10,11 +10,16 @@
 //   qilin imports <game>                     every library imported and each function id taken from it
 //   qilin exports <game>                     what the program offers the system
 //   qilin sfo     <game>                     every entry of PARAM.SFO
+//   qilin insns   <game>                     every word of the program's code: address, word, instruction
+//   qilin profile <game>                     how often the code uses each instruction, and what doesn't decode
+//   qilin disasm  <file> [--base address]    a file of raw big-endian PPU words, as `insns` prints them
 //
 // EBOOT.BIN is encrypted and this project has no keys: `info` reads what its
 // header leaves plain, and the rest needs the decrypted program
 // (docs/elf-analysis.md says how to make it from your own disc).
 // Exit status is non-zero on any error; nothing fails silently.
+#include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <filesystem>
 #include <format>
@@ -26,7 +31,9 @@
 #include <string_view>
 #include <vector>
 
+#include "bytes.hpp"
 #include "elf.hpp"
+#include "ppu.hpp"
 #include "self.hpp"
 #include "sfo.hpp"
 #include "title.hpp"
@@ -52,6 +59,9 @@ int usage() {
                "  qilin imports <game>\n"
                "  qilin exports <game>\n"
                "  qilin sfo     <game>\n"
+               "  qilin insns   <game>\n"
+               "  qilin profile <game>\n"
+               "  qilin disasm  <file of big-endian words> [--base address]\n"
                "  qilin --version\n");
     return 2;
 }
@@ -59,7 +69,18 @@ int usage() {
 struct Args {
     std::string command, input;
     std::optional<std::string> json;
+    uint32_t base = 0;
 };
+
+uint32_t parse_address(std::string_view text) {
+    const std::string_view all = text;
+    const bool hex = text.starts_with("0x") || text.starts_with("0X");
+    if (hex) text.remove_prefix(2);
+    uint32_t value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value, hex ? 16 : 10);
+    if (text.empty() || error != std::errc() || end != text.data() + text.size()) throw Failure{std::format("not an address: {}", all)};
+    return value;
+}
 
 Args parse_args(std::span<char*> argv) {
     Args a;
@@ -68,6 +89,7 @@ Args parse_args(std::span<char*> argv) {
     for (size_t i = 3; i < argv.size(); ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--json" && i + 1 < argv.size()) a.json = argv[++i];
+        else if (arg == "--base" && i + 1 < argv.size()) a.base = parse_address(argv[++i]);
         else throw Failure{std::format("unknown argument {}", arg)};
     }
     return a;
@@ -300,6 +322,125 @@ int cmd_sfo(const Args& a) {
     return 0;
 }
 
+// The program's code: its executable sections, or its executable segments
+// if it has no section table. Each is a whole number of words.
+struct CodeRange {
+    uint32_t address = 0;
+    std::span<const uint8_t> bytes;
+};
+
+std::vector<CodeRange> code_of(const Elf& elf) {
+    std::vector<CodeRange> code;
+    const auto add = [&](uint64_t address, uint64_t size, std::string_view what) {
+        if (size == 0) return;
+        const auto bytes = elf.bytes_at(address, size);
+        if (bytes.empty()) throw Failure{std::format("{} at {:#x} ({:#x} bytes) isn't in the file", what, address, size)};
+        if (address % 4 || size % 4)
+            throw Failure{std::format("{} at {:#x} ({:#x} bytes) isn't a whole number of words", what, address, size)};
+        code.push_back({static_cast<uint32_t>(address), bytes});
+    };
+    for (const ElfSection& s : elf.sections())
+        if (s.type == kShtProgbits && (s.flags & kShfAlloc) && (s.flags & kShfExec)) add(s.address, s.size, "code section");
+    if (code.empty())
+        for (const ElfSegment& s : elf.segments())
+            if (s.type == kPtLoad && (s.flags & kPfExec)) add(s.address, s.file_size & ~uint64_t{3}, "code segment");
+    if (code.empty()) throw Failure{"the program has no code"};
+    return code;
+}
+
+void print_insns(const CodeRange& range) {
+    std::string out;
+    for (size_t i = 0; i + 4 <= range.bytes.size(); i += 4) {
+        const uint32_t pc = range.address + static_cast<uint32_t>(i), word = read_be32(range.bytes.data() + i);
+        out += std::format("{:08x} {:08x} {}\n", pc, word, ppu::disasm(ppu::decode(word), pc));
+        if (out.size() >= 1 << 16) {
+            std::fwrite(out.data(), 1, out.size(), stdout);
+            out.clear();
+        }
+    }
+    std::fwrite(out.data(), 1, out.size(), stdout);
+}
+
+int cmd_insns(const Args& a) {
+    const Elf elf = elf_of(files_of(a));
+    for (const CodeRange& range : code_of(elf)) print_insns(range);
+    return 0;
+}
+
+int cmd_disasm(const Args& a) {
+    const auto file = read_file(a.input);
+    if (!file) throw Failure{file.error()};
+    if (file->size() % 4) throw Failure{std::format("{} is {} bytes: not a whole number of words", a.input, file->size())};
+    print_insns({a.base, *file});
+    return 0;
+}
+
+// How often each instruction occurs (with its suffixes: "addo." apart from
+// "add"), by family, and the words that don't decode. A code section holds
+// data too (jump tables, constants), so some invalid words are expected:
+// the control-flow pass says which are reached.
+int cmd_profile(const Args& a) {
+    const Elf elf = elf_of(files_of(a));
+    struct Count {
+        std::string name;
+        size_t count = 0;
+        uint32_t first = 0;
+    };
+    std::vector<std::vector<Count>> by_op(static_cast<size_t>(ppu::Op::count_));
+    size_t words = 0, invalid = 0, zero = 0, vector = 0, fp = 0, wide = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> first_invalid;
+    for (const CodeRange& range : code_of(elf)) {
+        for (size_t i = 0; i + 4 <= range.bytes.size(); i += 4) {
+            const uint32_t pc = range.address + static_cast<uint32_t>(i), word = read_be32(range.bytes.data() + i);
+            const ppu::Insn in = ppu::decode(word);
+            ++words;
+            if (!in.valid()) {
+                ++invalid;
+                if (word == 0) ++zero;
+                else if (first_invalid.size() < 16) first_invalid.emplace_back(pc, word);
+                continue;
+            }
+            const uint32_t flags = ppu::spec(in.op).flags;
+            vector += (flags & ppu::kVector) != 0;
+            fp += (flags & ppu::kFloat) != 0;
+            wide += (flags & ppu::k64) != 0;
+            auto& forms = by_op[static_cast<size_t>(in.op)];
+            std::string name = ppu::mnemonic(in);
+            auto it = std::ranges::find(forms, name, &Count::name);
+            if (it == forms.end()) it = forms.insert(forms.end(), Count{std::move(name), 0, pc});
+            ++it->count;
+        }
+    }
+    std::vector<Count> all;
+    size_t unused = 0;
+    for (size_t i = 1; i < by_op.size(); ++i) {
+        unused += by_op[i].empty();
+        all.insert(all.end(), by_op[i].begin(), by_op[i].end());
+    }
+    std::ranges::sort(all, [](const Count& x, const Count& y) { return x.count != y.count ? x.count > y.count : x.name < y.name; });
+    std::println("{} words of code: {} decode, {} don't ({} of those are zero)", words, words - invalid, invalid, zero);
+    std::println("{} floating-point, {} VMX, {} 64-bit-only instructions", fp, vector, wide);
+    std::println("{} of the decoder's {} instructions are used; {} are not", by_op.size() - 1 - unused, by_op.size() - 1, unused);
+    for (const Count& c : all) std::println("{:9} {:12} first at {:#x}", c.count, c.name, c.first);
+    if (!first_invalid.empty()) {
+        std::println("the first non-zero words that don't decode:");
+        for (const auto& [pc, word] : first_invalid) std::println("  {:#x} {:08x}", pc, word);
+    }
+    std::println("not used:");
+    std::string line;
+    for (size_t i = 1; i < by_op.size(); ++i) {
+        if (!by_op[i].empty()) continue;
+        const std::string_view name = ppu::spec(static_cast<ppu::Op>(i)).name;
+        if (line.size() + name.size() > 96) {
+            std::println(" {}", line);
+            line.clear();
+        }
+        line += std::format(" {}", name);
+    }
+    if (!line.empty()) std::println(" {}", line);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -314,6 +455,9 @@ int main(int argc, char** argv) {
         if (a.command == "imports") return cmd_imports(a);
         if (a.command == "exports") return cmd_exports(a);
         if (a.command == "sfo") return cmd_sfo(a);
+        if (a.command == "insns") return cmd_insns(a);
+        if (a.command == "profile") return cmd_profile(a);
+        if (a.command == "disasm") return cmd_disasm(a);
         return usage();
     } catch (const Failure& f) {
         std::println(stderr, "qilin: {}", f.message);

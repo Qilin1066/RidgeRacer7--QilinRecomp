@@ -9,6 +9,7 @@
 
 #include "elf.hpp"
 #include "elf_builder.hpp"
+#include "ppu.hpp"
 #include "self.hpp"
 #include "sfo.hpp"
 #include "sha256.hpp"
@@ -44,6 +45,89 @@ void test_sha256() {
     // Padding edges: the length fits in the last block, just doesn't, and exact blocks.
     CHECK(sha256_hex(pattern(55)) == "e7313d333c272e639f790978283f9eb392e843d0f29b7016828bb1daa4aac70b");
     CHECK(sha256_hex(pattern(56)) == "4324d65f3c103567f5589c710bc08f8523f929a9272e3af36fc968e52abc6c27");
+}
+
+// ---------------------------------------------------------------- the PPU decoder
+
+std::string text_of(uint32_t word, uint32_t pc = 0x10000) { return ppu::disasm(ppu::decode(word), pc); }
+
+void test_ppu() {
+    using ppu::Op;
+    // What every function of a PS3 program begins and ends with.
+    CHECK(text_of(0x7c0802a6) == "mfspr r0,8");            // mflr r0
+    CHECK(text_of(0xf821ff91) == "stdu r1,-112(r1)");
+    CHECK(text_of(0xf8010080) == "std r0,128(r1)");
+    CHECK(text_of(0xe8410028) == "ld r2,40(r1)");
+    CHECK(text_of(0xe8630002) == "lwa r3,0(r3)");
+    CHECK(text_of(0x4e800020) == "bclr 20,lt,0");          // blr
+    CHECK(text_of(0x4e800421) == "bcctrl 20,lt,0");        // bctrl
+    CHECK(text_of(0x48000011) == "bl 0x10010");
+    CHECK(text_of(0x4bfffff0) == "b 0xfff0");
+    CHECK(text_of(0x419e0008) == "bc 12,4*cr7+eq,0x10008");
+    CHECK(text_of(0x44000002) == "sc 0");
+    CHECK(text_of(0x60000000) == "ori r0,r0,0");           // nop
+    CHECK(text_of(0x38600001) == "addi r3,0,1");           // li r3,1
+    CHECK(text_of(0x7c7f1b78) == "or r31,r3,r3");          // mr r31,r3
+    CHECK(text_of(0x7c632214) == "add r3,r3,r4");
+    CHECK(text_of(0x7c632615) == "addo. r3,r3,r4");
+    // 64 bits.
+    CHECK(text_of(0x786b0020) == "rldicl r11,r3,0,32");    // clrldi r11,r3,32
+    CHECK(text_of(0x786307c6) == "rldicr r3,r3,32,31");    // sldi r3,r3,32
+    CHECK(text_of(0x7c6307b4) == "extsw r3,r3");
+    CHECK(text_of(0x7c63fe76) == "sradi r3,r3,63");
+    CHECK(text_of(0x2c230000) == "cmpi cr0,1,r3,0");       // cmpdi r3,0
+    CHECK(text_of(0x7f832040) == "cmpl cr7,0,r3,r4");      // cmplw cr7,r3,r4
+    CHECK(text_of(0x7c0004ac) == "sync 0");
+    CHECK(text_of(0x7c2004ac) == "sync 1");                // lwsync
+    CHECK(!ppu::decode(0x7c6004ac).valid());               // no fourth kind of sync
+    // The condition register, whole and by one field.
+    CHECK(text_of(0x7d800026) == "mfcr r12");
+    CHECK(text_of(0x7d908120) == "mtocrf 8,r12");
+    CHECK(text_of(0x7d808120) == "mtcrf 8,r12");
+    CHECK(!ppu::decode(0x7d918120).valid());               // mtocrf names one field, not two
+    // VMX.
+    CHECK(text_of(0x10000484) == "vor v0,v0,v0");
+    CHECK(text_of(0x7c0000ce) == "lvx v0,0,r0");
+    CHECK(text_of(0x7c2329ce) == "stvx v1,r3,r5");
+    CHECK(text_of(0x7c03240e) == "lvlx v0,r3,r4");
+    CHECK(text_of(0x1023038c) == "vspltisw v1,3");
+    CHECK(text_of(0x103f038c) == "vspltisw v1,-1");
+    CHECK(text_of(0x1022186e) == "vmaddfp v1,v2,v1,v3");
+    CHECK(text_of(0x102218ac) == "vsldoi v1,v2,v3,2");
+    CHECK(text_of(0x10221c06) == "vcmpequb. v1,v2,v3");
+    CHECK(text_of(0x1020128c) == "vspltw v1,v2,0");
+    CHECK(!ppu::decode(0x1024128c).valid());               // a word has four elements, not five
+    // Reserved bits and invalid forms don't decode.
+    CHECK(text_of(0x00000000) == ".long 0x0");
+    CHECK(ppu::decode(0x7c632215).valid());                // add. is fine
+    CHECK(!ppu::decode(0x7c0802a7).valid());               // mfspr with bit 31 set
+    CHECK(!ppu::decode(0xe8630003).valid());               // opcode 58 has three forms
+    CHECK(!ppu::decode(0xe8630001).valid());               // ldu r3,0(r3): the base is the target
+    CHECK(!ppu::decode(0xf8600001).valid());               // stdu with no base
+    CHECK(!ppu::decode(0x4c000064).valid());               // rfi: not on a 64-bit processor
+    CHECK(!ppu::decode(0x7c0000a6).valid());               // mfmsr: the supervisor's
+    CHECK(!ppu::decode(0x4e200020).valid());               // bclr whose BO has a reserved bit set
+    // Properties the passes go by.
+    CHECK(ppu::decode(0x4e800020).op == Op::bclr);
+    CHECK(ppu::spec(Op::bclr).flags & ppu::kBranch);
+    CHECK(ppu::spec(Op::lvx).flags & ppu::kVector);
+    CHECK(ppu::spec(Op::ld).flags & ppu::k64);
+    CHECK(ppu::decode(0x48000011).branch_target(0x10000) == 0x10010);
+    CHECK(ppu::decode(0x48000013).branch_target(0x10000) == 0x10);
+    // Every spec decodes from its own match bits, under its own name (some need an operand set to be a valid form).
+    for (const ppu::Spec& s : ppu::specs()) {
+        uint32_t word = s.match;
+        if (s.flags & (ppu::kRaNonZero | ppu::kRaNotZeroOrRd | ppu::kLmw | ppu::kLswi)) word |= 1u << 16;
+        if (s.flags & ppu::kLmw) word |= 31u << 21;
+        if (s.flags & ppu::kLswi) word |= 4u << 11;
+        if (s.flags & ppu::kLswx) word |= 1u << 21;
+        if (s.flags & (ppu::kValidBo | ppu::kBoNoDecrement)) word |= 20u << 21;
+        if (s.flags & ppu::kOneCrField) word |= 1u << 12;
+        const ppu::Insn in = ppu::decode(word);
+        if (in.op != s.op) std::println(stderr, "{} doesn't decode from its own bits ({:08x})", s.name, word);
+        CHECK(in.op == s.op);
+        CHECK(ppu::mnemonic(in) == s.name);
+    }
 }
 
 // ---------------------------------------------------------------- the program
@@ -337,6 +421,7 @@ void test_title() {
 
 int main() {
     test_sha256();
+    test_ppu();
     test_elf();
     test_self();
     test_sfo();

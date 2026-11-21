@@ -80,15 +80,23 @@ add_library(qilin_game STATIC
 target_include_directories(qilin_game PUBLIC recomp/src)
 target_link_libraries(qilin_game PRIVATE qilin_warnings)
 
+# ---- The recompiler's own parts: tools only (std::format is fine) ----
+add_library(qilin_recomp STATIC
+    recomp/src/ppu.cpp
+)
+target_include_directories(qilin_recomp PUBLIC recomp/src)
+target_link_libraries(qilin_recomp PRIVATE qilin_warnings)
+qilin_tool(qilin_recomp)
+
 # ---- The qilin tool ----
 add_executable(qilin recomp/src/main.cpp)
-target_link_libraries(qilin PRIVATE qilin_game qilin_warnings)
+target_link_libraries(qilin PRIVATE qilin_game qilin_recomp qilin_warnings)
 qilin_tool(qilin)
 target_compile_definitions(qilin PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 
 enable_testing()
 add_executable(qilin_tests recomp/tests/tests.cpp)
-target_link_libraries(qilin_tests PRIVATE qilin_game qilin_warnings)
+target_link_libraries(qilin_tests PRIVATE qilin_game qilin_recomp qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)
 # qilin's exit codes: a usage error is 2, a missing file 1, the version 0.

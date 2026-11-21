@@ -31,6 +31,12 @@ void thread_enters(const char* what, uint32_t number, uint32_t from);
 void set_current_cpu(const Cpu* cpu);
 const Cpu* current_cpu();
 void thread_leaves();
+// The calling thread's last calls to the system, newest first, for the fault report: each a name (or null: a system call), a number and the caller's address.
+struct PastCall {
+    const char* what;
+    uint32_t number, from;
+};
+size_t past_calls(PastCall* out, size_t most);
 void start_watch();
 
 // Objects of one kind, by id. Ids start at `first` and are never reused

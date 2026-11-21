@@ -14,10 +14,15 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The SPU lifter's first slice: everything but floating point (`docs/recompiler-core.md`). 1,719 of the 42 programs' 2,332 functions lift; `qilin lift --out` writes each program's code beside the PPU's. Its own differential test (`qilin_spu_difftest`: 3,552 cases, 227,328 runs against a separately written reference) is in `ctest`.
 - The SPU lifter's floating point, from IBM's public instruction-set document: single precision in its extended range (truncation, no denormals, NaNs or infinities, saturation) done exactly in whole numbers; `fi` exactly; the estimates by tables of this runtime's own, a stated choice checked against the document's bound; double precision on the host's doubles. 2,330 of 2,332 SPU functions lift; the test is 4,080 cases and 362,496 runs.
 - SPU threads (system calls 170 to 194, `sys_spu_image_import`): a thread runs its program's lifted code on a host thread, with memory transfers, the atomic line pair, mailboxes, events to the game's queues and the system's stop codes as hooks (`docs/runtime.md`).
-- `RR7_ERRORS` and `RR7_FILES`: logs of the error codes handed to the game and of its file reads.
+- `RR7_ERRORS` and `RR7_FILES`: logs of the error codes handed to the game and of its file reads. `RR7_CALLS`, `RR7_DUMP` and `qilin lift --registers`, for finding a fault (`docs/runtime.md`).
+- The clock library (`cellRtc`).
 
 ### Checked
-- On the owner's PC: the game starts its sound core (`bnusCoreSpu.elf`) as an SPU thread, which runs; it reads eight packs of `RR7.DAT` and then faults in its own code going over a table from the last (open: `docs/runtime.md`). 105 of its 248 imports and 54 of its 78 system calls are provided.
+- On the owner's PC: the game starts its sound core (`bnusCoreSpu.elf`) as an SPU thread, which runs; it reads and unpacks its first packs of `RR7.DAT`, and runs on to its first drawing: it stops at the RSX method that loads a vertex program. 110 of its 248 imports and 54 of its 78 system calls are provided.
+
+### Fixed
+- `sys_memory_allocate` could give the same address twice when blocks of both page sizes were allocated: the game's packs then overwrote one another, and it faulted going over one's table.
+- The archive's directory: a record begins with its name, not ends with it. Every pack and file had its neighbour's name since v0.5.0 (`docs/data-files.md`).
 
 ### Known
 - The lifted SPU code takes MSVC about fifteen minutes to compile, and one file over 9 GB of memory: the helpers are inlined into very large functions.

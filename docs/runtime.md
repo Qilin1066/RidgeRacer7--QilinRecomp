@@ -29,7 +29,7 @@ The script builds `qilin`, lifts your copy's program to C++ (`qilin lift <game> 
 
 Each was added when the game reached it, and does what the system's function does as far as the game can tell. The files are in `ridgeracer7/src/`.
 
-**Imports** (105 of the game's 248):
+**Imports** (110 of the game's 248):
 
 | | Functions | What they are here |
 |---|---|---|
@@ -42,6 +42,7 @@ Each was added when the game reached it, and does what the system's function doe
 | `fs.cpp` | `cellFsOpen`, `Close`, `Read`, `Write`, `Lseek`, `Fstat`, `Opendir`, `Readdir`, `Closedir`, `Unlink` | the file system (below) |
 | `audio.cpp` | `cellAudioInit`, `Quit`, `PortOpen`, `GetPortConfig`, `PortStart`, `PortStop`, `PortClose`, `SetNotifyEventQueue`, `RemoveNotifyEventQueue` | the sound ports: a ring of blocks of 256 float samples which one thread takes 187.5 times a second by the host's clock, mixes to stereo, clears, and tells the game's queues about; out through `host/`'s `AudioOut` (joined in `main.cpp`). The game opens one port of 8 channels and 8 blocks. *An 8-channel port is mixed down with the centre and surrounds at -3 dB and no bass channel: a stated choice, to be compared with the console's down-mixer. The event's own words are zero: the game's sound thread reads none of them* |
 | `spurs.cpp` | `cellSpursInitialize`, `cellSpursAttachLv2EventQueue`, `cellSpursCreateTaskset` | the SPURS instance (4 SPUs) and its tasksets (the game makes four). `cellSpursCreateTask` stops the game and says which SPU program it was handed: that needs the SPU lifter |
+| `rtc.cpp` | `cellRtcGetCurrentTick`, `GetCurrentClockLocalTime`, `SetTick`, `TickAddMinutes`, `ConvertUtcToLocalTime` | the calendar: a tick is microseconds from the start of year 1; the host's time, the console's time zone (the fixed setting: UTC) |
 | `net.cpp` | `sys_net_initialize_network_ex`, `sys_net_finalize_network`, `cellNetCtlInit`, `cellNetCtlTerm` | **a console with no network cable**: the libraries start, as they do on one. Sockets and the connection dialog are not provided yet |
 | `np.cpp` | `sceNpInit`, `sceNpTerm`, `sceNpManagerGetStatus` | PlayStation Network on **a console that is not signed in**: the status is "offline" |
 | `video.cpp` | `cellVideoOutGetNumberOfDevice`, `GetState`, `GetDeviceInfo`, `GetResolution`, `GetResolutionAvailability`, `Configure` | **the television is the runtime's to define**: one HDMI display, 16:9, 59.94 Hz, taking 1080p, 1080i, 720p and 480; it reports 1080p, the game's best, until the settings menu holds the choice. The game configures 1920 by 1080, pitch 8192. The sound output (`cellAudioOutGetSoundAvailability`, `cellAudioOutConfigure`, in the same file) is likewise defined: **two channels of linear PCM at 48 kHz** and nothing else, which the game takes (down-mixer 2). (The display information's modes begin at byte 32: read off the game's loop over them) |
@@ -54,7 +55,7 @@ Each was added when the game reached it, and does what the system's function doe
 
 | | Calls | |
 |---|---|---|
-| `memory.cpp` | 341, 342; 348, 349, 352 | memory containers (part of the process's memory set aside to lend a system utility: the game makes one of 3 MiB for its game-data check); memory in pages of 1 MiB or 64 KiB from one range of addresses, first fit. *The total a game may have, 213 MiB, is from public descriptions: the game asks for it, so it is to be confirmed* |
+| `memory.cpp` | 341, 342; 348, 349, 352 | memory containers (part of the process's memory set aside to lend a system utility: the game makes one of 3 MiB for its game-data check); memory in pages of 1 MiB or 64 KiB from one range of addresses, first fit (a fault in the search once gave two packs the same memory: below). *The total a game may have, 213 MiB, is from public descriptions: the game asks for it, so it is to be confirmed* |
 | `threads.cpp` | 43, 44, 45, 47, 48 | yield, join, detach, priorities |
 | `sync_calls.cpp` | 90-94, 114; 100-104; 105-108; 141, 142, 145, 147 | semaphores, mutexes, condition variables; sleeping, the calendar's time, the time base's frequency. **A semaphore's post goes to the thread that has waited longest**: the game's threads greet each other by posting and then waiting on the same semaphore, and a post the poster could take back itself left the game reading a null pointer |
 | `events.cpp` | 128-130, 134-138 | event queues and ports. The receive call returns its event in `r4` to `r7`: read off the game's code after each `sc` |
@@ -115,16 +116,22 @@ A path is kept inside its mount point (`..` can't climb out), and a name under n
 
 - **A bad memory access is reported** (`fault.cpp`): the guest address, the thread, and the lifted functions on the stack, found from the host's return addresses. Then the process stops, as for any other unknown. Before this a fault ended the process without a word.
 - `qilin lift --pc` makes lifted code note each instruction's address before it touches memory (`Cpu::pc`), and the report then names the instruction. It is slower, so it is for finding faults, not for playing.
+- `qilin lift --registers` goes further than `--pc`: the lifted code writes its registers back before every memory access, and the report prints all 32. Slow; it is what found the fault below. `RR7_DUMP=<addresses>` adds 96 bytes of guest memory at each to the report, and `RR7_CALLS=<thread id, or all>` logs every call a thread makes to the system with its arguments and result.
 - `RR7_ERRORS` logs every error code the system hands the game (a game may ignore one, and did). `RR7_FILES` logs every file opened and every read.
 - Two aids in the environment, neither a way to play: `RR7_WATCH=<seconds>` prints what system function each guest thread is inside after that long, and stops; `RR7_RSX_SURVEY` counts the RSX methods not yet provided up to the first flip, without running them, prints the list and stops.
 
 ## Where it stops now
 
-After v0.13.0: **a fault in the game's own code** (`0x13bd38`, in the function at `0x13ba90`, on the first thread): a read at an address that is not memory. By then the game has started SPURS and made four tasksets, looked for its game data, started the network libraries (no cable, not signed in), set the sound output to stereo, opened its sound port, **started its sound core as an SPU thread, which runs**, and begun reading `RR7.DAT`: the packs `SoundCommon`, `DjCommon`, `DB`, `CommonCar`, one at 5.06 GB, `Text`, `TextFr` and `Text_TGS`.
+After v0.13.0: **RSX method `0x1E9C`** (`SET_TRANSFORM_PROGRAM_LOAD`: the game is loading its first vertex program), at offset `0xCA8E80` of its mapped memory. By then it has started SPURS, its sound core on an SPU thread, read its first packs from `RR7.DAT` and unpacked and parsed them (its fonts and text among them), and built a frame's commands. **The next work is the RSX's drawing on Vulkan**: vertex and fragment programs, surfaces, draws, flips into `host/`'s window. Also still ahead: SPURS tasks (the game makes tasksets; creating a task stops it).
 
-The function that faults is going over a table read from the last of those, exchanging the byte order of its words in place; the word it then uses as an offset is `0x48000000`, as if a word already in the PPU's order had been exchanged. **Open, and next:** whether the pack was unpacked wrongly (the unpacker is the game's own, lifted: a lifter fault would show here), whether two threads are at the table at once (the scheduler), or whether the game is being told something that sends it to the wrong pack (it loads the French text, and a pack left from a trade-show build, on a console set to English).
+### A fault on the way, and what it was
 
-Still ahead, and large: **SPURS tasks** (the game makes tasksets; creating a task stops it), and **the RSX's drawing on Vulkan**.
+Before that, the game faulted in its own code (`0x13bd38`): it was going over a table from one pack and found another pack's bytes there. Two faults of this project's, neither the lifter's:
+
+- **`sys_memory_allocate` gave two packs the same memory.** Its first-fit search rounded the candidate address up to the page size asked for; with blocks of both page sizes in the list that could pass the next block's start, and an unsigned difference then looked like a huge gap. (The game allocates each pack's buffer with 64 KiB pages among 1 MiB ones.)
+- **The tools had every pack's and file's name one record off** (`docs/data-files.md`), so the game's own, correct, loads looked wrong (`TextFr` for `TextEn`) and sent the search the wrong way for a while.
+
+What found it: registers at the fault (`--registers`), the game's run-time table of pack records dumped beside the tools' reading of the same bytes, and the call trace of the loader thread.
 
 ## Checked
 

@@ -42,7 +42,31 @@ uintptr_t g_guest_base = 0;
 
 // Prints the lifted functions these host addresses are in, innermost first.
 void print_guest_stack(const uintptr_t* frames, size_t count) {
-    if (const Cpu* cpu = current_cpu(); cpu && cpu->pc) std::fprintf(stderr, "  the last of the game's instructions to touch memory was at %08x\n", cpu->pc);
+    if (const Cpu* cpu = current_cpu(); cpu && cpu->pc) {
+        std::fprintf(stderr, "  the last of the game's instructions to touch memory was at %08x\n", cpu->pc);
+        // (The registers are as the lifted code last wrote them back: current only in code lifted with --registers.)
+        for (unsigned i = 0; i < 32; i += 4)
+            std::fprintf(stderr, "  r%-2u %016llx  r%-2u %016llx  r%-2u %016llx  r%-2u %016llx\n", i, static_cast<unsigned long long>(cpu->r[i]), i + 1,
+                         static_cast<unsigned long long>(cpu->r[i + 1]), i + 2, static_cast<unsigned long long>(cpu->r[i + 2]), i + 3, static_cast<unsigned long long>(cpu->r[i + 3]));
+    }
+    // A development aid: RR7_DUMP=<address>[,<address>...] in hex prints 96 bytes of guest memory at each.
+    if (const char* list = std::getenv("RR7_DUMP")) {
+        while (*list) {
+            char* end = nullptr;
+            const uint32_t at = static_cast<uint32_t>(std::strtoul(list, &end, 16));
+            if (end == list) break;
+            std::fprintf(stderr, "  memory at %08x:", at);
+            for (uint32_t i = 0; i < 96; ++i) std::fprintf(stderr, "%s%02x", i % 4 == 0 ? " " : "", guest_memory()[at + i]);
+            std::fputc(10, stderr);
+            list = *end == ',' ? end + 1 : end;
+        }
+    }
+    PastCall past[16];
+    const size_t calls = past_calls(past, 16);
+    for (size_t i = 0; i < calls; ++i) {
+        if (past[i].what) std::fprintf(stderr, "  %s it called %s (from %08x)\n", i ? "before that" : "its last call to the system:", past[i].what, past[i].from);
+        else std::fprintf(stderr, "  %s system call %u (at %08x)\n", i ? "before that" : "its last call to the system:", past[i].number, past[i].from);
+    }
     if (g_by_host.empty()) return;
     const uintptr_t first = g_by_host.front().host, last = g_by_host.back().host + 0x100000;
     size_t shown = 0;

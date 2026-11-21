@@ -19,6 +19,7 @@ struct Where {
     std::atomic<const char*> what{nullptr};
     std::atomic<uint32_t> number{0}, from{0};
     std::atomic<uint64_t> calls{0};
+    PastCall past[16] = {};  // a ring of the thread's last calls (written by the thread itself)
 };
 thread_local uint32_t t_thread = 0;
 thread_local Where* t_where = nullptr;
@@ -41,7 +42,16 @@ void thread_enters(const char* what, uint32_t number, uint32_t from) {
     t_where->number.store(number, std::memory_order_relaxed);
     t_where->from.store(from, std::memory_order_relaxed);
     t_where->what.store(what, std::memory_order_relaxed);
+    t_where->past[t_where->calls.load(std::memory_order_relaxed) % 16] = {number ? nullptr : what, number, from};
     t_where->calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+size_t past_calls(PastCall* out, size_t most) {
+    if (!t_where) return 0;
+    const uint64_t calls = t_where->calls.load(std::memory_order_relaxed);
+    size_t n = 0;
+    for (; n < most && n < 16 && n < calls; ++n) out[n] = t_where->past[(calls - 1 - n) % 16];
+    return n;
 }
 void set_current_cpu(const Cpu* cpu) { t_cpu = cpu; }
 const Cpu* current_cpu() { return t_cpu; }

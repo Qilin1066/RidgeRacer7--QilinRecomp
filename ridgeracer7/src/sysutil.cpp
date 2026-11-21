@@ -156,6 +156,9 @@ constexpr NativeImport kImports[] = {
 
 }  // namespace
 
+int32_t console_time_zone_minutes() { return g_settings.time_zone; }
+int32_t console_summer_time_minutes() { return g_settings.summer_time; }
+
 void system_event(uint64_t status, uint64_t parameter) {
     const std::lock_guard lock(g_callbacks_mutex);
     g_events.emplace_back(status, parameter);

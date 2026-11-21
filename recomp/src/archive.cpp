@@ -16,19 +16,21 @@ struct PackRecord {
 };
 
 PackRecord pack_at(const uint8_t* p) {
-    return {read_be32(p), read_be32(p + 12), read_be32(p + 16), read_be32(p + 32), read_be16(p + 4), read_be16(p + 6), read_be16(p + 8), read_be16(p + 10)};
+    return {read_be32(p + 4), read_be32(p + 16), read_be32(p + 20), read_be32(p), read_be16(p + 8), read_be16(p + 10), read_be16(p + 12), read_be16(p + 14)};
 }
 
 }  // namespace
 
 std::expected<Archive, std::string> find_archive(std::span<const ArchiveMemory> memory, const std::function<std::string(uint32_t)>& text) {
-    // The pack table: records that follow one another sector by sector from sector 0, each with a name.
+    // The pack table: records that follow one another sector by sector from sector 0, each beginning with its name's address.
+    // (A record's name is its first word. This was first read as its last, which gave every pack and file its neighbour's name:
+    // the game's own table of pointers to the records, seen at run time, settled it.)
     for (const ArchiveMemory& m : memory) {
         const size_t size = m.bytes.size();
         for (size_t at = 0; at + kFewestPacks * kArchivePackRecord <= size; at += 4) {
             const uint8_t* p = m.bytes.data() + at;
             // Cheap tests first: sector 0, some sectors, files from number 0.
-            if (read_be32(p) != 0 || read_be16(p + 4) == 0 || read_be16(p + 6) != 0 || read_be16(p + 10) > 1) continue;
+            if (read_be32(p + 4) != 0 || read_be16(p + 8) == 0 || read_be16(p + 10) != 0 || read_be16(p + 14) > 1) continue;
             std::vector<PackRecord> records;
             uint32_t next_sector = 0;
             for (size_t q = at; q + kArchivePackRecord <= size; q += kArchivePackRecord) {
@@ -56,10 +58,10 @@ std::expected<Archive, std::string> find_archive(std::span<const ArchiveMemory> 
                 const uint8_t* f = m.bytes.data() + files_at + size_t{i} * kArchiveFileRecord;
                 ArchiveFile& file = archive.files[i];
                 file.pack = ArchiveFile::kNoPack;
-                file.align = read_be16(f + 6);
-                file.size = read_be32(f + 8);
-                file.offset = read_be32(f + 12);
-                file.name = text(read_be32(f + 16));
+                file.align = read_be16(f + 10);
+                file.size = read_be32(f + 12);
+                file.offset = read_be32(f + 16);
+                file.name = text(read_be32(f));
                 if (file.name.empty()) return fail(std::format("file {} has no name", i));
                 if (file.align != 0 && file.align != 64 && file.align != kArchiveSector)  // (0: one file has none)
                     return fail(std::format("file {} ({}) is aligned to {}", i, file.name, file.align));
@@ -96,8 +98,8 @@ std::expected<Archive, std::string> find_archive(std::span<const ArchiveMemory> 
                         // (Checked for files in packs only: the few in none say they span no sectors.)
                         const uint8_t* f = m.bytes.data() + files_at + size_t{i} * kArchiveFileRecord;
                         const uint32_t spans = (file.offset % kArchiveSector + file.size + kArchiveSector - 1) / kArchiveSector;
-                        if (read_be16(f + 4) != spans)
-                            return fail(std::format("file {} ({}) says it spans {} sectors, and its size says {}", i, file.name, read_be16(f + 4), spans));
+                        if (read_be16(f + 8) != spans)
+                            return fail(std::format("file {} ({}) says it spans {} sectors, and its size says {}", i, file.name, read_be16(f + 8), spans));
                         if (file.offset < previous_end || uint64_t{file.offset} + file.size > pack.size)
                             return fail(std::format("{}: file {} ({}), {:#x} bytes at {:#x}, overlaps the one before or runs past the pack's {:#x} bytes", which, i,
                                                     file.name, file.size, file.offset, pack.size));

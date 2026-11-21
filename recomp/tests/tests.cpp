@@ -547,23 +547,23 @@ struct ArchiveData {
     }
     void file(uint32_t i, uint32_t offset, uint32_t size, uint32_t name, uint16_t align = 64) {
         const size_t at = kFiles + 20 * i;
-        put_be16(bytes, at + 4, static_cast<uint16_t>((offset % 2048 + size + 2047) / 2048));
-        put_be16(bytes, at + 6, align);
-        put_be32(bytes, at + 8, size);
-        put_be32(bytes, at + 12, offset);
-        put_be32(bytes, at + 16, kAt + name);
+        put_be32(bytes, at, kAt + name);
+        put_be16(bytes, at + 8, static_cast<uint16_t>((offset % 2048 + size + 2047) / 2048));
+        put_be16(bytes, at + 10, align);
+        put_be32(bytes, at + 12, size);
+        put_be32(bytes, at + 16, offset);
     }
     void pack(uint32_t i, uint32_t sector, uint16_t sectors, uint16_t first, uint16_t end, bool compressed, uint32_t stored, uint32_t size,
               uint32_t name) {
         const size_t at = kPacks + 36 * i;
-        put_be32(bytes, at, sector);
-        put_be16(bytes, at + 4, sectors);
-        put_be16(bytes, at + 6, first);
-        put_be16(bytes, at + 8, end);
-        put_be16(bytes, at + 10, compressed);
-        put_be32(bytes, at + 12, stored);
-        put_be32(bytes, at + 16, size);
-        put_be32(bytes, at + 32, kAt + name);
+        put_be32(bytes, at, kAt + name);
+        put_be32(bytes, at + 4, sector);
+        put_be16(bytes, at + 8, sectors);
+        put_be16(bytes, at + 10, first);
+        put_be16(bytes, at + 12, end);
+        put_be16(bytes, at + 14, compressed);
+        put_be32(bytes, at + 16, stored);
+        put_be32(bytes, at + 20, size);
     }
     std::expected<Archive, std::string> find() const {
         const ArchiveMemory memory[] = {{kAt, bytes}};
@@ -611,7 +611,7 @@ void test_archive() {
     bad.bytes[0x2b] = 0;
     CHECK(has(bad.error(), "two packs"));
     bad = ArchiveData();
-    put_be32(bad.bytes, ArchiveData::kFiles + 16, 0);  // a file with no name
+    put_be32(bad.bytes, ArchiveData::kFiles, 0);  // a file with no name
     CHECK(has(bad.error(), "no name"));
     bad = ArchiveData();
     bad.pack(1, 5, 1, 2, 3, false, 0, 0, 0x28);  // the packs don't follow one another: no table

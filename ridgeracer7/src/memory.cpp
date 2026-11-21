@@ -49,11 +49,13 @@ void sys_memory_allocate(Cpu& c) {
         c.r[3] = kEnomem;
         return;
     }
-    // First fit among the gaps, at the page's alignment.
+    // First fit among the gaps, at the page's alignment. (`at` can pass a block's start when it is rounded up to a
+    // larger page than that block's: such a block is no gap's end, and is stepped over. Leaving that out once gave
+    // two of the game's packs the same memory.)
     uint32_t at = kHeapStart;
     for (const auto& [address, length] : g_blocks) {
-        if (address - at >= size) break;
-        at = (address + length + page - 1) & ~(page - 1);
+        if (address >= at && address - at >= size) break;
+        at = std::max(at, (address + length + page - 1) & ~(page - 1));
     }
     if (at >= kHeapEnd || size > kHeapEnd - at) {
         c.r[3] = kEnomem;

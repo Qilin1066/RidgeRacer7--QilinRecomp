@@ -41,6 +41,7 @@ std::span<const NativeImport> pad_imports();      // pad.cpp
 std::span<const NativeImport> usbd_imports();     // usbd.cpp
 std::span<const NativeImport> mempool_imports();  // mempool.cpp
 std::span<const NativeImport> gcm_imports();      // gcm.cpp
+std::span<const NativeImport> rtc_imports();  // rtc.cpp
 std::span<const NativeImport> spu_imports();      // spu.cpp
 std::span<const NativeImport> audio_imports();  // audio.cpp
 std::span<const NativeImport> np_imports();  // np.cpp
@@ -120,6 +121,9 @@ void system_event(uint64_t status, uint64_t parameter);
 // Where the game's sound goes (audio.cpp): called from the mixer's thread with 256 left-right pairs of 16-bit
 // samples at 48 kHz, 187.5 times a second. Set before run().
 void set_audio_sink(std::function<void(const int16_t* left_right, size_t frames)> sink);
+// The console's time zone and summer time, in minutes (sysutil.cpp's settings).
+int32_t console_time_zone_minutes();
+int32_t console_summer_time_minutes();
 // The program's thread-local image: each thread gets a copy.
 struct TlsImage {
     uint32_t address = 0, file_size = 0, memory_size = 0;

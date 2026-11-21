@@ -138,7 +138,8 @@ public:
                 out.why_at = a;
                 return out;
             }
-            if (f_.keep_pc && (line.find("read") != std::string::npos || line.find("write") != std::string::npos)) body += std::format("    c.pc = 0x{:08X}u;\n", a);
+            if (f_.keep_pc && (line.find("read") != std::string::npos || line.find("write") != std::string::npos))
+                body += std::format("    c.pc = 0x{:08X}u;{}\n", a, f_.keep_registers ? " " + sync_out() : std::string());
             body += line;
             const bool last = k + 1 == f_.insns.size();
             const uint32_t next = last ? 0 : f_.insns[k + 1].first;

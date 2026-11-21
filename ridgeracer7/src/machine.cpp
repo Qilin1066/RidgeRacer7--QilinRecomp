@@ -46,6 +46,10 @@ struct Machine {
 Machine* g_machine = nullptr;
 // A development aid: with RR7_ERRORS in the environment, every error code the system hands the game is logged (a game may ignore one).
 bool g_log_errors = false;
+// Another: with RR7_CALLS=<a thread's id in hex, or "all">, every call that thread makes to the system is logged with its first arguments and its result.
+uint32_t g_trace_thread = 0;
+bool g_trace_all = false;
+bool traced() { return g_trace_all || (g_trace_thread && current_thread() == g_trace_thread); }
 
 qilin::rt::GuestFn find_function(uint32_t address) {
     const auto& functions = g_machine->functions;
@@ -62,8 +66,13 @@ void on_call(Cpu& c, uint32_t target) {
             fatal("the game called %s (%s, id %08x), which this runtime doesn't provide yet; it would return to %08x", import.name.empty() ? "a function with no name" : import.name.c_str(),
                   import.library.c_str(), import.id, static_cast<uint32_t>(c.lr));
         thread_enters(import.name.c_str(), 0, static_cast<uint32_t>(c.lr));
+        const bool trace = traced();
+        const uint64_t a0 = c.r[3], a1 = c.r[4], a2 = c.r[5], a3 = c.r[6];
         import.handler(c);
         thread_leaves();
+        if (trace)
+            log("(calls) %08x %s(%llx, %llx, %llx, %llx) = %llx, to %08x", current_thread(), import.name.c_str(), static_cast<unsigned long long>(a0), static_cast<unsigned long long>(a1),
+                static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3), static_cast<unsigned long long>(c.r[3]), static_cast<uint32_t>(c.lr));
         if (g_log_errors && (c.r[3] >> 16) == 0x8001u) log("(errors) %s returned %08x to %08x", import.name.c_str(), static_cast<uint32_t>(c.r[3]), static_cast<uint32_t>(c.lr));
         return;
     }
@@ -83,8 +92,15 @@ void on_system_call(Cpu& c, uint32_t pc) {
     const uint32_t number = static_cast<uint32_t>(c.r[11]);
     if (const auto handler = find_native_system_call(number)) {
         thread_enters("a system call", number, pc);
+        const bool trace = traced();
+        const uint64_t a0 = c.r[3], a1 = c.r[4], a2 = c.r[5], a3 = c.r[6];
         handler(c);
         thread_leaves();
+        if (trace) {
+            const qilin::SystemCallName* called = qilin::system_call_name(number);
+            log("(calls) %08x %s(%llx, %llx, %llx, %llx) = %llx, at %08x", current_thread(), called ? std::string(called->name).c_str() : "?", static_cast<unsigned long long>(a0),
+                static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3), static_cast<unsigned long long>(c.r[3]), pc);
+        }
         if (g_log_errors && (c.r[3] >> 16) == 0x8001u) log("(errors) system call %u at %08x returned %08x", number, pc, static_cast<uint32_t>(c.r[3]));
         return;
     }
@@ -239,6 +255,10 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
     }
     start_watch();
     g_log_errors = std::getenv("RR7_ERRORS") != nullptr;
+    if (const char* const who = std::getenv("RR7_CALLS")) {
+        g_trace_all = std::string(who) == "all";
+        if (!g_trace_all) g_trace_thread = static_cast<uint32_t>(std::strtoul(who, nullptr, 16));
+    }
     set_current_cpu(&cpu);
     const qilin::rt::GuestFn entry = find_function(elf.entry_code());
     if (!entry) fatal("the program's entry point %08x is not among the lifted functions", elf.entry_code());

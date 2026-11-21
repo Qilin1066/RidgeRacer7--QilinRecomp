@@ -4,6 +4,20 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-21
+
+The game runs to graphics initialisation.
+
+### Added
+- The first layer of the system, each function added when the game reached it (`docs/runtime.md`): thread-local storage; lightweight mutexes, mutexes, condition variables and semaphores; threads (create, exit, join, detach, priorities); event queues and ports; timers; memory in pages; memory pools; the clock and sleeping; the console's terminal; the console's settings and the disc's description; controllers and USB as a console with nothing plugged in. 40 of the 248 imports, 39 of the 78 system calls.
+- What the game prints to the console's terminal appears in the log.
+
+### Checked
+- On the owner's PC: the game runs its start-up, loads its system modules, starts its force-feedback library (which prints its version), creates its event queues, timers and threads, and stops at `_cellGcmInitBody`: it wants the RSX.
+
+### Not as designed yet
+- The scheduler: guest threads run freely as host threads, and priorities decide nothing.
+
 ## [0.11.0] - 2026-11-21
 
 The game's first instructions run.

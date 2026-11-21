@@ -5,6 +5,11 @@
 
 namespace rr7 {
 
-std::span<const NativeSystemCall> native_system_calls() { return {}; }
+void (*find_native_system_call(uint32_t number))(Cpu&) {
+    for (const std::span<const NativeSystemCall> table : {memory_system_calls(), thread_system_calls(), sync_system_calls(), tty_system_calls(), event_system_calls(), timer_system_calls()})
+        for (const NativeSystemCall& call : table)
+            if (call.number == number) return call.handler;
+    return nullptr;
+}
 
 }  // namespace rr7

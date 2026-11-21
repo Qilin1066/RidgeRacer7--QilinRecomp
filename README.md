@@ -8,7 +8,7 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 
 ## Status
 
-**Early. The game's code is lifted to C++ and its first instructions run natively; it stops, by name, at the first system function the runtime doesn't provide yet. Nothing is on screen.**
+**Early. The game's code is lifted to C++ and runs natively through its start-up as far as graphics initialisation, where it stops, by name, at the first system function the runtime doesn't provide yet. Nothing is on screen.**
 
 | Piece | State |
 |---|---|
@@ -24,7 +24,7 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 | SPU control-flow pass (`docs/recompiler-core.md`) | ✅ on the game's 42 SPU programs: 2,332 functions, every one of 209,492 words accounted for |
 | PPU lifter: integers, loads and stores, branches, calls, switches, floating point bit-exact, VMX (`docs/recompiler-core.md`) | 🔨 14,196 of the game's 14,294 functions lift (96% of its instructions); identical to a separately written, integer-only reference over 1.3 million runs of the differential test, in CI |
 | The rest of the PPU lifter (the VMX estimates, exception landing pads); the SPU lifter | later |
-| Runtime skeleton (`docs/runtime.md`): the program loaded at its addresses, the first thread, imports and system calls replaced by name and number, anything missing stops the game naming it | 🔨 the game builds from the owner's copy and runs its start-up code; 1 of 248 imports provided |
+| Runtime skeleton (`docs/runtime.md`): the program loaded at its addresses, the first thread, imports and system calls replaced by name and number, anything missing stops the game naming it | 🔨 the game builds from the owner's copy and runs through its start-up to graphics initialisation (`_cellGcmInitBody`); 40 of 248 imports and 39 of 78 system calls provided: threads, mutexes, semaphores, event queues, timers, memory, the terminal |
 | The system libraries and system calls themselves; the RSX's command stream on Vulkan 1.3; sound, controllers, saves, films | later |
 | The settings menu (F1), the same as the other Qilin recomps' | later, with the window |
 

@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "import_names.hpp"
+#include "kernel.hpp"
 #include "qilin/rt/memory.hpp"
 #include "qilin/rt/report.hpp"
 #include "syscall_names.hpp"
@@ -31,6 +33,8 @@ struct Machine {
     std::vector<Import> imports;
     std::chrono::steady_clock::time_point started;
     uint32_t next_allocation = kRuntimeArea;
+    GameInfo info;
+    TlsImage tls;
 };
 Machine* g_machine = nullptr;
 
@@ -39,12 +43,6 @@ qilin::rt::GuestFn find_function(uint32_t address) {
     const auto it = std::ranges::lower_bound(functions, address, {}, &qilin::rt::LiftedFunction::address);
     return it != functions.end() && it->address == address ? it->fn : nullptr;
 }
-
-constexpr uint64_t kFirstThreadId = 0x01000000;  // *a guess at the shape of a thread id; nothing has compared it yet*
-
-struct ProcessExit {
-    int code;
-};
 
 // ---- the hooks lifted code calls ----
 
@@ -57,7 +55,7 @@ void on_call(Cpu& c, uint32_t target) {
         import.handler(c);
         return;
     }
-    if (target == kReturnToHost) throw ProcessExit{static_cast<int>(c.r[3])};
+    if (target == kReturnToHost) fatal("a jump to the address a thread's first function returns to (LR %08x)", static_cast<uint32_t>(c.lr));
     const qilin::rt::GuestFn fn = find_function(target);
     if (!fn) fatal("a call through a register to %08x, which is not a function (it would return to %08x)", target, static_cast<uint32_t>(c.lr));
     fn(c);
@@ -65,11 +63,10 @@ void on_call(Cpu& c, uint32_t target) {
 
 void on_system_call(Cpu& c, uint32_t pc) {
     const uint32_t number = static_cast<uint32_t>(c.r[11]);
-    for (const NativeSystemCall& call : native_system_calls())
-        if (call.number == number) {
-            call.handler(c);
-            return;
-        }
+    if (const auto handler = find_native_system_call(number)) {
+        handler(c);
+        return;
+    }
     const qilin::SystemCallName* name = qilin::system_call_name(number);
     fatal("system call %u (%s) at %08x, which this runtime doesn't provide yet", number, name ? std::string(name->name).c_str() : "no name", pc);
 }
@@ -89,6 +86,28 @@ const qilin::rt::CpuHooks kHooks{on_call, on_system_call, on_trap, on_time_base}
 
 uint8_t* guest_memory() { return g_machine->space.base(); }
 
+const GameInfo& game() { return g_machine->info; }
+
+uint64_t system_time() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g_machine->started).count());
+}
+
+void exit_process(int code) {
+    log("the process ended with code %d", code);
+    // At once: other threads may be running, and the objects they use must not be torn down under them.
+    std::_Exit(code);
+}
+
+const qilin::rt::CpuHooks& guest_hooks() { return kHooks; }
+
+void call_guest(Cpu& c, uint32_t code) {
+    const qilin::rt::GuestFn fn = find_function(code);
+    if (!fn) fatal("%08x is to be run, and is not among the lifted functions", code);
+    fn(c);
+}
+
+TlsImage tls_image() { return g_machine->tls; }
+
 void commit(uint32_t address, uint32_t size) {
     if (!g_machine->space.commit(address, size)) fatal("the host refused %u bytes of memory for the guest at %08x", size, address);
 }
@@ -101,9 +120,10 @@ uint32_t allocate(uint32_t size, uint32_t alignment) {
     return at;
 }
 
-int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functions) {
+int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functions, GameInfo info) {
     Machine machine;
     g_machine = &machine;
+    machine.info = std::move(info);
     machine.functions = functions;
     machine.started = std::chrono::steady_clock::now();
     if (!machine.space.base()) fatal("the host refused the 4 GiB of address space the guest's memory needs");
@@ -120,15 +140,13 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
 
     // The imports: each slot is given a descriptor whose code address is the import's own, in a
     // range where nothing is, so that the call through it arrives at on_call.
-    const auto natives = native_imports();
     for (const qilin::ImportLibrary& library : elf.imports())
         for (const qilin::ImportFunction& f : library.functions) {
             Import import;
             import.library = library.name;
             import.id = f.id;
             import.name = std::string(qilin::import_name(library.name, f.id));
-            for (const NativeImport& native : natives)
-                if (import.library == native.library && import.name == native.name) import.handler = native.handler;
+            if (!import.name.empty()) import.handler = find_native_import(import.library, import.name);
             machine.imports.push_back(std::move(import));
         }
     commit(kImportDescriptors, static_cast<uint32_t>(8 * machine.imports.size()));
@@ -153,6 +171,8 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
     // The first thread: its stack, the table of contents, and a return address that ends the process.
     const uint32_t stack_size = elf.process_param() ? elf.process_param()->primary_stack_size : 0x10000u;
     commit(kStackTop - stack_size, stack_size);
+    set_current_thread(kFirstThreadId);
+    add_thread(kFirstThreadId, elf.process_param() ? elf.process_param()->primary_priority : 1001);
     cpu.r[1] = kStackTop - 0x80;
     cpu.r[2] = elf.entry_toc();
     cpu.lr = kReturnToHost;
@@ -169,6 +189,7 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
         cpu.r[5] = arguments + 8;
         cpu.r[7] = kFirstThreadId;
         if (const auto& tls = elf.tls()) {
+            machine.tls = {tls->address, tls->file_size, tls->memory_size};
             cpu.r[8] = tls->address;
             cpu.r[9] = tls->file_size;
             cpu.r[10] = tls->memory_size;
@@ -177,14 +198,9 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
     }
     const qilin::rt::GuestFn entry = find_function(elf.entry_code());
     if (!entry) fatal("the program's entry point %08x is not among the lifted functions", elf.entry_code());
-    try {
-        entry(cpu);
-    } catch (const ProcessExit& exit) {
-        log("the process ended with code %d", exit.code);
-        return exit.code;
-    }
-    log("the entry point returned %d", static_cast<int>(cpu.r[3]));
-    return static_cast<int>(cpu.r[3]);
+    entry(cpu);
+    log("the entry point returned");
+    exit_process(static_cast<int>(cpu.r[3]));
 }
 
 }  // namespace rr7

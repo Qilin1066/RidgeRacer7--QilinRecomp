@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(RidgeRacer7QilinRecomp VERSION 0.11.0 LANGUAGES CXX)
+project(RidgeRacer7QilinRecomp VERSION 0.12.0 LANGUAGES CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -131,9 +131,21 @@ set_tests_properties(qilin_usage PROPERTIES WILL_FAIL TRUE)
 # repository: `qilin lift <game> --out <folder>`, then configure with
 # -DQILIN_GEN_DIR=<folder> (tools/build-ridgeracer7.ps1 does both).
 add_library(ridgeracer7_machine STATIC
+    ridgeracer7/src/events.cpp
     ridgeracer7/src/imports.cpp
+    ridgeracer7/src/kernel.cpp
     ridgeracer7/src/machine.cpp
+    ridgeracer7/src/memory.cpp
+    ridgeracer7/src/mempool.cpp
+    ridgeracer7/src/pad.cpp
+    ridgeracer7/src/sync.cpp
+    ridgeracer7/src/sync_calls.cpp
     ridgeracer7/src/syscalls.cpp
+    ridgeracer7/src/sysutil.cpp
+    ridgeracer7/src/threads.cpp
+    ridgeracer7/src/timers.cpp
+    ridgeracer7/src/tty.cpp
+    ridgeracer7/src/usbd.cpp
 )
 target_include_directories(ridgeracer7_machine PUBLIC ridgeracer7/src)
 target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt PRIVATE qilin_warnings)

@@ -44,7 +44,8 @@ void fatal(const char* format, ...) {
     va_start(arguments, format);
     write_line("stopped: ", format, arguments);
     va_end(arguments);
-    std::exit(70);
+    // At once: other threads may be running, and the objects they use must not be torn down under them.
+    std::_Exit(70);
 }
 
 }  // namespace qilin::rt

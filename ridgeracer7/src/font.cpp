@@ -67,7 +67,6 @@ constexpr FontSet kFontSets[] = {
     {0x101, {"SCE-PS3-NR-R-JPN.TTF", "SCE-PS3-NR-R-EXT.TTF", nullptr}},
 };
 
-float float_at(uint32_t address) { return std::bit_cast<float>(load32(address)); }
 void store_float(uint32_t address, float value) { store32(address, std::bit_cast<uint32_t>(value)); }
 
 Font* font_of(uint32_t structure) {

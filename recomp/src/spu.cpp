@@ -117,7 +117,15 @@ Insn decode(uint32_t word, bool ignore_reserved) {
 std::string disasm(const Insn& in, uint32_t pc) {
     if (!in.valid()) return std::format(".long 0x{:x}", in.word);
     const Spec& s = spec(in.op);
-    const std::string name(s.name);
+    std::string name(s.name);
+    // objdump names bits 11, 12 and 13 of these forms in the mnemonic: "bid",
+    // "bie", "syncc", "hbrp". (Only some are defined for each instruction;
+    // the rest show when the caller asked to look past reserved bits.)
+    if (s.form == Form::sync || s.form == Form::branch_ra || s.form == Form::branch_rt_ra || s.form == Form::hint_ra) {
+        if (in.word & kC) name += s.form == Form::sync ? 'c' : 'p';
+        if (in.word & 0x00080000) name += 'd';
+        if (in.word & 0x00040000) name += 'e';
+    }
     const auto r = [](unsigned n) { return std::format("${}", n); };
     // objdump prints a zero displacement as "0", and any other as the address it reaches.
     const auto rel = [&] { return in.i16() == 0 ? std::string("0") : address(in.relative(pc)); };
@@ -125,7 +133,7 @@ std::string disasm(const Insn& in, uint32_t pc) {
     switch (s.form) {
     case Form::none: case Form::sync: return name;
     case Form::nop: case Form::rt1: return std::format("{} {}", name, r(in.rt()));
-    case Form::stop: return std::format("{} {}", name, in.u14());
+    case Form::stop: return name;  // objdump leaves the signal type out
     case Form::rr: return std::format("{} {},{},{}", name, r(in.rt()), r(in.ra()), r(in.rb()));
     case Form::rr2: return std::format("{} {},{}", name, r(in.rt()), r(in.ra()));
     case Form::ra1: case Form::branch_ra: return std::format("{} {}", name, r(in.ra()));

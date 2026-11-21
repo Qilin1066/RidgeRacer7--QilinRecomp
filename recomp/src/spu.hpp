@@ -249,7 +249,8 @@ std::span<const Spec> specs();
 Insn decode(uint32_t word, bool ignore_reserved = false);
 
 // Text of an instruction at address pc, as objdump prints it: "ai $1,$1,-32",
-// "lqd $3,16($1)", "brsl $0,0x3040"; an invalid word is ".long 0x...".
+// "lqd $3,16($1)", "brsl $0,0x3040", "bid $0" (a `bi` that disables
+// interrupts); an invalid word is ".long 0x...".
 std::string disasm(const Insn& insn, uint32_t pc);
 
 }  // namespace qilin::spu

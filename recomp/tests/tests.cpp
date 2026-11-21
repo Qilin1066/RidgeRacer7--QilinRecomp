@@ -154,7 +154,8 @@ void test_spu() {
     CHECK(spu_text(0x1cf80081) == "ai $1,$1,-32");
     CHECK(spu_text(0x34004080) == "lqd $0,16($1)");
     CHECK(spu_text(0x35000000) == "bi $0");
-    CHECK(spu_text(0x35080000) == "bi $0");                 // bid: interrupts disabled on the way
+    CHECK(spu_text(0x35080000) == "bid $0");                // interrupts disabled on the way
+    CHECK(spu_text(0x00500000) == "syncc" && !spu::decode(0x00480000).valid());  // sync has a C bit and no D
     CHECK(spu::decode(0x35080000).d() && !spu::decode(0x35080000).e());
     // Each length of opcode.
     CHECK(spu_text(0x18010183) == "a $3,$3,$4");            // 11 bits
@@ -177,8 +178,8 @@ void test_spu() {
     CHECK(spu_text(0x21a00e83) == "wrch $ch29,$3");
     CHECK(spu_text(0x00200000) == "lnop");
     CHECK(spu_text(0x40200000) == "nop $0");
-    CHECK(spu_text(0x00000000) == "stop 0");
-    CHECK(spu_text(0x00002000) == "stop 8192");
+    CHECK(spu_text(0x00000000) == "stop");
+    CHECK(spu_text(0x00002000) == "stop" && spu::decode(0x00002000).u14() == 0x2000);
     // Reserved bits set don't decode, unless asked to look past them.
     CHECK(!spu::decode(0x00200001).valid());                // lnop has no operands
     CHECK(!spu::decode(0x54a04183).valid());                // clz has no rb

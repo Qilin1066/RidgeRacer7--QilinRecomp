@@ -89,7 +89,49 @@ void sys_memory_get_user_memory_size(Cpu& c) {
     c.r[3] = kOk;
 }
 
+// Memory containers (system calls 341 and 342): a part of the process's memory set aside, which the
+// game then lends to one of the system's utilities (a save dialog, say) to do its work in. Setting it
+// aside takes it out of what sys_memory_allocate can give; nothing is committed for it until it is used.
+// (The game makes one of 3 MiB and passes its id on: read off the code around the call.)
+std::map<uint32_t, uint32_t> g_containers;  // id -> size
+uint32_t g_next_container = 0x3F000001u;
+
+// sys_memory_container_create(sys_memory_container_t* id, size)
+void sys_memory_container_create(Cpu& c) {
+    const uint32_t out = static_cast<uint32_t>(c.r[3]);
+    const uint64_t size = c.r[4] & ~uint64_t{0xfffff};  // whole megabytes
+    if (!out) {
+        c.r[3] = kEfault;
+        return;
+    }
+    const std::lock_guard lock(g_mutex);
+    if (size == 0 || size > kUserMemory - g_used) {
+        c.r[3] = kEnomem;
+        return;
+    }
+    g_used += static_cast<uint32_t>(size);
+    const uint32_t id = g_next_container++;
+    g_containers.emplace(id, static_cast<uint32_t>(size));
+    store32(out, id);
+    c.r[3] = kOk;
+}
+
+// sys_memory_container_destroy(id)
+void sys_memory_container_destroy(Cpu& c) {
+    const std::lock_guard lock(g_mutex);
+    const auto it = g_containers.find(static_cast<uint32_t>(c.r[3]));
+    if (it == g_containers.end()) {
+        c.r[3] = kEsrch;
+        return;
+    }
+    g_used -= it->second;
+    g_containers.erase(it);
+    c.r[3] = kOk;
+}
+
 constexpr NativeSystemCall kCalls[] = {
+    {341, sys_memory_container_create},
+    {342, sys_memory_container_destroy},
     {348, sys_memory_allocate},
     {349, sys_memory_free},
     {352, sys_memory_get_user_memory_size},

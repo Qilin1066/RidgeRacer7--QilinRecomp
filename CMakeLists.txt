@@ -218,6 +218,7 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/pad.cpp
     ridgeracer7/src/rsx.cpp
     ridgeracer7/src/spu.cpp
+    ridgeracer7/src/spurs.cpp
     ridgeracer7/src/sync.cpp
     ridgeracer7/src/sync_calls.cpp
     ridgeracer7/src/syscalls.cpp

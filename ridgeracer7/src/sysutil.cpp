@@ -6,6 +6,9 @@
 // number, so that none is answered blindly.
 #include <algorithm>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <utility>
 
 #include "kernel.hpp"
 #include "qilin/rt/report.hpp"
@@ -83,13 +86,80 @@ void cellDiscGameGetBootDiscInfo(Cpu& c) {
     c.r[3] = kOk;
 }
 
+// The system's events for a game (the player asks to quit, the system menu opens): the game registers up
+// to four functions, and calls cellSysutilCheckCallback every frame, which calls them for each event that
+// has happened since. Events are put here by the runtime (system_event); so far nothing sends one.
+struct Callback {
+    uint32_t function = 0, user = 0;
+};
+std::mutex g_callbacks_mutex;
+Callback g_callbacks[4];
+std::deque<std::pair<uint64_t, uint64_t>> g_events;  // status, parameter
+
+// cellSysutilRegisterCallback(slot, function, user data), cellSysutilUnregisterCallback(slot)
+void cellSysutilRegisterCallback(Cpu& c) {
+    const uint32_t slot = static_cast<uint32_t>(c.r[3]);
+    if (slot > 3) {
+        c.r[3] = 0x8002b102u;  // CELL_SYSUTIL_ERROR_VALUE
+        return;
+    }
+    const std::lock_guard lock(g_callbacks_mutex);
+    g_callbacks[slot] = {static_cast<uint32_t>(c.r[4]), static_cast<uint32_t>(c.r[5])};
+    c.r[3] = kOk;
+}
+void cellSysutilUnregisterCallback(Cpu& c) {
+    const uint32_t slot = static_cast<uint32_t>(c.r[3]);
+    if (slot > 3) {
+        c.r[3] = 0x8002b102u;
+        return;
+    }
+    const std::lock_guard lock(g_callbacks_mutex);
+    g_callbacks[slot] = {};
+    c.r[3] = kOk;
+}
+
+// cellSysutilCheckCallback(): calls each registered function(status, parameter, user data) for each event waiting.
+void cellSysutilCheckCallback(Cpu& c) {
+    for (;;) {
+        std::pair<uint64_t, uint64_t> event;
+        Callback callbacks[4];
+        {
+            const std::lock_guard lock(g_callbacks_mutex);
+            if (g_events.empty()) break;
+            event = g_events.front();
+            g_events.pop_front();
+            for (uint32_t i = 0; i < 4; ++i) callbacks[i] = g_callbacks[i];
+        }
+        for (const Callback& callback : callbacks) {
+            if (!callback.function) continue;
+            const uint64_t toc = c.r[2], lr = c.lr;
+            c.r[3] = event.first;
+            c.r[4] = event.second;
+            c.r[5] = callback.user;
+            c.r[2] = load32(callback.function + 4);
+            c.hooks->call(c, load32(callback.function));
+            c.r[2] = toc;
+            c.lr = lr;
+        }
+    }
+    c.r[3] = kOk;
+}
+
 constexpr NativeImport kImports[] = {
+    {"cellSysutil", "cellSysutilRegisterCallback", cellSysutilRegisterCallback},
+    {"cellSysutil", "cellSysutilUnregisterCallback", cellSysutilUnregisterCallback},
+    {"cellSysutil", "cellSysutilCheckCallback", cellSysutilCheckCallback},
     {"cellSysutil", "cellDiscGameGetBootDiscInfo", cellDiscGameGetBootDiscInfo},
     {"cellSysutil", "cellSysutilGetSystemParamInt", cellSysutilGetSystemParamInt},
     {"cellSysutil", "cellSysutilGetSystemParamString", cellSysutilGetSystemParamString},
 };
 
 }  // namespace
+
+void system_event(uint64_t status, uint64_t parameter) {
+    const std::lock_guard lock(g_callbacks_mutex);
+    g_events.emplace_back(status, parameter);
+}
 
 std::span<const NativeImport> sysutil_imports() { return kImports; }
 

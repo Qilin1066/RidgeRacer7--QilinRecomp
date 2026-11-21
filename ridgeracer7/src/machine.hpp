@@ -40,6 +40,7 @@ std::span<const NativeImport> pad_imports();      // pad.cpp
 std::span<const NativeImport> usbd_imports();     // usbd.cpp
 std::span<const NativeImport> mempool_imports();  // mempool.cpp
 std::span<const NativeImport> gcm_imports();      // gcm.cpp
+std::span<const NativeImport> spurs_imports();  // spurs.cpp
 std::span<const NativeImport> font_imports();  // font.cpp
 std::span<const NativeImport> video_imports();  // video.cpp
 
@@ -104,6 +105,8 @@ uint32_t native_function(void (*handler)(Cpu&));
 void become_guest_thread(Cpu& c, uint32_t stack_size, int32_t priority);
 // Calls the game's function behind a descriptor, with the arguments already in the registers.
 void call_descriptor(Cpu& c, uint32_t descriptor);
+// Tells the game of a system event at its next cellSysutilCheckCallback (sysutil.cpp): 0x0101 is "the player asks to quit".
+void system_event(uint64_t status, uint64_t parameter);
 // The program's thread-local image: each thread gets a copy.
 struct TlsImage {
     uint32_t address = 0, file_size = 0, memory_size = 0;

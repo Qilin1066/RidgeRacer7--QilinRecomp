@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(RidgeRacer7QilinRecomp VERSION 0.10.0 LANGUAGES CXX)
+project(RidgeRacer7QilinRecomp VERSION 0.11.0 LANGUAGES CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -101,6 +101,7 @@ qilin_tool(qilin_recomp)
 # ---- The runtime: what lifted code compiles against (no std::format) ----
 add_library(qilin_rt STATIC
     runtime/src/memory.cpp
+    runtime/src/report.cpp
 )
 target_include_directories(qilin_rt PUBLIC runtime/include)
 target_link_libraries(qilin_rt PRIVATE qilin_warnings)
@@ -122,6 +123,37 @@ add_test(NAME qilin_missing_file COMMAND qilin info no-such-folder)
 set_tests_properties(qilin_missing_file PROPERTIES WILL_FAIL TRUE)
 add_test(NAME qilin_usage COMMAND qilin)
 set_tests_properties(qilin_usage PROPERTIES WILL_FAIL TRUE)
+
+# ---- The game ----
+# Its machine (memory, the first thread, the boundary with the system) is
+# built always, so that CI compiles it. The executable itself needs the lifted
+# code, which is made from the player's own copy and is never in the
+# repository: `qilin lift <game> --out <folder>`, then configure with
+# -DQILIN_GEN_DIR=<folder> (tools/build-ridgeracer7.ps1 does both).
+add_library(ridgeracer7_machine STATIC
+    ridgeracer7/src/imports.cpp
+    ridgeracer7/src/machine.cpp
+    ridgeracer7/src/syscalls.cpp
+)
+target_include_directories(ridgeracer7_machine PUBLIC ridgeracer7/src)
+target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt PRIVATE qilin_warnings)
+set(QILIN_GEN_DIR "" CACHE PATH "The folder `qilin lift <game> --out` wrote: the lifted code of your own copy")
+if(QILIN_GEN_DIR)
+    if(NOT EXISTS "${QILIN_GEN_DIR}/table.cpp")
+        message(FATAL_ERROR "QILIN_GEN_DIR (${QILIN_GEN_DIR}) holds no lifted code: run `qilin lift <game> --out ${QILIN_GEN_DIR}` first")
+    endif()
+    file(GLOB qilin_lifted CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")
+    add_executable(ridgeracer7 ridgeracer7/src/main.cpp ${qilin_lifted})
+    target_include_directories(ridgeracer7 PRIVATE "${QILIN_GEN_DIR}")
+    target_link_libraries(ridgeracer7 PRIVATE ridgeracer7_machine qilin_warnings)
+    # Lifted code is generated: its unused labels and the like are not warnings worth reading.
+    if(MSVC)
+        set_source_files_properties(${qilin_lifted} PROPERTIES COMPILE_OPTIONS "/w;/bigobj")
+        target_compile_options(ridgeracer7 PRIVATE /MP)  # the lifted files side by side
+    else()
+        set_source_files_properties(${qilin_lifted} PROPERTIES COMPILE_OPTIONS "-w")
+    endif()
+endif()
 
 # ---- The differential test of the lifter ----
 # qilin_difftest_gen lifts random encodings of every instruction in the

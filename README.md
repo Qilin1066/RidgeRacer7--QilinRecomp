@@ -8,7 +8,7 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 
 ## Status
 
-**Early: the tools that read the game, and the first part of the recompiler. Nothing runs yet.**
+**Early. The game's code is lifted to C++ and its first instructions run natively; it stops, by name, at the first system function the runtime doesn't provide yet. Nothing is on screen.**
 
 | Piece | State |
 |---|---|
@@ -24,7 +24,8 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 | SPU control-flow pass (`docs/recompiler-core.md`) | ✅ on the game's 42 SPU programs: 2,332 functions, every one of 209,492 words accounted for |
 | PPU lifter: integers, loads and stores, branches, calls, switches, floating point bit-exact, VMX (`docs/recompiler-core.md`) | 🔨 14,196 of the game's 14,294 functions lift (96% of its instructions); identical to a separately written, integer-only reference over 1.3 million runs of the differential test, in CI |
 | The rest of the PPU lifter (the VMX estimates, exception landing pads); the SPU lifter | later |
-| Runtime: the system libraries and system calls replaced natively; the RSX's command stream on Vulkan 1.3; sound, controllers, saves, films | later |
+| Runtime skeleton (`docs/runtime.md`): the program loaded at its addresses, the first thread, imports and system calls replaced by name and number, anything missing stops the game naming it | 🔨 the game builds from the owner's copy and runs its start-up code; 1 of 248 imports provided |
+| The system libraries and system calls themselves; the RSX's command stream on Vulkan 1.3; sound, controllers, saves, films | later |
 | The settings menu (F1), the same as the other Qilin recomps' | later, with the window |
 
 `docs/roadmap-and-design-targets.md` has the plan and every design decision, with the open ones marked.
@@ -94,9 +95,10 @@ With only `EBOOT.BIN` there, `info` prints what its header leaves plain and then
 |---|---|
 | `recomp/src/` | `elf` (the PS3 program loader), `self` (`EBOOT.BIN`'s plain header), `sfo` (`PARAM.SFO`), `title` (finds the game's files; the known builds), `media` (the sound banks' and films' headers), `spu_image` (the SPU programs inside the program), `import_names` (the imported functions' names), `sha256`, `ppu` (the PPU decoder), `spu` (the SPU decoder), `spu_cfg` (the SPU control-flow pass), `cfg` (the control-flow pass), `lift` (the PPU lifter), `archive` (RR7.DAT's directory), `shaders` (the compiled Cg programs), `main` (the `qilin` CLI) |
 | `recomp/tests/` | Unit tests on a program, a SELF and a `PARAM.SFO` built in memory, so they need no game files; `difftest/`, the lifter against a reference interpreter |
-| `runtime/` | What lifted code compiles against: the CPU state and its helpers (`cpu.hpp`), the guest's address space (`memory`) |
-| `tools/` | `analyse-game.ps1`, behind `Analyse game.bat`; `check/verify_decoder.py` and `check/verify_spu_decoder.py` (the decoders against GNU objdump) |
-| `docs/` | Roadmap and design targets, the program's analysis, the data files, the recompiler's core, prior art, naming |
+| `runtime/` | What lifted code compiles against: the CPU state and its helpers (`cpu.hpp`, `fp.hpp`, `vmx.hpp`), the guest's address space (`memory`), messages and stopping (`report`) |
+| `ridgeracer7/src/` | The game's machine: memory, the first thread, the imports and system calls provided natively |
+| `tools/` | `build-ridgeracer7.ps1` (builds the game from your copy); `analyse-game.ps1`, behind `Analyse game.bat`; `check/verify_decoder.py` and `check/verify_spu_decoder.py` (the decoders against GNU objdump) |
+| `docs/` | Roadmap and design targets, the program's analysis, the data files, the recompiler's core, the runtime, prior art, naming |
 
 ## Licence
 

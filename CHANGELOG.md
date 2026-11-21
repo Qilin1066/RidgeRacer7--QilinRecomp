@@ -4,6 +4,21 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-21
+
+The game's first instructions run.
+
+### Added
+- The game's machine (`ridgeracer7/src/`): the program loaded at its linked addresses in a 4 GiB guest address space, the first thread with the registers the system hands a process, calls through a register dispatched to the lifted functions, and the boundary with the system: every import and system call arrives by name or number, is run if the runtime provides it, and otherwise **stops the game with a line naming it and its caller**.
+- `ridgeracer7`, the game's executable, built from the player's own copy: `qilin lift --out` now also writes a table of every function and, for the functions not lifted yet, ones that stop the game if called. It checks at start-up that the program it is given is the one it was built from.
+- `tools/build-ridgeracer7.ps1`: lifts your copy and builds the game in one go. `qilin lift` rewrites only files that changed.
+- The runtime's messages and its way of stopping (`rt::log`, `rt::fatal`).
+- The first import provided natively: `sys_initialize_tls`.
+- `docs/runtime.md`; the planned shape of exception landing pads, in the roadmap.
+
+### Checked
+- On the owner's PC: the game builds (14,294 functions, a 40 MB executable), loads, runs its entry point and start-up code natively, and stops at `sys_lwmutex_create`, the first system function not provided.
+
 ## [0.10.0] - 2026-11-21
 
 The lifter's third slice: VMX.

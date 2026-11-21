@@ -806,8 +806,9 @@ int cmd_lift(const Args& a) {
     std::vector<Reason> reasons;
     size_t lifted = 0, words = 0, lifted_words = 0;
     std::vector<std::string> code;
-    std::string declarations;
+    std::string declarations, stubs, table;
     for (const auto& [start, f] : cfg->functions()) {
+        if (a.out) table += std::format("    {{0x{:08X}u, &{}}},\n", start, fn_name(start));
         words += f.words;
         const Lifted l = lift(lift_input(*cfg, f));
         if (l.ok) {
@@ -819,7 +820,12 @@ int cmd_lift(const Args& a) {
             }
             continue;
         }
-        if (a.out) declarations += std::format("void {}(Cpu& c);  // not lifted: {} at {:08X}\n", fn_name(start), l.why, l.why_at);
+        if (a.out) {
+            // Not lifted: a function that stops the game, saying why, if it is ever called.
+            declarations += std::format("void {}(Cpu& c);  // not lifted: {} at {:08X}\n", fn_name(start), l.why, l.why_at);
+            stubs += std::format("void {}(Cpu& c) {{ c.hooks->trap(c, 0x{:08X}u, \"this function is not lifted yet: {} at {:08X}\"); }}\n", fn_name(start),
+                                 start, l.why, l.why_at);
+        }
         auto it = std::ranges::find(reasons, l.why, &Reason::why);
         // Reasons that name an address are one reason.
         if (it == reasons.end()) it = reasons.insert(reasons.end(), Reason{l.why, 0, l.why_at});
@@ -834,11 +840,15 @@ int cmd_lift(const Args& a) {
         const fs::path folder = *a.out;
         std::error_code ec;
         fs::create_directories(folder, ec);
+        // A file that already says the same is left alone, so that a build compiles only what changed.
+        size_t rewritten = 0;
         const auto write = [&](const fs::path& path, const std::string& text) {
+            if (const auto old = read_file(path); old && std::string_view(reinterpret_cast<const char*>(old->data()), old->size()) == text) return;
             std::ofstream f(path, std::ios::binary);
             f << text;
             f.close();
             if (!f) throw Failure{std::format("cannot write {}", path.string())};
+            ++rewritten;
         };
         write(folder / "functions.hpp", "// Lifted from the game's program by qilin: do not share.\n#pragma once\n#include <bit>\n#include <cstdint>\n"
                                         "#include \"qilin/rt/cpu.hpp\"\nusing namespace qilin::rt;\n" + declarations);
@@ -848,7 +858,15 @@ int cmd_lift(const Args& a) {
             for (size_t k = i; k < code.size() && k < i + 256; ++k) text += "\n" + code[k];
             write(folder / std::format("lifted_{:03}.cpp", files++), text);
         }
-        std::println("{} functions written to {} in {} files", code.size(), folder.string(), files);
+        write(folder / "stubs.cpp", "// The functions qilin doesn't lift yet: each stops the game if called.\n#include \"functions.hpp\"\n\n" + stubs);
+        // Every function by address, in order, and which program they were lifted from.
+        write(folder / "table.cpp", std::format("// Lifted from the game's program by qilin: do not share.\n#include \"functions.hpp\"\n#include \"qilin/rt/lifted.hpp\"\n\n"
+                                                "namespace qilin::rt {{\nconst LiftedFunction kLiftedFunctions[] = {{\n{}}};\n"
+                                                "const size_t kLiftedFunctionCount = {};\nconst char kLiftedFrom[] = \"{}\";\n}}  // namespace qilin::rt\n",
+                                                table, cfg->functions().size(), elf.sha256()));
+        std::println("{} functions written to {} in {} files, with {} that stop if called, and the table of all {}", code.size(), folder.string(), files,
+                     cfg->functions().size() - code.size(), cfg->functions().size());
+        std::println("{} files were new or changed", rewritten);
     }
     return 0;
 }

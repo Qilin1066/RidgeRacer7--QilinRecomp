@@ -93,6 +93,7 @@ add_library(qilin_recomp STATIC
     recomp/src/shaders.cpp
     recomp/src/spu.cpp
     recomp/src/spu_cfg.cpp
+    recomp/src/spu_lift.cpp
 )
 target_include_directories(qilin_recomp PUBLIC recomp/src)
 target_link_libraries(qilin_recomp PUBLIC qilin_game PRIVATE qilin_warnings)
@@ -285,3 +286,26 @@ else()
     set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/difftest_cases.cpp PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 add_test(NAME qilin_difftest COMMAND qilin_difftest)
+
+# The same for the SPU lifter (recomp/tests/spu_difftest): single instructions against its own reference.
+add_executable(qilin_spu_difftest_gen recomp/tests/spu_difftest/gen.cpp)
+target_link_libraries(qilin_spu_difftest_gen PRIVATE qilin_recomp qilin_rt qilin_warnings)
+qilin_tool(qilin_spu_difftest_gen)
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/spu_difftest_cases.cpp
+    COMMAND qilin_spu_difftest_gen ${CMAKE_CURRENT_BINARY_DIR}/spu_difftest_cases.cpp
+    DEPENDS qilin_spu_difftest_gen
+    VERBATIM)
+add_executable(qilin_spu_difftest
+    recomp/tests/spu_difftest/run.cpp
+    recomp/tests/spu_difftest/ref.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/spu_difftest_cases.cpp)
+target_include_directories(qilin_spu_difftest PRIVATE recomp/tests/spu_difftest)
+target_link_libraries(qilin_spu_difftest PRIVATE qilin_recomp qilin_rt qilin_warnings)
+qilin_tool(qilin_spu_difftest)
+if(MSVC)
+    set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/spu_difftest_cases.cpp PROPERTIES COMPILE_OPTIONS "/w")
+else()
+    set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/spu_difftest_cases.cpp PROPERTIES COMPILE_OPTIONS "-w")
+endif()
+add_test(NAME qilin_spu_difftest COMMAND qilin_spu_difftest)

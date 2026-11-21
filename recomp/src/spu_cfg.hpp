@@ -80,6 +80,9 @@ public:
     // Channels read and written, with how often.
     const std::map<unsigned, unsigned>& channels_read() const { return read_; }
     const std::map<unsigned, unsigned>& channels_written() const { return written_; }
+    // For the lifter: whether a word was reached as an instruction, and the instruction there.
+    bool is_code(uint32_t a) const { return in_code(a) && kind_[(a - lo_) / 4] == 1; }
+    spu::Insn at(uint32_t a) const { return insn(a); }
     uint32_t lo() const { return lo_; }
     uint32_t hi() const { return hi_; }
 

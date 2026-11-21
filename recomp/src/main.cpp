@@ -54,6 +54,7 @@
 #include "sfo.hpp"
 #include "spu.hpp"
 #include "spu_cfg.hpp"
+#include "spu_lift.hpp"
 #include "shaders.hpp"
 #include "spu_image.hpp"
 #include "title.hpp"
@@ -839,6 +840,49 @@ int cmd_lift(const Args& a) {
     std::println("not lifted, by the first instruction outside the slice:");
     for (size_t i = 0; i < reasons.size() && i < 40; ++i)
         std::println("  {:6}  {} (first at {:#x})", reasons[i].functions, reasons[i].why, reasons[i].first);
+    // The SPU programs, each lifted into a file of its own.
+    const auto images = find_spu_images(elf);
+    if (!images) throw Failure{images.error()};
+    std::vector<std::pair<std::string, std::string>> spu_files;  // name, text
+    std::string spu_table, spu_declarations;
+    {
+        std::vector<Reason> spu_reasons;
+        size_t spu_lifted = 0, spu_functions = 0, index = 0;
+        for (const SpuImage& image : *images) {
+            const auto program = SpuCfg::build(image, elf.bytes_at(image.address, image.size));
+            if (!program) throw Failure{program.error()};
+            const std::string space = std::format("spu_p{:02}", index++);
+            std::string own, definitions, cases;
+            for (const auto& [start, f] : program->functions()) {
+                ++spu_functions;
+                own += std::format("void {}(Spu& s);\n", spu_fn_name(start));
+                cases += std::format("    case 0x{:05X}u: {}(s); return;\n", start, spu_fn_name(start));
+                const SpuLifted l = spu_lift(*program, f);
+                if (l.ok) {
+                    ++spu_lifted;
+                    definitions += "\n" + l.code;
+                    continue;
+                }
+                definitions += std::format("\nvoid {}(Spu& s) {{ s.hooks->halt(s, 0x{:05X}u, \"this function is not lifted yet: {} at {:05X}\"); }}\n",
+                                           spu_fn_name(start), start, l.why, l.why_at);
+                auto it = std::ranges::find(spu_reasons, l.why, &Reason::why);
+                if (it == spu_reasons.end()) it = spu_reasons.insert(spu_reasons.end(), Reason{l.why, 0, l.why_at});
+                ++it->functions;
+            }
+            spu_files.emplace_back(space + ".cpp",
+                                   std::format("// Lifted from one of the game's SPU programs by qilin: do not share.\n#include \"qilin/rt/spu.hpp\"\nusing namespace qilin::rt;\n\n"
+                                               "namespace {} {{\n\nvoid call(Spu& s, uint32_t target, uint32_t pc);\n{}{}\n"
+                                               "// The function at an address the program worked out.\nvoid call(Spu& s, uint32_t target, uint32_t pc) {{\n    switch (target) {{\n{}"
+                                               "    default: s.hooks->halt(s, pc, \"a branch through a register to an address that is not a function\");\n    }}\n}}\n\n}}  // namespace {}\n",
+                                               space, own, definitions, cases, space));
+            spu_declarations += std::format("namespace {} {{ void call(Spu& s, uint32_t target, uint32_t pc); }}\n", space);
+            spu_table += std::format("    {{0x{:08X}u, 0x{:X}u, 0x{:05X}u, &{}::call}},\n", image.address, image.size, image.entry, space);
+        }
+        std::ranges::sort(spu_reasons, [](const Reason& x, const Reason& y) { return x.functions > y.functions; });
+        std::println("SPU: {} of {} functions lifted, in {} programs", spu_lifted, spu_functions, images->size());
+        for (size_t i = 0; i < spu_reasons.size() && i < 40; ++i)
+            std::println("  {:6}  {} (first at {:#x})", spu_reasons[i].functions, spu_reasons[i].why, spu_reasons[i].first);
+    }
     if (a.out) {
         const fs::path folder = *a.out;
         std::error_code ec;
@@ -867,6 +911,11 @@ int cmd_lift(const Args& a) {
                                                 "namespace qilin::rt {{\nconst LiftedFunction kLiftedFunctions[] = {{\n{}}};\n"
                                                 "const size_t kLiftedFunctionCount = {};\nconst char kLiftedFrom[] = \"{}\";\n}}  // namespace qilin::rt\n",
                                                 table, cfg->functions().size(), elf.sha256()));
+        for (const auto& [name, text] : spu_files) write(folder / name, text);
+        write(folder / "spu_table.cpp", std::format("// Lifted from the game's program by qilin: do not share.\n#include \"qilin/rt/lifted.hpp\"\nusing namespace qilin::rt;\n\n{}\n"
+                                                    "namespace qilin::rt {{\nconst LiftedSpuProgram kLiftedSpuPrograms[] = {{\n{}}};\n"
+                                                    "const size_t kLiftedSpuProgramCount = {};\n}}  // namespace qilin::rt\n",
+                                                    spu_declarations, spu_table, images->size()));
         std::println("{} functions written to {} in {} files, with {} that stop if called, and the table of all {}", code.size(), folder.string(), files,
                      cfg->functions().size() - code.size(), cfg->functions().size());
         std::println("{} files were new or changed", rewritten);

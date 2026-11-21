@@ -23,7 +23,8 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 | SPU decoder: 199 instructions (`docs/recompiler-core.md`) | ✅ identical to objdump (binutils 2.31.1, built by CI) over a 1.66-million-word sweep; on the game's 42 SPU programs all but a four-word jump table decode |
 | SPU control-flow pass (`docs/recompiler-core.md`) | ✅ on the game's 42 SPU programs: 2,332 functions, every one of 209,492 words accounted for |
 | PPU lifter: integers, loads and stores, branches, calls, switches, floating point bit-exact, VMX (`docs/recompiler-core.md`) | 🔨 14,292 of the game's 14,294 functions lift (all but 21 of its 1,059,387 instructions); identical to a separately written, integer-only reference over 1.3 million runs of the differential test, in CI |
-| The rest of the PPU lifter (the two FPSCR functions, exception landing pads); the SPU lifter | later |
+| SPU lifter (`docs/recompiler-core.md`): everything but floating point | 🔨 1,719 of the 42 programs' 2,332 functions lift; identical to a separately written reference over 227,328 runs of its own differential test, in CI |
+| The rest of the PPU lifter (the two FPSCR functions, exception landing pads); the SPU's floating point | later |
 | Runtime skeleton (`docs/runtime.md`): the program loaded at its addresses, the first thread, imports and system calls replaced by name and number, anything missing stops the game naming it | 🔨 the game builds from the owner's copy and runs through its start-up, the RSX's set-up and its first commands, and its font, to the start of SPURS (`cellSpursInitialize`); 67 of 248 imports and 40 of 78 system calls provided |
 | The host layer (`host/`): window and input on SDL3, Vulkan 1.3 through volk, presentation, frame times: the other Qilin recomps' | ✅ built and tested; the game doesn't draw into it yet |
 | The system libraries and system calls themselves; the RSX's command stream on Vulkan 1.3; sound, controllers, saves, films | later |

@@ -11,6 +11,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The system's event callbacks, memory containers (system calls 341, 342), the sound output's description (stereo linear PCM at 48 kHz), and the network and PlayStation Network libraries as a console with no cable and not signed in.
 
 - The sound ports (`cellAudio`), mixed by the host's clock and played through `host/`'s sound output.
+- The SPU lifter's first slice: everything but floating point (`docs/recompiler-core.md`). 1,719 of the 42 programs' 2,332 functions lift; `qilin lift --out` writes each program's code beside the PPU's. Its own differential test (`qilin_spu_difftest`: 3,552 cases, 227,328 runs against a separately written reference) is in `ctest`.
 
 ### Checked
 - On the owner's PC: the game runs on to `sys_spu_thread_group_create` (its sound core, an SPU program), with 103 of its 248 imports and 42 of its 78 system calls provided.

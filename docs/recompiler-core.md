@@ -242,3 +242,19 @@ The reference shares the lifter's author and the choices above for undefined res
 2. ✅ The control-flow pass (v0.4.0, above). Next for it: its output as JSON, and the lifter that reads it.
 3. ✅ The SPU decoder (v0.6.0) and control-flow pass (v0.7.0).
 4. 🔨 The PPU lifter: integers and control flow (v0.8.0), floating point and the time base (v0.9.0), VMX (v0.10.0). The VMX estimates (v0.13.0: the correctly rounded values, a stated choice). Left: the FPSCR, landing pads as entries. Then the SPU lifter.
+
+## The SPU lifter (`recomp/src/spu_lift.*`, `runtime/include/qilin/rt/spu.hpp`)
+
+Started after v0.13.0, when the game reached the first thing that needs an SPU program running (its sound core, started as an SPU thread).
+
+**The shape** is the PPU lifter's, and simpler: an SPU has no condition register and no table of contents. A lifted function is `void fn_XXXXX(Spu& s)`; each instruction is one call of a helper in `spu.hpp`, written from the SPU's published instruction set. Each of the 42 programs is lifted into a file and a namespace of its own (`spu_p00` to `spu_p41`: they all sit at the same addresses), with a `call(s, target, pc)` that is a switch over the program's function starts, for branches through a register. `qilin lift <game> --out` writes them beside the PPU's files, with a table (`kLiftedSpuPrograms`: where each program's ELF lies in the PPU program's memory, which is how the game names it to the system; its entry point; its `call`).
+
+- A register is four words, the preferred slot first; the local store is 256 KiB in the SPU's byte order, and a quadword's address is masked into it at a multiple of 16, as the SPU does.
+- **Registers are read and written in the `Spu` itself**, not held in locals as the PPU's are: 128 registers of 16 bytes would cost more to copy in and out around every call than locals would save. *To be measured.*
+- Calls are `brsl` (the callee is called; `$0` gets the return address, as the program expects to find it), returns `bi $0`. `biz`, `binz` and the halfword forms through `$0` are conditional returns. A branch to another function's start is a tail call. A function that reaches its end without a return runs into the next one (281 do). The one switch is a `switch` over its table's targets.
+- Channels and `stop` go to hooks (`SpuHooks`), which the runtime provides; a halt instruction that fires, or a branch to an address that is no function, is the hook `halt`, which doesn't return.
+- Outside the slice, by name: floating point (the next slice), interrupts (`iret`, `bisled`, and indirect branches that enable or disable them: the game has none), the special-purpose registers.
+
+**Slice 1: everything but floating point. 1,719 of the 2,332 functions lift.** Every one of the other 613 is stopped by a floating-point instruction (`fm` in 225, `fcgt` in 143, `fs` in 101, ...): nothing else is in the way.
+
+**The differential test** (`recomp/tests/spu_difftest`, `qilin_spu_difftest` in `ctest`) is the PPU test's twin: the generator lifts random encodings of every instruction in the slice that is not a branch (148 instructions, 3,552 cases), the runner runs each from 64 states (227,328 runs) as lifted code and by a separately written reference, and compares all 128 registers, the whole local store after a store, what was written to a channel, a stop's code and whether a halt fired. The reference (`ref.cpp`) is in another shape on purpose: a register is sixteen bytes, elements are read and written by width and number, and the whole-register shifts work on the register as one 128-bit number, where the helpers work on words and bytes. **All agree**; with `sumb`'s halves exchanged and `rotqmby`'s count cut short on purpose it gave 7,908 disagreements. *Branches, calls and the switch need a program around them, and are not in this test: they are checked by the game's own programs running.*

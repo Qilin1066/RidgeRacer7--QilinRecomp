@@ -10,6 +10,7 @@
 //   qilin imports <game>                     every library imported and each function id taken from it
 //   qilin exports <game>                     what the program offers the system
 //   qilin sfo     <game>                     every entry of PARAM.SFO
+//   qilin data    <game>                     the game's own files, and the headers of its sound banks and films
 //   qilin insns   <game>                     every word of the program's code: address, word, instruction
 //   qilin profile <game>                     how often the code uses each instruction, and what doesn't decode
 //   qilin disasm  <file> [--base address]    a file of raw big-endian PPU words, as `insns` prints them
@@ -33,6 +34,7 @@
 
 #include "bytes.hpp"
 #include "elf.hpp"
+#include "media.hpp"
 #include "ppu.hpp"
 #include "self.hpp"
 #include "sfo.hpp"
@@ -59,6 +61,7 @@ int usage() {
                "  qilin imports <game>\n"
                "  qilin exports <game>\n"
                "  qilin sfo     <game>\n"
+               "  qilin data    <game>\n"
                "  qilin insns   <game>\n"
                "  qilin profile <game>\n"
                "  qilin disasm  <file of big-endian words> [--base address]\n"
@@ -441,6 +444,65 @@ int cmd_profile(const Args& a) {
     return 0;
 }
 
+// The game's own files (USRDIR): each one's size, and what the headers of the
+// sound banks and the films say.
+int cmd_data(const Args& a) {
+    const GameFiles files = files_of(a);
+    if (files.usrdir.empty()) throw Failure{std::format("{} is one file: give the disc's folder", a.input)};
+    std::vector<fs::path> paths;
+    for (const fs::directory_entry& e : fs::directory_iterator(files.usrdir))
+        if (e.is_regular_file()) paths.push_back(e.path());
+    std::ranges::sort(paths);
+    const auto lower = [](std::string s) {
+        for (char& c : s) c = static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+        return s;
+    };
+    for (const fs::path& path : paths) {
+        const std::string name = path.filename().string(), kind = lower(path.extension().string());
+        std::println("{:20} {:13} bytes", name, fs::file_size(path));
+        if (kind == ".nub") {
+            const auto bank = NubBank::load(path);
+            if (!bank) throw Failure{bank.error()};
+            std::println("  sound bank {:#x}: {} sounds, their data {:#x} bytes at {:#x}", bank->id, bank->sounds.size(), bank->data_size,
+                         bank->data_at);
+            // The sounds by format: how many, and how long they play in all.
+            struct Format {
+                NubCodec codec;
+                uint16_t channels;
+                uint32_t rate, bytes_per_second;
+                uint16_t block;
+                size_t count = 0;
+                uint64_t bytes = 0;
+            };
+            std::vector<Format> formats;
+            for (const NubSound& s : bank->sounds) {
+                auto it = std::ranges::find_if(formats, [&](const Format& f) {
+                    return f.codec == s.codec && f.channels == s.channels && f.rate == s.sample_rate &&
+                           f.bytes_per_second == s.bytes_per_second && f.block == s.block_align;
+                });
+                if (it == formats.end())
+                    it = formats.insert(formats.end(), Format{s.codec, s.channels, s.sample_rate, s.bytes_per_second, s.block_align});
+                ++it->count;
+                it->bytes += s.data_size;
+            }
+            for (const Format& f : formats)
+                std::println("  {:5} x {}, {} channels, {} Hz, {} bytes a second in blocks of {}: {:.0f} seconds in all", f.count,
+                             f.codec == NubCodec::atrac3plus ? "ATRAC3plus" : "16-bit big-endian PCM", f.channels, f.rate,
+                             f.bytes_per_second, f.block, static_cast<double>(f.bytes) / f.bytes_per_second);
+        } else if (kind == ".pam") {
+            const auto film = Pamf::load(path);
+            if (!film) throw Failure{film.error()};
+            std::println("  film (PAMF {}): {:.1f} seconds, at most {} bytes a second, the stream {:#x} bytes at {:#x}", film->version,
+                         film->seconds(), uint64_t{film->mux_rate} * 50, film->data_size, film->data_at);
+            for (const PamfStream& s : film->streams) {
+                if (s.video()) std::println("  stream {:#04x}: {}, {} x {}", s.stream_id, pamf_coding_name(s.coding), s.width, s.height);
+                else std::println("  stream {:#04x} {:#04x}: {}", s.stream_id, s.sub_id, pamf_coding_name(s.coding));
+            }
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -455,6 +517,7 @@ int main(int argc, char** argv) {
         if (a.command == "imports") return cmd_imports(a);
         if (a.command == "exports") return cmd_exports(a);
         if (a.command == "sfo") return cmd_sfo(a);
+        if (a.command == "data") return cmd_data(a);
         if (a.command == "insns") return cmd_insns(a);
         if (a.command == "profile") return cmd_profile(a);
         if (a.command == "disasm") return cmd_disasm(a);

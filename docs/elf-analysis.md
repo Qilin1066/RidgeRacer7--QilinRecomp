@@ -125,10 +125,10 @@ The compiler is GCC (the C++ runtime is `libstdc++`, and the program has `.eh_fr
 
 ### The disc's other files
 
-In `USRDIR`: `RR7.DAT` (5.23 GB: the game's own archive), `BGM.nub` (616 MB) and `Game_DJ.nub` (152 MB) (Namco's sound banks: music and the announcer), and seven `.pam` films (`intro`, `ending`, `menu`, `title`, `title2`, `auroravision`, `e3`; 1.19 GB together). *None of their formats has been examined.*
+In `USRDIR`: `RR7.DAT` (5.23 GB: the game's own archive), `BGM.nub` (616 MB) and `Game_DJ.nub` (152 MB) (Namco's sound banks: music and the announcer), and seven `.pam` films (`intro`, `ending`, `menu`, `title`, `title2`, `auroravision`, `e3`; 1.19 GB together). Their headers have been read since (v0.2.0): `data-files.md`.
 
 ## Next
 
 1. The owner decrypts `EBOOT.BIN` (above); `qilin info` on the result. Fix whatever the ELF loader gets wrong on the real file, record the hash, replace the inferred section names, and list the 22 libraries with every id taken from each.
 2. Names for the 248 ids (`prior-art.md`).
-3. The PPU decoder, and the SPU programs found and counted.
+3. ✅ The PPU decoder (v0.2.0, `recompiler-core.md`); its profile of the real code, and the SPU programs found and counted, wait for step 1.

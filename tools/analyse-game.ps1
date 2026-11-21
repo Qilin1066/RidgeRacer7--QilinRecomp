@@ -9,8 +9,9 @@
 # EBOOT.BIN or EBOOT.elf in its USRDIR. With no -Game it uses the one it used
 # last (build\game-path.txt), else asks with a folder picker. Everything it
 # writes goes to analysis-out\ (never committed): the disc's description,
-# what EBOOT.BIN's header leaves plain, and, once the decrypted program
-# (EBOOT.elf) is beside EBOOT.BIN, the program's summary and its imports.
+# what the headers of the sound banks and films say, what EBOOT.BIN's header
+# leaves plain, and, once the decrypted program (EBOOT.elf) is beside
+# EBOOT.BIN, the program's summary, its imports and its code's profile.
 #
 # Keep this file ASCII-only and Windows PowerShell 5.1-compatible.
 param(
@@ -102,11 +103,13 @@ if (-not $qilin) { throw "built, but qilin$exe isn't where it should be" }
 
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 Save-Output "The disc's description" $qilin @("sfo", $Game) (Join-Path $out "sfo.txt") -Show
+Save-Output "The game's files" $qilin @("data", $Game) (Join-Path $out "data.txt") -Show
 # With only EBOOT.BIN this prints what its header leaves plain, then stops and
 # says how to make the decrypted program.
 Save-Output "The program" $qilin @("info", $Game, "--json", (Join-Path $out "info.json")) (Join-Path $out "info.txt") -Show
 Save-Output "Its imports" $qilin @("imports", $Game) (Join-Path $out "imports.txt")
 Save-Output "Its exports" $qilin @("exports", $Game) (Join-Path $out "exports.txt")
+Save-Output "Its code's profile" $qilin @("profile", $Game) (Join-Path $out "profile.txt")
 
 Write-Host ""
 Write-Host "Done. The results are in $out" -ForegroundColor Green

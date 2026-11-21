@@ -1,5 +1,6 @@
 // Unit tests: no game files needed. Run by ctest.
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <print>
@@ -9,6 +10,7 @@
 
 #include "elf.hpp"
 #include "elf_builder.hpp"
+#include "media.hpp"
 #include "ppu.hpp"
 #include "self.hpp"
 #include "sfo.hpp"
@@ -321,6 +323,144 @@ void test_self() {
     CHECK(parse_sdk_stamps("") && parse_sdk_stamps("")->empty());
 }
 
+// ---------------------------------------------------------------- sound banks and films
+
+// A bank of two sounds: one of PCM, one of ATRAC3plus.
+Bytes make_nub() {
+    const uint32_t offsets_at = 0x20, first = 0x30, second = first + 0xd0, data_at = 0x300;
+    Bytes b(data_at + 0x40);
+    put_be32(b, 0, 0x00020100);
+    put_be32(b, 8, 0x2bc);
+    put_be32(b, 0xc, 2);
+    put_be32(b, 0x10, data_at);
+    put_be32(b, 0x14, 0x40);
+    put_be32(b, 0x18, offsets_at);
+    put_be32(b, 0x1c, first);
+    put_be32(b, offsets_at, first);
+    put_be32(b, offsets_at + 4, second);
+    put_text(b, first, "wav");
+    put_be32(b, first + 4, 0x2bc);
+    put_be32(b, first + 8, 0);
+    put_be32(b, first + 0x14, 0x10);  // size
+    put_be32(b, first + 0x18, 0);     // offset
+    put_be32(b, first + 0x1c, 0x10);
+    put_be16(b, first + 0xbc, 1);
+    put_be16(b, first + 0xbe, 1);
+    put_be32(b, first + 0xc0, 44100);
+    put_be32(b, first + 0xc4, 88200);
+    put_be16(b, first + 0xc8, 2);
+    put_be16(b, first + 0xca, 16);
+    put_text(b, second, "at3");
+    put_be32(b, second + 4, 0x2bc);
+    put_be32(b, second + 8, 1);
+    put_be32(b, second + 0x14, 0x30);
+    put_be32(b, second + 0x18, 0x10);
+    put_be32(b, second + 0x1c, 0x40);
+    const size_t f = second + 0xbc;
+    put_le16(b, f, 0xfffe);
+    put_le16(b, f + 2, 6);
+    put_le32(b, f + 4, 48000);
+    put_le32(b, f + 8, 48000);
+    put_le16(b, f + 12, 0x800);
+    const uint8_t guid[16] = {0xbf, 0xaa, 0x23, 0xe9, 0x58, 0xcb, 0x71, 0x44, 0xa1, 0x19, 0xff, 0xfa, 0x01, 0xe4, 0xce, 0x62};
+    std::memcpy(b.data() + f + 24, guid, 16);
+    return b;
+}
+
+// A film of one MPEG-2 picture stream and one ATRAC3plus sound stream.
+Bytes make_pamf() {
+    Bytes b(0x800 * 3);
+    put_text(b, 0, "PAMF0041");
+    put_be32(b, 8, 1);
+    put_be32(b, 12, 2);
+    put_be32(b, 0x50, 0x34 + 2 * 0x30);
+    put_be32(b, 0x58, 90000);          // starts at one second
+    put_be32(b, 0x5e, 90000 * 11);     // ends at eleven
+    put_be32(b, 0x62, 120000);
+    put_be16(b, 0x86, 2);
+    b[0x88] = 0x02;
+    b[0x8c] = 0xe0;
+    put_be16(b, 0xa0, 80);
+    put_be16(b, 0xa2, 45);
+    put_be16(b, 0xa4, 1280);
+    put_be16(b, 0xa6, 720);
+    b[0xb8] = 0xdc;
+    b[0xbc] = 0xbd;
+    return b;
+}
+
+std::string nub_error(const Bytes& b) {
+    auto bank = NubBank::parse(b, b.size());
+    return bank ? std::string() : bank.error();
+}
+
+std::string pamf_error(const Bytes& b) {
+    auto film = Pamf::parse(b, b.size());
+    return film ? std::string() : film.error();
+}
+
+void test_media() {
+    const Bytes nub = make_nub();
+    const auto bank = NubBank::parse(nub, nub.size());
+    CHECK(bank.has_value());
+    if (bank) {
+        CHECK(bank->id == 0x2bc && bank->data_at == 0x300 && bank->data_size == 0x40 && bank->sounds.size() == 2);
+        const NubSound& pcm = bank->sounds[0];
+        CHECK(pcm.codec == NubCodec::pcm16_be && pcm.channels == 1 && pcm.sample_rate == 44100 && pcm.data_size == 0x10);
+        const NubSound& at3 = bank->sounds[1];
+        CHECK(at3.codec == NubCodec::atrac3plus && at3.channels == 6 && at3.sample_rate == 48000 && at3.block_align == 0x800);
+        CHECK(at3.data_offset == 0x10 && at3.bytes_per_second == 48000);
+    }
+    Bytes bad = nub;
+    put_text(bad, 0x30, "ogg");
+    CHECK(has(nub_error(bad), "unknown kind"));
+    bad = nub;
+    put_be32(bad, 0x30 + 0x14, 0x41);  // the first sound's data runs past the bank's
+    CHECK(has(nub_error(bad), "runs past"));
+    bad = nub;
+    bad[0x30 + 0xd0 + 0xbc + 24] ^= 1;  // not ATRAC3plus's sub-format
+    CHECK(has(nub_error(bad), "isn't ATRAC3plus"));
+    bad = nub;
+    put_be32(bad, 0x14, 0x41);  // more data than the file holds
+    CHECK(has(nub_error(bad), "past the file's end"));
+    bad = nub;
+    put_be32(bad, 0x30 + 8, 5);
+    CHECK(has(nub_error(bad), "says it is sound 5"));
+    bad = nub;
+    put_be16(bad, 0x30 + 0xca, 8);
+    CHECK(has(nub_error(bad), "8 bits"));
+    CHECK(has(nub_error(Bytes(nub.begin(), nub.begin() + 0x100)), "only"));
+
+    const Bytes pam = make_pamf();
+    const auto film = Pamf::parse(pam, pam.size());
+    CHECK(film.has_value());
+    if (film) {
+        CHECK(film->version == "0041" && film->data_at == 0x800 && film->data_size == 0x1000);
+        CHECK(film->seconds() == 10.0 && film->mux_rate == 120000 && film->streams.size() == 2);
+        CHECK(film->streams[0].coding == kPamfMpeg2Video && film->streams[0].width == 1280 && film->streams[0].height == 720);
+        CHECK(film->streams[0].stream_id == 0xe0 && film->streams[0].video());
+        CHECK(film->streams[1].coding == kPamfAtrac3plus && film->streams[1].stream_id == 0xbd && !film->streams[1].video());
+    }
+    bad = pam;
+    bad[0xb8] = 0x55;
+    CHECK(has(pamf_error(bad), "unknown coding"));
+    bad = pam;
+    put_be32(bad, 12, 3);
+    CHECK(has(pamf_error(bad), "past the file's end"));
+    bad = pam;
+    put_be16(bad, 0xa4, 1920);
+    CHECK(has(pamf_error(bad), "two sizes disagree"));
+    bad = pam;
+    put_be16(bad, 0x86, 3);
+    CHECK(has(pamf_error(bad), "not the layout"));
+    bad = pam;
+    bad[7] = '2';
+    CHECK(has(pamf_error(bad), "version 0042"));
+    bad = pam;
+    bad[0] = 'X';
+    CHECK(has(pamf_error(bad), "not a film"));
+}
+
 // ---------------------------------------------------------------- PARAM.SFO
 
 void test_sfo() {
@@ -428,6 +568,7 @@ int main() {
     test_elf();
     test_self();
     test_sfo();
+    test_media();
     test_title();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);

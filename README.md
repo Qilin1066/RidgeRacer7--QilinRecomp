@@ -8,7 +8,7 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 
 ## Status
 
-**The very start: the tools that read the game. Nothing runs yet.**
+**Early: the tools that read the game, and the first part of the recompiler. Nothing runs yet.**
 
 | Piece | State |
 |---|---|
@@ -17,7 +17,8 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 | `EBOOT.BIN`'s plain header (the SELF): the program's segments and sections, the SDK libraries it was linked from. Nothing is decrypted | ✅ read from the owner's disc (`docs/elf-analysis.md`): 4.25 MB of code, 14,046 function descriptors, 248 functions imported from 22 system libraries, SPURS and about 1 MB that looks like SPU programs |
 | The decrypted program (ELF): segments, sections, the entry point's descriptor, process and PRX parameters, imports with their stubs, exports, thread-local storage | ✅ on synthetic files; **not yet run on the real program** (it has to be decrypted first, below) |
 | CI: Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64 and x64, Windows x64, warnings as errors | ✅ |
-| PPU decoder (64-bit PowerPC with VMX), checked against GNU binutils | next |
+| PPU decoder: 64-bit PowerPC with VMX, 383 instructions (`docs/recompiler-core.md`) | ✅ identical to GNU objdump over a 4.9-million-word sweep of the encoding space, in CI; **not yet run on the game's code** |
+| The data files: the sound banks' and films' headers, a survey of the archive (`docs/data-files.md`) | ✅ read from the owner's disc: MPEG-2 films at 1280 × 720, ATRAC3plus music in 5.1, PCM speech; the archive's directory is not in the archive |
 | SPU decoder; control-flow passes; lifters to C++; differential tests | later |
 | Runtime: the system libraries and system calls replaced natively; the RSX's command stream on Vulkan 1.3; sound, controllers, saves, films | later |
 | The settings menu (F1), the same as the other Qilin recomps' | later, with the window |
@@ -69,6 +70,10 @@ build/qilin info    <game> [--json info.json]   # the disc's description, EBOOT.
 build/qilin imports <game>                      # every system library imported and each function id taken from it
 build/qilin exports <game>                      # what the program offers the system
 build/qilin sfo     <game>                      # every entry of PARAM.SFO
+build/qilin data    <game>                      # the game's own files; the sound banks' and films' headers
+build/qilin insns   <game>                      # every word of the program's code: address, word, instruction
+build/qilin profile <game>                      # how often the code uses each instruction
+build/qilin disasm  <file> [--base address]     # a file of raw big-endian PPU words
 ```
 
 With only `EBOOT.BIN` there, `info` prints what its header leaves plain and then stops, saying how to make `EBOOT.elf`. Everything `qilin` writes about your copy is derived from the game: keep it out of the repository.
@@ -77,10 +82,10 @@ With only `EBOOT.BIN` there, `info` prints what its header leaves plain and then
 
 | Path | What |
 |---|---|
-| `recomp/src/` | `elf` (the PS3 program loader), `self` (`EBOOT.BIN`'s plain header), `sfo` (`PARAM.SFO`), `title` (finds the game's files; the known builds), `sha256`, `main` (the `qilin` CLI) |
+| `recomp/src/` | `elf` (the PS3 program loader), `self` (`EBOOT.BIN`'s plain header), `sfo` (`PARAM.SFO`), `title` (finds the game's files; the known builds), `media` (the sound banks' and films' headers), `sha256`, `ppu` (the PPU decoder), `main` (the `qilin` CLI) |
 | `recomp/tests/` | Unit tests on a program, a SELF and a `PARAM.SFO` built in memory, so they need no game files |
-| `tools/` | `analyse-game.ps1`, behind `Analyse game.bat` |
-| `docs/` | Roadmap and design targets, the program's analysis, prior art, naming |
+| `tools/` | `analyse-game.ps1`, behind `Analyse game.bat`; `check/verify_decoder.py` (the PPU decoder against GNU objdump) |
+| `docs/` | Roadmap and design targets, the program's analysis, the data files, the recompiler's core, prior art, naming |
 
 ## Licence
 

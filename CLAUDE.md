@@ -16,10 +16,11 @@ Static recompilation of **Ridge Racer 7** (PlayStation 3, USA, `BLUS30001`, vers
 
 ## Layout
 
-- `recomp/src/`: `elf` (the PS3 program: segments, sections, the entry descriptor, process and PRX parameters, imports with ids, slots and stubs, exports, TLS), `self` (`EBOOT.BIN`'s plain header: the ELF's tables, the stored segments, the SDK library stamps), `sfo` (`PARAM.SFO`), `title` (finds the files in the player's copy; `known_build`; the decrypt message), `sha256`, `bytes.hpp`. These are CMake's `qilin_game`: **runtime code too, so no `std::format` in them** (macOS 10.15). `main.cpp` is the `qilin` CLI (tools only: `std::format` and `std::print` are fine there).
+- `recomp/src/`: `elf` (the PS3 program: segments, sections, the entry descriptor, process and PRX parameters, imports with ids, slots and stubs, exports, TLS), `self` (`EBOOT.BIN`'s plain header: the ELF's tables, the stored segments, the SDK library stamps), `sfo` (`PARAM.SFO`), `title` (finds the files in the player's copy; `known_build`; the decrypt message), `media` (the headers of the `.nub` sound banks and `.pam` films), `sha256`, `bytes.hpp`. These are CMake's `qilin_game`: **runtime code too, so no `std::format` in them** (macOS 10.15). `ppu` (the PPU decoder, `qilin::ppu`) is CMake's `qilin_recomp`: tools only, as is `main.cpp`, the `qilin` CLI (`std::format` and `std::print` are fine there).
 - `recomp/tests/`: `tests.cpp` (unit tests), `elf_builder.hpp` (builds a program, its SELF and a `PARAM.SFO` in memory).
-- `tools/analyse-game.ps1` and `Analyse game.bat`: build `qilin` on Windows and write the first analysis to `analysis-out/`. Keep the script Windows PowerShell 5.1-compatible and ASCII-only. **It has not been run.**
-- `docs/`: design and results. Keep them current. `roadmap-and-design-targets.md` is the roadmap and every design decision (open ones are marked **open**); `elf-analysis.md` the program and what has been read from the owner's disc; `prior-art.md` what may be taken from where; `naming.md` the names.
+- `tools/analyse-game.ps1` and `Analyse game.bat`: build `qilin` on Windows and write the analysis to `analysis-out/`. Keep the script Windows PowerShell 5.1-compatible and ASCII-only. Run on the owner's PC up to the decrypt message; its steps after that (imports, exports, profile) have not run.
+- `tools/check/verify_decoder.py`: the PPU decoder against GNU objdump (`--sweep` in CI; `--game` needs the decrypted program and a PowerPC objdump).
+- `docs/`: design and results. Keep them current. `roadmap-and-design-targets.md` is the roadmap and every design decision (open ones are marked **open**); `elf-analysis.md` the program and what has been read from the owner's disc; `data-files.md` the sound banks, films and archive; `recompiler-core.md` the decoder and its check; `prior-art.md` what may be taken from where; `naming.md` the names.
 - Still to come, in WindWakerHD-QilinRecomp's layout: `host/` (window, Vulkan, input, audio), `runtime/` (`qilin_rt`), `ridgeracer7/src/` (the game's executable, the system libraries by file, `settings`, `menu`).
 
 ## Build and check
@@ -30,14 +31,19 @@ cmake --build build --parallel 4   # a number: with Makefiles, a bare --parallel
 ctest --test-dir build --output-on-failure
 build/qilin info <game>      # <game>: the disc's folder (holding PS3_GAME), EBOOT.BIN, or EBOOT.elf
 build/qilin imports <game>
+build/qilin data <game>       # the game's files; the sound banks' and films' headers
+build/qilin profile <game>    # needs the decrypted program
+python3 tools/check/verify_decoder.py --qilin build/qilin --sweep   # needs a PowerPC objdump: CI has one
 ```
+
+On the owner's PC (Windows, Visual Studio 2022 Build Tools, no Ninja): `cmake -S . -B build -DQILIN_WERROR=ON`, `cmake --build build --config Release --parallel 8`, and the programs are in `build\Release\`.
 
 Before a milestone commit: tests pass, warnings are clean (`QILIN_WERROR`), and CI is green on all six configurations. Check CI after pushing (its results are readable without signing in: `https://api.github.com/repos/Qilin1066/RidgeRacer7--QilinRecomp/actions/runs`).
 
 ## Known facts worth not rediscovering
 
 - The owner's copy is the disc's folder on the owner's PC, outside the repository (its path is in the claude.ai Project's `claude/status.md`; local paths are not written here). `RR7.DAT` is 5.23 GB and `BGM.nub` and `ending.pam` are over 600 MB: a cloud session can stage files of up to 400 MB, so those never leave the PC whole. `EBOOT.BIN` (7.8 MB) and `PARAM.SFO` stage fine, and so will `EBOOT.elf`.
-- **`EBOOT.elf` does not exist yet** (v0.1.0): the owner has to make it with RPCS3. Until then the ELF loader has only met synthetic files. Its reading of the PS3's additions (field offsets of the two parameter blocks, the 44-byte import and 28-byte export entries, the stub's eight instructions, slots initially holding their stub's address) is from public descriptions and memory of them: each is a hard error or a reported count if the real file differs, so the first `qilin info` on the real ELF is the check.
+- **`EBOOT.elf` does not exist yet** (v0.2.0): the owner has to make it with RPCS3. On 2026-11-21 the owner's message said it was beside `EBOOT.BIN`, but it was not there, nor anywhere on the PC's `D:` drive or in the user's folder, and RPCS3 was not installed: look before believing either way. Until then the ELF loader has only met synthetic files. Its reading of the PS3's additions (field offsets of the two parameter blocks, the 44-byte import and 28-byte export entries, the stub's eight instructions, slots initially holding their stub's address) is from public descriptions and memory of them: each is a hard error or a reported count if the real file differs, so the first `qilin info` on the real ELF is the check.
 - A cloud session reaches the PC only while the Claude desktop app is open there, and can run commands there only when the app offers its shell (`device_bash`). In the session that made v0.1.0 it offered listing and staging files, not the shell: nothing was run on the owner's PC, and the owner's sister-project folders were read by staging files.
 - Tags don't reach GitHub from a cloud session (the proxy refuses pushing them: HTTP 403); `main` does. Releases are marked by their commit's title (`vX.Y.Z: ...`) and the changelog until a tag can be pushed from elsewhere.
 - The cloud workspace has GCC 13 and Clang 18, both below the minimums: build there with zig's Clang (`pip install --break-system-packages ziglang==0.17.1`, then wrapper scripts running `python3 -m ziglang cc` / `c++` as `CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER`). It has no PowerPC objdump: a decoder sweep runs in CI.
@@ -45,23 +51,27 @@ Before a milestone commit: tests pass, warnings are clean (`QILIN_WERROR`), and 
 - The SELF's SDK version header (at the offset the extended header gives): type, present, size `0x30`, then at `+0x20` the stamp list's offset in the file and at `+0x28` its length. The stamps run together with no separators ("crt0:p102002crt1:p102002..."): a name, a colon, one letter and digits.
 - `PARAM.SFO`'s `SOUND_FORMAT`: the compressed formats are two bits each sharing bit 1 (Dolby Digital `0x102`, DTS `0x202`); this disc's 263 is LPCM 2.0, LPCM 5.1 and Dolby Digital.
 - An extraction of the owner's `.7z` was still running when the first session listed the folder (`RR7.DAT` showed 36 MB with a fresh date, and two films were missing). A file with today's date among 2006 ones is a file still being written: list again before recording sizes.
+- A local session on the owner's PC (Claude Code there) has the shell, MSVC 19.44, CMake, Python 3.12 and `gh`, and can push to `main` directly (pushing a tag from there hasn't been tried). It has **no PowerPC objdump**, no WSL and no Docker: the decoder's check against binutils runs only in CI, so push and read the sweep's log (`gh run view <id> --log`). Git has no identity set there: commit as the first commit did (`git -c user.name=Claude -c user.email=noreply@anthropic.com commit`), which also keeps the owner's name out.
+- The data files, read on the owner's PC (`docs/data-files.md`): films are PAMF `0041` with MPEG-2 video (not AVC) and, in three, ATRAC3plus; `BGM.nub` is ATRAC3plus 5.1 at 48 kHz, `Game_DJ.nub` 16-bit big-endian mono PCM. `RR7.DAT` has no directory at its start (its first `0x360` bytes are zero, then a compressed file): the directory is probably in the program. Reading all 5.2 GB of it in Python takes about two minutes there.
+- binutils' `cell` set differs from the PPU in reviewed ways (`docs/recompiler-core.md`): it has `lq`/`stq`, `attn`, `eciwx`/`ecowx` and the supervisor's instructions, and ignores several reserved bits. objdump's raw mode prints every optional operand (`sc 0`, `bclr 20,lt,0`, `lwarx r3,0,r4,0`, `mfcr r3,-1`).
 - Other PS3 static recompilations exist (`docs/prior-art.md`: ps3recomp and ports built on it). Their licences are unchecked: don't read their code until they are.
 - Facts about the game not read from the disc (60 frames a second, 1080p, online play, what it shares with Ridge Racer 6) are from public descriptions.
 
-## Status (v0.1.0)
+## Status (v0.2.0)
 
 - The tools find the game, read `PARAM.SFO` and the SELF's plain header, and load a decrypted PS3 program (on synthetic files). Read from the owner's disc: `docs/elf-analysis.md`.
-- Checked: unit tests (zig's Clang in the cloud workspace); `qilin info` on the owner's disc folder (prints the disc's description and the SELF's plain facts, then stops with the decrypt message, exit 1).
-- Unchecked: **the ELF loader on the real program**; the PowerShell script (never run).
+- The PPU decoder (383 instructions) agrees with binutils 2.42 over CI's sweep of 4.9 million words, with no unexplained difference. `qilin data` reads the sound banks' and films' headers.
+- Checked: unit tests and a warnings-as-errors build on all six CI configurations and with MSVC on the owner's PC; `qilin info` and `qilin data` on the owner's disc folder; `Analyse game.bat`'s script up to the decrypt message.
+- Unchecked: **the ELF loader on the real program**; `insns`, `profile` and `verify_decoder.py --game` (they need it).
 
 ## Next steps, in order
 
 1. The owner: RPCS3, Utilities > Decrypt PS3 Binaries on `EBOOT.BIN`; `EBOOT.elf` beside it in `USRDIR`. Then stage it and run `qilin info` and `imports`. Fix whatever the ELF loader gets wrong on the real file. Record the ELF's SHA-256 in `kBuilds` (`title.cpp`), and in `docs/elf-analysis.md` the real section names, the compiler (`.comment`), the 22 libraries and the count taken from each, how many slots pair with a stub.
 2. Names for the imported ids: the id is derived from the name by a public method (`docs/prior-art.md`); find a clean, permissively licensed list of names, compute, match all 248. Add `qilin imports` names.
-3. The PPU decoder (`qilin::ppu`): the Nintendo recomps' table shape, for 64-bit PowerPC with VMX; `qilin insns`, `disasm`, `profile`; `tools/check/verify_decoder.py` against binutils (`--sweep` in CI). The profile says which VMX and 64-bit forms the game uses.
-4. The SPU programs: find the embedded images (the section aligned to 128), count them, read their headers; the SPU decoder and its binutils check.
+3. ✅ The PPU decoder (v0.2.0). Still to do with the real program: `qilin profile` (which VMX and 64-bit forms the game uses; whether `mcrxr`, `ldbrx`, `stdbrx` or anything left out occurs) and `verify_decoder.py --game` (in CI's absence of game files, that needs a PowerPC objdump where the game is).
+4. The SPU programs: find the embedded images (the section aligned to 128), count them, read their headers; the SPU decoder. Its check needs a reference: current binutils has no SPU (**open**, in the roadmap).
 5. The control-flow pass on the PPU code: seeds from the descriptors (`.opd`) and `.eh_frame`; stubs as known import calls; `sc` sites listed with their numbers; coverage to 0 unknown words.
-6. Survey `RR7.DAT` on the owner's PC (it can't be staged whole: a `qilin` command that lists it, run there by `Analyse game.bat`), the `.nub` and `.pam` headers. Decide the open items in the roadmap (shaders, codecs).
+6. ✅ in part (v0.2.0): the `.nub` and `.pam` headers are read (`qilin data`) and the codecs known. Still to do: find `RR7.DAT`'s directory (look in the program's read-only data for a table of sector offsets and sizes), then a `qilin` command that lists the archive; identify its compression and the `ArcL`, `R7T`, `R7W` and `RR7 ` formats; find the shaders. Decide the ATRAC3plus decoder (**open**).
 7. Then, in WindWakerHD's order: lifter and difftest, the runtime skeleton, the window and the settings menu, threads, files, the RSX on Vulkan, sound.
 
 ## Conventions

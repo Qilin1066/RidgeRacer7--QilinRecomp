@@ -42,6 +42,8 @@ cfg.json.gz
 functions.json
 functions.json.gz
 imports.txt
+profile.txt
+data.txt
 exports.txt
 symbols.txt
 

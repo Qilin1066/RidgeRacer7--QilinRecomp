@@ -4,6 +4,25 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
+The PPU decoder, and the first look inside the data files. The decrypted program still hasn't been read: it wasn't on the owner's PC when this was made.
+
+### Added
+- PPU decoder (`recomp/src/ppu.*`, `qilin::ppu`): the Cell's PowerPC core, in the table shape of the other Qilin recompilers. 383 instructions: the 64-bit PowerPC architecture, VMX, and the Cell's own vector loads and stores. Reserved bits set and invalid forms decode as invalid; the supervisor's instructions are left out (`docs/recompiler-core.md`).
+- `qilin insns` (every word of the program's code), `profile` (how often each instruction is used, and what doesn't decode) and `disasm` (a file of raw words).
+- `tools/check/verify_decoder.py`: the decoder against GNU objdump (`-M cell,raw`), word by word, over the game's code or a sweep of the encoding space. CI runs the sweep.
+- Readers for the headers of the sound banks (`.nub`) and the films (`.pam`) (`recomp/src/media.*`), and `qilin data`, which lists the game's files with what those headers say. `Analyse game.bat` writes it, and the code's profile once there is a decrypted program.
+- `docs/data-files.md`: what the data files are, and what that decides.
+
+### Checked
+- The decoder against binutils 2.42 in CI: 4,931,891 words swept, 4,266,210 valid and identical, 539,096 invalid for both, the rest reviewed differences (binutils accepting what the PPU lacks or ignoring reserved bits), none unexplained. The sweep's first run found one fault, fixed: `mftb` accepted any register number.
+- On the owner's PC, for the first time: the build with Visual Studio 2022 (17.14), the unit tests, and `Analyse game.bat`'s script, which had never been run. It stops where it should, saying how to decrypt the program.
+- On the owner's disc: the seven films are PAMF with **MPEG-2 video** (1280 × 720; one at 320 × 176), three with an ATRAC3plus sound stream; `BGM.nub` holds 43 pieces of **ATRAC3plus in 5.1** at 48 kHz (three and a half hours); `Game_DJ.nub` holds 714 sounds of 16-bit PCM. `RR7.DAT` has no directory of its own, and at least some of its files are compressed.
+
+### Not checked
+- Anything that needs the decrypted program: the ELF loader on the real file, `insns` and `profile` on the game's code, the decoder over every word of it.
+
 ## [0.1.0] - 2026-11-21
 
 The start of the project: the tools that read the game. Nothing runs yet.

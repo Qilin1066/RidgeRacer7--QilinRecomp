@@ -93,6 +93,7 @@ if (-not $qilin) { throw "built, but qilin$exe isn't where it should be" }
 
 # Your copy's program, to C++.
 Invoke-Step "Lifting your copy's program" $qilin @("lift", $Game, "--out", $gen)
+Invoke-Step "Translating your copy's shaders" $qilin @("shaders", $Game, "--out", $gen)
 
 # The game, from that.
 Invoke-Step "Configuring the game" "cmake" @("-S", $root, "-B", $build, "-DQILIN_GEN_DIR=$gen")

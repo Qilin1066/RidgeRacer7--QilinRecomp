@@ -56,6 +56,7 @@
 #include "spu_cfg.hpp"
 #include "spu_lift.hpp"
 #include "rsx_program.hpp"
+#include "rsx_spirv.hpp"
 #include "shaders.hpp"
 #include "spu_image.hpp"
 #include "title.hpp"
@@ -712,6 +713,50 @@ int cmd_shaders(const Args& a) {
         }
     }
     std::println("decoded: {} instructions; {} of {} programs disagree with their own tables", instructions, wrong_programs, programs->size());
+    // Each translated to SPIR-V (rsx_spirv.hpp).
+    std::map<std::string, size_t> refusals;
+    size_t translated = 0;
+    std::string table;
+    std::vector<std::string> modules;
+    for (const ShaderProgram& s : *programs) {
+        const auto p = rsx::parse_cg(elf.bytes_at(s.address, s.size), s.address);
+        const auto t = rsx::translate(*p);
+        if (!t) {
+            std::string why = t.error();
+            why = why.substr(why.find(": ") + 2);
+            if (const size_t n = why.find("instruction "); n == 0) why = why.substr(why.find(": ") + 2);
+            ++refusals[why];
+            if (a.disasm) std::println("REFUSED {}", t.error());
+            continue;
+        }
+        ++translated;
+        if (a.out) {
+            std::string words;
+            for (size_t i = 0; i < t->spirv.size(); ++i) words += std::format("{}0x{:08x}u,", i % 8 ? " " : "\n    ", t->spirv[i]);
+            modules.push_back(std::format("const uint32_t kSpirv{}[] = {{{}\n}};\n", modules.size(), words));
+            std::string slots;
+            for (const uint32_t o : t->constant_slots) slots += std::format("{}, ", o);
+            if (!slots.empty()) modules.back() += std::format("const uint32_t kSlots{}[] = {{{}}};\n", modules.size() - 1, slots);
+            table += std::format("    {{0x{:016x}ull, {}, 0x{:08x}u, kSpirv{}, std::size(kSpirv{}), 0x{:x}u, 0x{:x}u, 0x{:x}u, 0x{:x}u, {}, {}}},\n", rsx::program_key(*p),
+                                 p->vertex ? "true" : "false", s.address, modules.size() - 1, modules.size() - 1, t->inputs, t->outputs, t->textures, t->cube_textures,
+                                 slots.empty() ? "nullptr" : std::format("kSlots{}", modules.size() - 1), t->constant_slots.size());
+        }
+    }
+    std::println("translated to SPIR-V: {} of {}", translated, programs->size());
+    for (const auto& [why, n] : refusals) std::println("  {:4}  refused: {}", n, why);
+    if (a.out) {
+        const fs::path folder = *a.out;
+        std::error_code ec;
+        fs::create_directories(folder, ec);
+        std::string text = "// Translated from the game's shaders by qilin: do not share.\n#include <iterator>\n#include \"qilin/rt/shaders.hpp\"\n\nnamespace {\n";
+        for (const std::string& m : modules) text += m;
+        text += "}  // namespace\n\nnamespace qilin::rt {\nconst TranslatedShader kTranslatedShaders[] = {\n" + table + "};\nconst size_t kTranslatedShaderCount = std::size(kTranslatedShaders);\n}  // namespace qilin::rt\n";
+        std::ofstream f(folder / "shaders.cpp", std::ios::binary);
+        f << text;
+        if (!f) throw Failure{"cannot write shaders.cpp"};
+        std::println("written to {}", (folder / "shaders.cpp").string());
+    }
+    if (translated != programs->size()) return 1;
     std::println("what the programs use, in how many:");
     for (const auto& [what, n] : used) std::println("  {:4}  {}", n, what);
     return wrong_programs ? 1 : 0;

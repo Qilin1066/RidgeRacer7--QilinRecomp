@@ -95,6 +95,8 @@ add_library(qilin_recomp STATIC
     recomp/src/spu_cfg.cpp
     recomp/src/spu_lift.cpp
     recomp/src/rsx_program.cpp
+    recomp/src/rsx_spirv.cpp
+    recomp/src/spirv.cpp
 )
 target_include_directories(qilin_recomp PUBLIC recomp/src)
 target_link_libraries(qilin_recomp PUBLIC qilin_game PRIVATE qilin_warnings)
@@ -247,6 +249,18 @@ if(QILIN_GEN_DIR)
         message(FATAL_ERROR "QILIN_GEN_DIR (${QILIN_GEN_DIR}) holds no lifted code: run `qilin lift <game> --out ${QILIN_GEN_DIR}` first")
     endif()
     file(GLOB qilin_lifted CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")
+    # The translated shaders (`qilin shaders <game> --out`) are their own file, and have a check of their own.
+    if(NOT EXISTS "${QILIN_GEN_DIR}/shaders.cpp")
+        message(FATAL_ERROR "QILIN_GEN_DIR (${QILIN_GEN_DIR}) holds no translated shaders: run `qilin shaders <game> --out ${QILIN_GEN_DIR}` first")
+    endif()
+    add_executable(ridgeracer7_shader_check ridgeracer7/src/shader_check.cpp "${QILIN_GEN_DIR}/shaders.cpp")
+    target_link_libraries(ridgeracer7_shader_check PRIVATE qilin_host qilin_rt qilin_warnings)
+    if(MSVC)
+        set_source_files_properties("${QILIN_GEN_DIR}/shaders.cpp" PROPERTIES COMPILE_OPTIONS "/w;/bigobj")
+    else()
+        set_source_files_properties("${QILIN_GEN_DIR}/shaders.cpp" PROPERTIES COMPILE_OPTIONS "-w")
+        set_source_files_properties(ridgeracer7/src/shader_check.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
+    endif()
     add_executable(ridgeracer7 ridgeracer7/src/main.cpp ${qilin_lifted})
     target_include_directories(ridgeracer7 PRIVATE "${QILIN_GEN_DIR}")
     target_link_libraries(ridgeracer7 PRIVATE ridgeracer7_machine qilin_host qilin_warnings)

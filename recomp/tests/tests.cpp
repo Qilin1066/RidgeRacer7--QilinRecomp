@@ -10,6 +10,7 @@
 
 #include "archive.hpp"
 #include "rsx_program.hpp"
+#include "rsx_spirv.hpp"
 #include "cfg.hpp"
 #include "elf.hpp"
 #include "elf_builder.hpp"
@@ -1073,6 +1074,10 @@ void test_title() {
 // ---------------------------------------------------------------- the RSX's programs
 
 // Instructions built field by field from the documented layout (rsx_program.hpp), not taken from any program.
+void put_be32_back(std::vector<uint8_t>& b, uint32_t v) {
+    for (int s = 24; s >= 0; s -= 8) b.push_back(static_cast<uint8_t>(v >> s));
+}
+
 void test_rsx_program() {
     using namespace qilin::rsx;
     // MAD R3.xz, -v[2].yzwx, c[300], R5 (the vector unit), and RSQ o[TC1].w, R5.x (the scalar unit), last.
@@ -1128,6 +1133,46 @@ void test_rsx_program() {
     }
 }
 
+// The translation of synthetic programs: a vertex program that moves an input to the position and a texture
+// coordinate, and a fragment program that reads it and a constant; refusals by name.
+void test_rsx_spirv() {
+    using namespace qilin::rsx;
+    const auto vp_source = [](uint32_t type, uint32_t temp) { return type | (temp << 2) | (0x1bu << 8); };  // swizzle xyzw
+    const auto vp_word = [&](uint32_t op, uint32_t input, uint32_t dest, bool last) {
+        const uint32_t s0 = vp_source(2, 0);
+        return std::array<uint32_t, 4>{(1u << 30) | (0x3fu << 15) | (7u << 10) | (0x1bu << 2), (op << 22) | (input << 8) | (s0 >> 9), (s0 & 0x1ff) << 23,
+                                       (0xfu << 13) | (dest << 2) | (last ? 1u : 0u)};
+    };
+    CgProgram vp;
+    vp.vertex = true;
+    vp.header = {2, 0, 1, 1, 0, 0};
+    for (const auto& w : {vp_word(kVecMov, 0, 0, false), vp_word(kVecMov, 0, 7, true)})
+        for (const uint32_t v : w) put_be32_back(vp.microcode, v);
+    const auto vt = translate(vp);
+    CHECK(vt.has_value());
+    if (vt) {
+        CHECK(vt->spirv.size() > 5 && vt->spirv[0] == 0x07230203u && vt->inputs == 1 && vt->outputs == ((1u << 0) | (1u << 7)));
+    }
+    // MUL R0, f[TEX0], {2, 2, 2, 2}: a constant inline; the end.
+    CgProgram fp;
+    fp.header = {2, 0, 0, 0x10000, 0x200, 0, 0};
+    const uint32_t words[] = {(uint32_t{kFpMul} << 24) | (4u << 13) | (0xfu << 9) | 1u, 1u | (0xe4u << 9) | (7u << 18) | (0xe4u << 21), 2u | (0xe4u << 9), 0x7fcu << 19,
+                              0x40000000u, 0x40000000u, 0x40000000u, 0x40000000u};
+    for (const uint32_t v : words) put_be32_back(fp.microcode, (v << 16) | (v >> 16));
+    const auto ft = translate(fp);
+    CHECK(ft.has_value());
+    if (ft) CHECK(ft->inputs == (1u << 4) && ft->outputs == 1 && ft->constant_slots == std::vector<uint32_t>{16});
+    // The key leaves the inline constant out: another value, the same key.
+    CgProgram other = fp;
+    other.microcode[16] ^= 0x55;
+    CHECK(program_key(other) == program_key(fp));
+    // An operation the translation doesn't take is refused by name.
+    CgProgram kil = fp;
+    kil.microcode[2] = kFpKil;  // (word 0 is stored with its halves exchanged: its top byte, the opcode, is the stored word's third)
+    const auto refused = translate(kil);
+    CHECK(!refused.has_value() && refused.error().find("KIL") != std::string::npos);
+}
+
 int main() {
     test_sha256();
     test_ppu();
@@ -1140,6 +1185,7 @@ int main() {
     test_shaders();
     test_archive();
     test_rsx_program();
+    test_rsx_spirv();
     test_syscall_names();
     test_cfg();
     test_import_names();

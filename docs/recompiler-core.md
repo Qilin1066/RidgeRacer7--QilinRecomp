@@ -298,4 +298,18 @@ The game's first frame draws, so its vertex and fragment programs have to be tra
 
 **The uploaded program is the built one.** The vertex program the game loads for its first draw is the microcode of the Cg program at `0x10201c68`, byte for byte: the programs are found at build time and looked up at run time, as planned.
 
-Next: their translation to SPIR-V at build time, then the RSX's drawing.
+### Their translation to SPIR-V (`recomp/src/rsx_spirv.*`, `recomp/src/spirv.*`)
+
+**All 242 translate.** `qilin shaders <game> --out <folder>` writes them, as SPIR-V, to `shaders.cpp` (derived from the game: outside the repository), each with its key: a hash of its microcode with a fragment program's inline constants left out, since the game patches those. The renderer finds a program the game uploads by that key; one it doesn't find stops the game.
+
+**The SPIR-V is written by the project's own writer** (`spirv.*`), so building the game needs no shader compiler. Its numbers are from Khronos' published grammar files (SPIRV-Headers, at the tag the Vulkan headers are pinned to), not from memory. SPIR-V 1.3; registers are function variables, loaded and stored around each instruction (the driver's compiler keeps them in registers).
+
+**What a translated program expects of the renderer** is stated at the top of `rsx_spirv.hpp`: vertex constants (468) and a fragment program's inline constants in uniform blocks; the RSX's viewport folded into the position by push constants; outputs and inputs at locations by register number; a texture unit's dimension (2D or cube) from the program's Cg parameters.
+
+**The R and H registers are one file.** The NV40 family's fp16 `H` registers are the halves of its fp32 `R` registers (`H2n` and `H2n+1` of `Rn`), and the game's programs show it: every fragment program's register count is at least `max(Rn+1, (Hn+2)/2)` of what it uses, and exactly that in 77 of the 121 (the rest have the minimum, 2). The translation keeps the two views as separate values, which is exact as long as no value crosses between them, and **refuses any program in which one does**: it tracks which view last wrote each quarter of each register and checks every component an instruction actually uses. No program is refused. (A register moved to itself in place, which the compiler emits, is the same bits either way.)
+
+**Found by that check**: `DIV` and `DIVSQ` divide by their second source's *first* component, as a scalar. The game computes a length into one component and divides a vector by it (`DP3R R1.x, R2, R2; DIVSQR R3.xyz, R2, R1`); read component by component, those programs crossed between the views, which is how it showed.
+
+**Stated choices**, to be compared with the console's picture: an output component the vertex program doesn't write is `(0, 0, 0, 1)`'s; with both vertex units at work, the vector unit's result sets the condition codes; a branch's condition is its first component's (refused if its swizzle isn't one component repeated); the fences (`FENCT`, `FENCB`) have no value; fixed point (s1.10) is a clamp to [-2, 2 - 1/1024] and a rounding to 1/1024; an fp16 result is rounded with `OpQuantizeToF16`; the fragment input flag in word 3's bit 31 is no-perspective interpolation (refused if a program reads an input both ways).
+
+**Checked**: unit tests translate synthetic programs and check refusals by name; and **`ridgeracer7_shader_check`** (built with the lifted code) gives all 242 to the local Vulkan driver: a module for each, and a graphics pipeline for each with a partner that writes what it reads. On the owner's PC (NVIDIA GeForce GTX 1080 Ti) **all 242 modules and 242 pipelines are taken.** A driver is lenient: *still owed, a check with Khronos' validator (`spirv-val`), and a test of the translation's meaning against a reference, as the lifters have.*

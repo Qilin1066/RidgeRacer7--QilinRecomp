@@ -223,7 +223,10 @@ endif()
 add_library(qilin_ffmpeg STATIC ${qilin_ffmpeg_sources} ${QILIN_FFMPEG}/libavcodec/bsf/null.c)
 target_include_directories(qilin_ffmpeg PRIVATE ${qilin_ffmpeg_gen} ${QILIN_FFMPEG})
 set_source_files_properties(${QILIN_FFMPEG}/libavcodec/bsf/null.c PROPERTIES INCLUDE_DIRECTORIES ${QILIN_FFMPEG}/libavcodec)
-target_include_directories(qilin_ffmpeg SYSTEM INTERFACE ${qilin_ffmpeg_gen} ${QILIN_FFMPEG})
+# What users of it see: a copy of the two libraries' headers (with the generated ones), not FFmpeg's root, whose file
+# VERSION a case-insensitive file system (macOS's) takes for C++'s <version>.
+file(COPY ${QILIN_FFMPEG}/libavcodec ${QILIN_FFMPEG}/libavutil DESTINATION ${qilin_ffmpeg_gen}/public FILES_MATCHING PATTERN "*.h")
+target_include_directories(qilin_ffmpeg SYSTEM INTERFACE ${qilin_ffmpeg_gen}/public ${qilin_ffmpeg_gen})
 target_compile_definitions(qilin_ffmpeg PRIVATE HAVE_AV_CONFIG_H=1 _ISOC99_SOURCE _FILE_OFFSET_BITS=64 _LARGEFILE_SOURCE _POSIX_C_SOURCE=200112 _XOPEN_SOURCE=600)
 set_target_properties(qilin_ffmpeg PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
 # Not ours to warn about.

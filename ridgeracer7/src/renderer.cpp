@@ -260,6 +260,45 @@ VkBlendOp blend_op(uint32_t e) {
     }
 }
 
+// A texture's image: 2D, or a cube map's six layers with a cube view (which the host layer doesn't make).
+host::Image texture_image(const host::Gpu& gpu, const Texels& t) {
+    if (t.faces == 1)
+        return host::Image::create(gpu, t.width, t.height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, t.levels);
+    host::Image im;
+    im.format = VK_FORMAT_R8G8B8A8_UNORM, im.width = t.width, im.height = t.height, im.levels = t.levels;
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    ici.imageType = VK_IMAGE_TYPE_2D, ici.format = im.format, ici.extent = {t.width, t.height, 1};
+    ici.mipLevels = t.levels, ici.arrayLayers = 6, ici.samples = VK_SAMPLE_COUNT_1_BIT, ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    host::check(vkCreateImage(gpu.device, &ici, nullptr, &im.image), "vkCreateImage");
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(gpu.device, im.image, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size, mai.memoryTypeIndex = gpu.memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    host::check(vkAllocateMemory(gpu.device, &mai, nullptr, &im.memory), "vkAllocateMemory");
+    host::check(vkBindImageMemory(gpu.device, im.image, im.memory, 0), "vkBindImageMemory");
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = im.image, vci.viewType = VK_IMAGE_VIEW_TYPE_CUBE, vci.format = im.format;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, t.levels, 0, 6};
+    host::check(vkCreateImageView(gpu.device, &vci, nullptr, &im.view), "vkCreateImageView");
+    return im;
+}
+
+// A layout transition of every level and layer of a texture's image (the host layer's covers one layer).
+void transition_texture(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to) {
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.oldLayout = from, b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dep.imageMemoryBarrierCount = 1, dep.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
 VkSamplerAddressMode address_mode(uint32_t mode) {
     switch (mode) {
     case 1: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -308,7 +347,8 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
     std::vector<uint32_t> key{static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs) >> 32),
                               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs) >> 32),
                               static_cast<uint32_t>(format), static_cast<uint32_t>(topology), d.color_mask, d.blend, d.blend_src, d.blend_dst, d.blend_equation,
-                              d.depth_test, d.depth_write, d.depth_func, d.cull, d.cull_face, d.front_face};
+                              d.depth_test, d.depth_write, d.depth_func, d.cull, d.cull_face, d.front_face, d.depth_bias,
+                              std::bit_cast<uint32_t>(d.bias_factor), std::bit_cast<uint32_t>(d.bias_units)};
     auto& p = g_renderer->pipelines[key];
     if (p) return p;
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -331,6 +371,7 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
     VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     raster.lineWidth = 1.0f;
     raster.cullMode = VK_CULL_MODE_NONE;
+    if (d.depth_bias) raster.depthBiasEnable = VK_TRUE, raster.depthBiasSlopeFactor = d.bias_factor, raster.depthBiasConstantFactor = d.bias_units;
     // Culling (OpenGL's faces: front 0x404, back 0x405, both 0x408; windings: clockwise 0x900, anticlockwise 0x901). The
     // winding is in window coordinates, which count down from the top as Vulkan's framebuffer does (rsx.cpp: the window's
     // origin), so the RSX's anticlockwise is Vulkan's (*a stated reading, held to the picture*).
@@ -658,7 +699,6 @@ void renderer_draw(const Draw& d) {
     const host::Gpu& gpu = *r.gpu;
     const qilin::rt::TranslatedShader& vs = find_shader(d.vertex_program, true);
     const qilin::rt::TranslatedShader& fs = find_shader(d.fragment_program, false);
-    if (fs.cube_textures) fatal("the fragment program at %08x samples cube maps (units %#x), which the renderer doesn't provide yet", fs.address, fs.cube_textures);
     // What the fragment program reads, the vertex program must write (COL0 1, COL1 2, FOGC 5, TEXn 7 + n).
     static constexpr unsigned kLocation[14] = {0, 1, 2, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     for (unsigned n = 1; n < 14; ++n)
@@ -667,10 +707,43 @@ void renderer_draw(const Draw& d) {
     // The primitive (the RSX's numbers: OpenGL's plus one). Those Vulkan lacks, or may lack (fans, on portability devices), are
     // drawn as lists of triangles through indices: a quad (a, b, c, d) as (a, b, c) and (a, c, d), a fan's or polygon's
     // triangles about its first vertex (*the diagonals are a stated choice*).
+    // The order the vertices are drawn in: the game's indices, or the vertices one after another.
+    std::vector<uint32_t> order;
+    if (d.indexed) {
+        order = d.indices;
+    } else {
+        order.resize(d.count);
+        for (uint32_t v = 0; v < d.count; ++v) order[v] = v;
+    }
+    const uint32_t n = static_cast<uint32_t>(order.size());
     VkPrimitiveTopology topology;
     std::vector<uint32_t> indices;
-    bool indexed = false;
-    switch (d.primitive) {
+    bool indexed = d.indexed;
+    // With primitive restart, each piece between restarts is a primitive of its own: all made into a list of triangles (a
+    // strip's triangles keeping their alternate windings).
+    if (std::find(order.begin(), order.end(), kRestart) != order.end()) {
+        if (d.primitive < 5) fatal("primitive restart in a draw of primitive %u, which the renderer doesn't take yet", d.primitive);
+        topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, indexed = true;
+        for (size_t a = 0; a < order.size();) {
+            size_t b = a;
+            while (b < order.size() && order[b] != kRestart) ++b;
+            const uint32_t* s = order.data() + a;
+            const uint32_t m = static_cast<uint32_t>(b - a);
+            switch (d.primitive) {
+            case 5: indices.insert(indices.end(), s, s + m / 3 * 3); break;
+            case 6:
+                for (uint32_t v = 2; v < m; ++v)
+                    if (v % 2 == 0) indices.insert(indices.end(), {s[v - 2], s[v - 1], s[v]});
+                    else indices.insert(indices.end(), {s[v - 1], s[v - 2], s[v]});
+                break;
+            case 7: case 10: for (uint32_t v = 2; v < m; ++v) indices.insert(indices.end(), {s[0], s[v - 1], s[v]}); break;
+            case 8: for (uint32_t v = 0; v + 4 <= m; v += 4) indices.insert(indices.end(), {s[v], s[v + 1], s[v + 2], s[v], s[v + 2], s[v + 3]}); break;
+            case 9: for (uint32_t v = 0; v + 4 <= m; v += 2) indices.insert(indices.end(), {s[v], s[v + 1], s[v + 3], s[v], s[v + 3], s[v + 2]}); break;
+            default: fatal("a draw of primitive %u, which the renderer doesn't take yet", d.primitive);
+            }
+            a = b + 1;
+        }
+    } else switch (d.primitive) {
     case 1: topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
     case 2: topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
     case 4: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
@@ -678,18 +751,19 @@ void renderer_draw(const Draw& d) {
     case 6: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
     case 7: case 10:  // triangle fan, polygon
         topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, indexed = true;
-        for (uint32_t v = 2; v < d.count; ++v) indices.insert(indices.end(), {0, v - 1, v});
+        for (uint32_t v = 2; v < n; ++v) indices.insert(indices.end(), {order[0], order[v - 1], order[v]});
         break;
     case 8:  // quads
         topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, indexed = true;
-        for (uint32_t v = 0; v + 4 <= d.count; v += 4) indices.insert(indices.end(), {v, v + 1, v + 2, v, v + 2, v + 3});
+        for (uint32_t v = 0; v + 4 <= n; v += 4) indices.insert(indices.end(), {order[v], order[v + 1], order[v + 2], order[v], order[v + 2], order[v + 3]});
         break;
     case 9:  // quad strip: quads (v, v + 1, v + 3, v + 2)
         topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, indexed = true;
-        for (uint32_t v = 0; v + 4 <= d.count; v += 2) indices.insert(indices.end(), {v, v + 1, v + 3, v, v + 3, v + 2});
+        for (uint32_t v = 0; v + 4 <= n; v += 2) indices.insert(indices.end(), {order[v], order[v + 1], order[v + 3], order[v], order[v + 3], order[v + 2]});
         break;
     default: fatal("a draw of primitive %u, which the renderer doesn't take yet", d.primitive);
     }
+    if (indexed && indices.empty() && d.primitive <= 6) indices = order;  // the game's own indices, as they are
     uint32_t pixel_bytes = 0;
     const VkFormat format = surface_format(d.color.format, pixel_bytes);
 
@@ -742,7 +816,10 @@ void renderer_draw(const Draw& d) {
             overlap = overlap || touched_overlap(r, t.address, bytes, nullptr);
             Upload& up = uploads.emplace_back();
             up.unit = u;
-            up.cached = &r.textures[{t.address, t.format, t.rect, t.control3, t.remap, 0}];
+            up.cached = &r.textures[{t.address, t.format, t.rect, t.control3, t.remap, (fs.cube_textures >> u) & 1}];
+            if (((fs.cube_textures >> u) & 1) != ((t.format >> 2) & 1))
+                fatal("the fragment program at %08x samples texture %u as %s, and it is %s", fs.address, u, (fs.cube_textures >> u) & 1 ? "a cube map" : "2D",
+                      (t.format >> 2) & 1 ? "a cube map" : "2D");
             // Its bytes are hashed once a batch. Within one the game can't change a texture the batch has drawn with: it can't
             // know the RSX is done with it without a label, a wait or a flip, each of which ends the batch. (The texture
             // cache's invalidation doesn't change that, and the game sends one before nearly every draw.)
@@ -778,7 +855,16 @@ void renderer_draw(const Draw& d) {
     for (uint32_t a = 0; a < 16; ++a) attributes += (vs.inputs >> a) & 1;
     VkDeviceSize needed = r.align * 8 + VkDeviceSize{16} * attributes * d.count + indices.size() * 4 + kVertexConstants * 16 + fs.constant_slot_count * 16;
     for (const Upload& up : uploads) needed += up.decode ? up.texels.rgba.size() + r.align : 0;
-    if (needed > r.arena.size) fatal("a draw needs %llu bytes of the renderer's arena, which has %llu", static_cast<unsigned long long>(needed), static_cast<unsigned long long>(r.arena.size));
+    if (needed > r.arena.size) {
+        // A draw larger than the arena: the batch is written back and the arena made big enough (a power of two).
+        renderer_flush();
+        VkDeviceSize size = r.arena.size;
+        while (size < needed) size *= 2;
+        r.arena.destroy(gpu);
+        r.arena = host::Buffer::host_visible(gpu, size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        qilin::rt::log("the renderer's arena grows to %llu MB for a draw of %llu MB", static_cast<unsigned long long>(size >> 20), static_cast<unsigned long long>(needed >> 20));
+    }
     if (r.recording && (r.arena_used + needed > r.arena.size || r.sets_used + 2 > kMostSets)) renderer_flush();
     VkCommandBuffer cmd = r.cmd;
     if (!r.recording) {
@@ -850,9 +936,7 @@ void renderer_draw(const Draw& d) {
         for (size_t i = 0; i < uploads.size(); ++i) {
             Upload& up = uploads[i];
             host::Image& image = up.cached->image;
-            if (!image.image)
-                image = host::Image::create(gpu, up.texels.width, up.texels.height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                            up.texels.levels);
+            if (!image.image) image = texture_image(gpu, up.texels);
             images[i] = {up.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             texture_writes[i].dstSet = set1, texture_writes[i].dstBinding = up.unit, texture_writes[i].descriptorCount = 1;
             texture_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_writes[i].pImageInfo = &images[i];
@@ -860,15 +944,17 @@ void renderer_draw(const Draw& d) {
             // (Draws earlier in the batch that sampled it are ordered before this copy by the transition's barrier.)
             const VkDeviceSize at = arena_take(r, up.texels.rgba.size());
             std::memcpy(arena_at(r, at), up.texels.rgba.data(), up.texels.rgba.size());
-            host::transition(cmd, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            std::vector<VkBufferImageCopy> levels(up.texels.levels);
-            for (uint32_t l = 0; l < up.texels.levels; ++l) {
-                levels[l].bufferOffset = at + up.texels.level_offset[l];
-                levels[l].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
-                levels[l].imageExtent = {std::max(1u, up.texels.width >> l), std::max(1u, up.texels.height >> l), 1};
-            }
-            vkCmdCopyBufferToImage(cmd, r.arena.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, up.texels.levels, levels.data());
-            host::transition(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            transition_texture(cmd, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            std::vector<VkBufferImageCopy> levels(size_t{up.texels.levels} * up.texels.faces);
+            for (uint32_t face = 0; face < up.texels.faces; ++face)
+                for (uint32_t l = 0; l < up.texels.levels; ++l) {
+                    VkBufferImageCopy& c = levels[size_t{face} * up.texels.levels + l];
+                    c.bufferOffset = at + up.texels.level_offset[size_t{face} * up.texels.levels + l];
+                    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, face, 1};
+                    c.imageExtent = {std::max(1u, up.texels.width >> l), std::max(1u, up.texels.height >> l), 1};
+                }
+            vkCmdCopyBufferToImage(cmd, r.arena.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(levels.size()), levels.data());
+            transition_texture(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
         vkUpdateDescriptorSets(gpu.device, static_cast<uint32_t>(texture_writes.size()), texture_writes.data(), 0, nullptr);
     }

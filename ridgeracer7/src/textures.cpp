@@ -97,26 +97,30 @@ std::string texture_extent(const TextureUnit& t, size_t& guest_bytes) {
     const uint32_t f = (t.format >> 8) & 0x1f;
     const bool linear = (t.format >> 13) & 1;
     if ((t.format & 3) != 1 && (t.format & 3) != 2) return what("a texture in location %u", t.format & 3);
-    if (t.format & 4) return "a cube map";
     if (((t.format >> 4) & 0xf) != 2) return what("a texture of %u dimensions", (t.format >> 4) & 0xf);
     if ((t.format >> 14) & 1) return "unnormalised texture coordinates";
     if (!unit_bytes(f)) return what("texture format %u", f);
+    const bool cube = (t.format & 4) != 0;
+    if (cube && (t.rect >> 16) != (t.rect & 0xffff)) return "a cube map that isn't square";
     const uint32_t width = t.rect >> 16, height = t.rect & 0xffff, levels = (t.format >> 16) & 0xffff, depth = t.control3 >> 20, pitch = t.control3 & 0xfffff;
     if (!width || !height || !levels) return what("a texture with no texels (%08x)", t.rect);
     if (depth != 1) return what("a texture of depth %u", depth);
     if (linear && !compressed(f) && levels > 1) return "a linear texture with mipmaps";
     if (!linear && !compressed(f) && !(std::has_single_bit(width) && std::has_single_bit(height))) return "a swizzled texture whose sides aren't powers of two";
     size_t at = 0;
-    for (uint32_t l = 0; l < levels; ++l) {
-        const uint32_t w = std::max(1u, width >> l), h = std::max(1u, height >> l);
-        if (compressed(f)) {
-            const uint32_t bh = (h + 3) / 4, row = (w + 3) / 4 * unit_bytes(f);
-            const uint32_t stride = linear && pitch && l == 0 ? pitch : row;
-            if (stride < row) return what("a compressed texture's pitch %u", pitch);
-            at += size_t{stride} * bh;
-        } else {
-            if (linear && pitch < w * unit_bytes(f)) return what("a linear texture's pitch %u", pitch);
-            at += linear ? size_t{pitch} * h : size_t{w} * h * unit_bytes(f);
+    for (uint32_t face = 0; face < (cube ? 6u : 1u); ++face) {
+        at = (at + 127) & ~size_t{127};  // a cube map's faces each begin on 128 bytes (*a stated reading*)
+        for (uint32_t l = 0; l < levels; ++l) {
+            const uint32_t w = std::max(1u, width >> l), h = std::max(1u, height >> l);
+            if (compressed(f)) {
+                const uint32_t bh = (h + 3) / 4, row = (w + 3) / 4 * unit_bytes(f);
+                const uint32_t stride = linear && pitch && l == 0 ? pitch : row;
+                if (stride < row) return what("a compressed texture's pitch %u", pitch);
+                at += size_t{stride} * bh;
+            } else {
+                if (linear && pitch < w * unit_bytes(f)) return what("a linear texture's pitch %u", pitch);
+                at += linear ? size_t{pitch} * h : size_t{w} * h * unit_bytes(f);
+            }
         }
     }
     guest_bytes = at;
@@ -127,17 +131,8 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
     if (size_t bytes = 0; !texture_extent(t, bytes).empty()) return texture_extent(t, bytes);
     const uint32_t f = (t.format >> 8) & 0x1f;
     const bool linear = (t.format >> 13) & 1;
-    if ((t.format & 3) != 1 && (t.format & 3) != 2) return what("a texture in location %u", t.format & 3);
-    if (t.format & 4) return "a cube map";
-    if (((t.format >> 4) & 0xf) != 2) return what("a texture of %u dimensions", (t.format >> 4) & 0xf);
-    if ((t.format >> 14) & 1) return "unnormalised texture coordinates";
-    if (!unit_bytes(f)) return what("texture format %u", f);
-    const uint32_t width = t.rect >> 16, height = t.rect & 0xffff, levels = (t.format >> 16) & 0xffff, depth = t.control3 >> 20, pitch = t.control3 & 0xfffff;
-    if (!width || !height || !levels) return what("a texture with no texels (%08x)", t.rect);
-    if (depth != 1) return what("a texture of depth %u", depth);
-    if (linear && !compressed(f) && levels > 1) return "a linear texture with mipmaps";
-    const bool square_sides = std::has_single_bit(width) && std::has_single_bit(height);
-    if (!linear && !compressed(f) && !square_sides) return "a swizzled texture whose sides aren't powers of two";
+    // (Checked by texture_extent.)
+    const uint32_t width = t.rect >> 16, height = t.rect & 0xffff, levels = (t.format >> 16) & 0xffff, pitch = t.control3 & 0xfffff;
     // The remap: each output (A, R, G, B) zero, one, or one of the inputs (A, R, G, B).
     uint32_t source[4], kind[4];
     for (unsigned c = 0; c < 4; ++c) source[c] = (t.remap >> (2 * c)) & 3, kind[c] = (t.remap >> (8 + 2 * c)) & 3;
@@ -148,8 +143,11 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
         for (unsigned c = 0; c < 4; ++c)
             if (kind[c] == 2 && source[c] != 3) return what("a B8 texture's remap %08x, which reads a channel other than B", t.remap);
 
-    out = {width, height, levels, {}, {}};
+    const uint32_t faces = (t.format & 4) ? 6 : 1;
+    out = {width, height, levels, faces, {}, {}};
     size_t at = 0;  // in guest memory, from the texture's start
+    for (uint32_t face = 0; face < faces; ++face) {
+    if (faces > 1) at = (at + 127) & ~size_t{127};
     for (uint32_t l = 0; l < levels; ++l) {
         const uint32_t w = std::max(1u, width >> l), h = std::max(1u, height >> l);
         out.level_offset.push_back(out.rgba.size());
@@ -191,6 +189,7 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
                 }
             at += linear ? size_t{pitch} * h : size_t{w} * h * bytes;
         }
+    }
     }
     out.guest_bytes = at;
     return {};

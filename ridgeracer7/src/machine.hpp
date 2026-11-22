@@ -158,6 +158,9 @@ struct SpuTaskSetup {
 void start_spu_task(SpuTaskSetup setup);
 // Woken whenever an SPU program's atomic put succeeds (with spu_atomic_mutex), for native code waiting on a line to change.
 std::condition_variable& spu_atomic_changed();
+// Called (without the lock) after each atomic put an SPU program makes, with the line's address: how SPURS sees what the
+// SDK's code in its tasks does to a taskset (a task made by another, say).
+void set_spu_atomic_watch(void (*watch)(uint32_t line));
 // The lock SPU programs' atomic transfers take (spu.cpp): native code changing a line an SPU program reserves takes it too,
 // so that the program's conditional put fails and it reads the line again.
 std::mutex& spu_atomic_mutex();

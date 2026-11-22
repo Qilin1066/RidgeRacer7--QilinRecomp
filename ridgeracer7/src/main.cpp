@@ -184,16 +184,25 @@ int main(int argc, char** argv) {
     info.title_id = sfo->text("TITLE_ID").value_or("");
     info.parental_level = sfo->number("PARENTAL_LEVEL").value_or(0);
     if (info.title_id.empty()) fatal("%s names no title id", files->sfo.string().c_str());
+    // A development aid: RR7_QUIET=1 runs with no window (headless), no sound and no controller but RR7_PRESS's, so that a
+    // test run disturbs nobody at the computer. Its dialogs must be answered by RR7_ANSWER.
+    const bool quiet = std::getenv("RR7_QUIET") != nullptr;
+    if (quiet && !std::getenv("RR7_ANSWER")) fatal("RR7_QUIET needs RR7_ANSWER: with no window, nobody can answer the system's dialogs");
     // The game's sound, to the host's output: opened when the first of it comes.
-    rr7::set_audio_sink([](const int16_t* left_right, size_t frames) {
-        static qilin::host::AudioOut out;
-        out.push(left_right, frames, 48000);
-    });
+    if (quiet) {
+        rr7::set_audio_sink([](const int16_t*, size_t) {});
+    } else {
+        rr7::set_audio_sink([](const int16_t* left_right, size_t frames) {
+            static qilin::host::AudioOut out;
+            out.push(left_right, frames, 48000);
+        });
+    }
     // The window, on this thread (the window system wants its events here); the game on a thread of its own.
     namespace host = qilin::host;
     host::Display::Options o;
     o.title = "Ridge Racer 7";
     o.width = 1280, o.height = 720;
+    o.headless = quiet;
     host::Display display(o);
     qilin::rt::log("graphics device: %s", display.device_name().c_str());
     static std::mutex queue;  // the GPU's queue: the renderer's draws and the window's presentation take turns on it
@@ -246,7 +255,13 @@ int main(int argc, char** argv) {
             const uint64_t now = flips;
             for (const Press& p : presses)
                 if (now >= p.flip && now < p.flip + 6) (p.second ? pressed2 : pressed1) |= p.bit;
-            rr7::set_pad_state(read_pad(display, pressed1, pressed2));
+            if (quiet) {
+                rr7::PadState pad;
+                pad.digital1 = pressed1, pad.digital2 = pressed2;
+                rr7::set_pad_state(pad);
+            } else {
+                rr7::set_pad_state(read_pad(display, pressed1, pressed2));
+            }
         }
         // A dialog of the system's that asks the player something: a message box of the host's, over the window.
         {
@@ -270,6 +285,10 @@ int main(int argc, char** argv) {
                 if (!SDL_ShowMessageBox(&box, &chosen)) qilin::rt::fatal("the host can't show the system's dialog: %s", SDL_GetError());
                 rr7::answer_dialog(chosen < 0 ? 3 : chosen);
             }
+        }
+        if (quiet) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
         }
         if (flips != shown) {
             {

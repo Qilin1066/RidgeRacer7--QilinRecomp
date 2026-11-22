@@ -31,6 +31,7 @@
 // come).
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -109,6 +110,7 @@ uint32_t g_next_group = 0x04000100u, g_next_thread = 0x02000000u;
 bool g_initialised = false;
 std::mutex g_atomic;  // the atomic line transfers, one at a time
 std::condition_variable g_atomic_changed;  // an atomic put has changed a line
+std::atomic<void (*)(uint32_t)> g_atomic_watch{nullptr};
 // Where a task's SPURS kernel is, in its local store below the program (spu.cpp's prepare): its context and its entry.
 constexpr uint32_t kTaskContext = 0x2d00, kKernelEntry = 0x2e00;
 
@@ -191,7 +193,7 @@ void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
         return;
     }
     case 0xB4: {  // put the line back, if nobody changed it
-        const std::lock_guard lock(g_atomic);
+        std::unique_lock lock(g_atomic);
         const uint32_t line = t.eal & ~127u;
         uint8_t* const there = shared(t, line, 128, pc);
         if (t.reserved && t.reserved_at == line && std::memcmp(there, t.reserved_data.data(), 128) == 0) {
@@ -202,14 +204,21 @@ void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
             t.atomic_status = 1;
         }
         t.reserved = false;
+        if (t.atomic_status == 0) {
+            lock.unlock();
+            if (const auto watch = g_atomic_watch.load()) watch(line);
+        }
         return;
     }
     case 0xB0: case 0xB8: {  // put the line whatever happened (the second form reports nothing)
-        const std::lock_guard lock(g_atomic);
-        std::memcpy(shared(t, t.eal & ~127u, 128, pc), local(t, t.lsa & 0x3ff80u, 128, pc), 128);
-        if ((command & ~3u) == 0xB0) t.atomic_status = 2;
-        t.reserved = false;
-        g_atomic_changed.notify_all();
+        {
+            const std::lock_guard lock(g_atomic);
+            std::memcpy(shared(t, t.eal & ~127u, 128, pc), local(t, t.lsa & 0x3ff80u, 128, pc), 128);
+            if ((command & ~3u) == 0xB0) t.atomic_status = 2;
+            t.reserved = false;
+            g_atomic_changed.notify_all();
+        }
+        if (const auto watch = g_atomic_watch.load()) watch(t.eal & ~127u);
         return;
     }
     default: fatal("SPU thread %s: memory-transfer command %#x, which this runtime doesn't provide yet (at %05x)", t.name.c_str(), command, pc);
@@ -771,6 +780,7 @@ void start_spu_task(SpuTaskSetup setup) {
 
 std::mutex& spu_atomic_mutex() { return g_atomic; }
 std::condition_variable& spu_atomic_changed() { return g_atomic_changed; }
+void set_spu_atomic_watch(void (*watch)(uint32_t line)) { g_atomic_watch.store(watch); }
 
 void forbid_spu_transfers(uint32_t address, uint32_t size, const char* what) {
     const std::lock_guard lock(g_forbidden_mutex);

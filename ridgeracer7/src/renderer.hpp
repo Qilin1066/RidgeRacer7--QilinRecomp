@@ -32,11 +32,15 @@ struct Surface {
     uint32_t pitch = 0, format = 0, width = 0, height = 0;
 };
 
+inline constexpr uint32_t kRestart = 0xffffffffu;
+
 // One draw, as the RSX's methods left it.
 struct Draw {
     Surface color;
     uint32_t color_mask = 0;  // the RSX's: blue bit 0, green 8, red 16, alpha 24
-    uint32_t primitive = 0, first = 0, count = 0;
+    uint32_t primitive = 0, first = 0, count = 0;  // the vertices fetched: [first, first + count)
+    bool indexed = false;
+    std::vector<uint32_t> indices;  // when indexed: the order the vertices are drawn in, from 0 for `first`; kRestart ends a primitive
     // Vertex attributes: the raw format word (SET_VERTEX_DATA_ARRAY_FORMAT) and the address of the first vertex's.
     std::array<uint32_t, 16> attribute_format{}, attribute_address{};
     const float* vertex_constants = nullptr;  // 468 vec4
@@ -57,6 +61,8 @@ struct Draw {
     // The depth test: on or off, its function (OpenGL's NEVER 0x200 to ALWAYS 0x207), whether depth is written, and the
     // depth-stencil surface (format 2: Z24S8, a big-endian word of depth in the top 24 bits and stencil in the low 8).
     bool depth_test = false, depth_write = false;
+    bool depth_bias = false;  // polygon offset
+    float bias_factor = 0, bias_units = 0;
     uint32_t depth_func = 0;
     Surface depth;
 };

@@ -13,11 +13,13 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 #include <chrono>
 #include <cstdlib>
 #include <map>
+#include <string>
 #include <thread>
 
 #include "gcm.hpp"
@@ -48,7 +50,11 @@ struct Rsx {
     uint32_t constant_at = 0;
     // Between SET_BEGIN_END's begin and its end: the primitive, and the ranges of vertices drawn.
     uint32_t primitive = 0;
-    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    struct Range {
+        uint32_t first, count;
+        bool indexed;  // DRAW_INDEX_ARRAY's: first and count are of the index array
+    };
+    std::vector<Range> ranges;
 };
 Rsx r;
 
@@ -114,6 +120,16 @@ constexpr StateMethods kState[] = {
     {0x1fc0, 6, "SET_FREQUENCY_DIVIDER_OPERATION"},  // ... ATTRIB_COLOR, ATTRIB_TEX_COORD, ATTRIB_TEX_COORD_EX, ATTRIB_UCLIP0, ATTRIB_UCLIP1
     {0x1fe0, 1, "SET_REDUCE_DST_COLOR"},
     {0x1fe8, 5, "SET_NO_PARANOID_TEXTURE_FETCHES"},  // ... SHADER_PACKER, VERTEX_ATTRIB_INPUT_MASK, VERTEX_ATTRIB_OUTPUT_MASK, TRANSFORM_BRANCH_BITS
+    // The 2D objects the game's library puts on subchannels 3 and 5 (its command headers say so: 0x6xxx and 0xaxxx), as
+    // PSL1GHT's headers name their methods. Subchannel 3: the 2D surface (NV3062) a blit writes to.
+    {0x6000, 1, "NV3062 SET_OBJECT"},
+    {0x6180, 3, "NV3062 SET_CONTEXT_DMA_NOTIFIES"},  // ... IMAGE_SOURCE, IMAGE_DESTIN
+    {0x6300, 4, "NV3062 SET_COLOR_FORMAT"},          // ... SET_PITCH (destination << 16 | source), SET_OFFSET_SOURCE, SET_OFFSET_DESTIN
+    // Subchannel 5: the image from the CPU (NV308A), whose COLOR words (0xa400 on) are written to the 2D surface.
+    {0xa000, 1, "NV308A SET_OBJECT"},
+    {0xa180, 8, "NV308A SET_CONTEXT_DMA_NOTIFIES"},  // ... COLOR_KEY, CLIP_RECTANGLE, PATTERN, ROP, BETA1, BETA4, SURFACE
+    {0xa2fc, 4, "NV308A SET_OPERATION"},             // ... SET_COLOR_FORMAT, POINT, SIZE_OUT
+    {0xa30c, 1, "NV308A SIZE_IN"},
 };
 
 bool is_state(uint32_t method) {
@@ -168,7 +184,7 @@ uint32_t state(uint32_t method) { return r.state[method / 4]; }
 float state_float(uint32_t method) { return std::bit_cast<float>(r.state[method / 4]); }
 
 // One draw of vertices [first, first + count), with the state the methods have left.
-void draw(uint32_t first, uint32_t count, uint32_t at) {
+void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
     Draw d;
     // The colour surface: only surface A, linear, not antialiased, in this first renderer.
     const uint32_t format = state(0x0208);
@@ -192,7 +208,10 @@ void draw(uint32_t first, uint32_t count, uint32_t at) {
         d.depth.address = guest_address(surface_location(state(0x0198)), state(0x0214), "a depth surface");
         d.depth.width = state(0x0200) >> 16, d.depth.height = state(0x0204) >> 16;
     }
-    if (state(0x0a68)) fatal("a draw with polygon offset, which the renderer doesn't take yet (at offset %08x)", at);
+    // Polygon offset for filled primitives (SET_POLY_OFFSET_FILL_ENABLE, SCALE_FACTOR, BIAS): Vulkan's depth bias, the slope
+    // factor and the constant. *With D32S8 a unit of bias follows the depth's exponent rather than 2^-24: a stated difference.*
+    if (state(0x0a60) || state(0x0a64)) fatal("a draw with polygon offset for points or lines, which the renderer doesn't take yet (at offset %08x)", at);
+    if (state(0x0a68)) d.depth_bias = true, d.bias_factor = state_float(0x0a78), d.bias_units = state_float(0x0a7c);
     if (state(0x032c)) fatal("a draw with the stencil test, which the renderer doesn't take yet (at offset %08x)", at);
     // The alpha test (SET_ALPHA_FUNC: OpenGL's NEVER 0x200 to ALWAYS 0x207, bit 0 less, bit 1 equal, bit 2 greater; SET_ALPHA_REF):
     // on 8-bit surfaces the reference's low byte against the alpha as stored. *Its reference on a float surface isn't known here.*
@@ -204,6 +223,33 @@ void draw(uint32_t first, uint32_t count, uint32_t at) {
     }
     if (state(0x173c)) fatal("a draw with a base vertex index, which the renderer doesn't take yet (at offset %08x)", at);
     d.primitive = r.primitive, d.first = first, d.count = count;
+    if (indexed) {
+        // The indices (SET_INDEX_ARRAY_ADDRESS, and INDEX_ARRAY_DMA: location in bit 0, type in bits 4 to 7, 0 32-bit and 1
+        // 16-bit), big-endian, from `first`: the vertices fetched are the range they use, and the indices rebased to it.
+        const uint32_t dma = state(0x1820), type = (dma >> 4) & 0xf;
+        if (type > 1 || (dma & ~0xf1u)) fatal("an index array of format %08x, which the renderer doesn't take yet (at offset %08x)", dma, at);
+        // Primitive restart (SET_RESTART_INDEX_ENABLE, RESTART_INDEX): the index that ends a primitive and starts the next,
+        // marked in the list as kRestart for the renderer.
+        const bool restart = state(0x1dac) != 0;
+        const uint32_t restart_index = state(0x1db0);
+        const uint32_t size = type ? 2 : 4;
+        const uint32_t base = guest_address(dma & 1, state(0x181c), "an index array") + first * size;
+        uint32_t lowest = UINT32_MAX, highest = 0;
+        d.indices.resize(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t v = size == 2 ? (uint32_t{guest_memory()[base + 2 * i]} << 8 | guest_memory()[base + 2 * i + 1]) : load32(base + 4 * i);
+            if (restart && v == restart_index) {
+                d.indices[i] = kRestart;
+                continue;
+            }
+            d.indices[i] = v, lowest = std::min(lowest, v), highest = std::max(highest, v);
+        }
+        if (lowest > highest) return;  // (nothing but restarts)
+        for (uint32_t& v : d.indices)
+            if (v != kRestart) v -= lowest;
+        d.first = lowest, d.count = highest - lowest + 1;
+        d.indexed = true;
+    }
     for (uint32_t a = 0; a < 16; ++a) {
         d.attribute_format[a] = state(0x1740 + 4 * a);
         if (((d.attribute_format[a] >> 4) & 0xf) == 0) continue;
@@ -331,10 +377,49 @@ void flip(uint32_t id, uint32_t at) {
     present_frame(rgba.data(), b.width, b.height);
 }
 
+// NV308A's image from the CPU: words given in the command stream (COLOR, 0xa400 on) written into the 2D surface from POINT,
+// a row of SIZE_IN's width at a time; a transfer's sizes come before its words, and the renderer's batch is written back
+// then, so the words land in guest memory after everything drawn before. Fields as PSL1GHT's headers name them (it puts
+// the object on subchannel 5 too, and calls the set-up rsxSetTransferImage's inline form). Only 32-bit surface formats
+// (Y32, A8R8G8B8) are taken: one word a pixel.
+void inline_word(uint32_t index, uint32_t word, uint32_t at) {
+    const uint32_t format = state(0x6300);
+    if (format != 0xb && format != 0xa) fatal("an inline transfer to a surface of format %u, which this runtime doesn't take yet (at offset %08x)", format, at);
+    const uint32_t point = state(0xa304), in_size = state(0xa30c), out_size = state(0xa308);
+    if (in_size != out_size) fatal("an inline transfer that scales (%08x to %08x) (at offset %08x)", in_size, out_size, at);
+    const uint32_t width = in_size & 0xffff, height = in_size >> 16;
+    // The words come padded to an even count (PSL1GHT's padSizeInWords): the padding is no pixel.
+    if (width && index >= width * height && index < ((width * height + 1) & ~1u)) return;
+    if (!width || index >= width * height) fatal("an inline transfer's word %u, past its %u by %u (at offset %08x)", index, width, height, at);
+    const uint32_t x = (point & 0xffff) + index % width, y = (point >> 16) + index / width;
+    const uint32_t dest = guest_address(surface_location(state(0x6188)), state(0x630c), "an inline transfer's surface");
+    store32(dest + y * (state(0x6304) >> 16) + x * 4, word);
+}
+
+// The RSX's last jumps, calls and returns (from, to), for the report of a stop.
+std::array<std::pair<uint32_t, uint32_t>, 8> g_transfers{};
+uint32_t g_transfer_count = 0;
+void note_transfer(uint32_t from, uint32_t to) { g_transfers[g_transfer_count++ % g_transfers.size()] = {from, to}; }
+std::string recent_transfers() {
+    std::string out;
+    for (uint32_t i = 0; i < g_transfers.size() && i < g_transfer_count; ++i) {
+        const auto& [from, to] = g_transfers[(g_transfer_count - 1 - i) % g_transfers.size()];
+        char item[40];
+        std::snprintf(item, sizeof item, "%s%08x->%08x", out.empty() ? "" : ", ", from, to);
+        out += item;
+    }
+    return out;
+}
+
 // One method with one argument.
 void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     if (is_state(method)) {
         r.state[method / 4] = argument;
+        if (method == 0xa30c) renderer_flush();  // an inline transfer begins (inline_word)
+        return;
+    }
+    if (method >= 0xa400 && method < 0xa600) {  // NV308A COLOR: an inline transfer's words
+        inline_word((method - 0xa400) / 4, argument, at);
         return;
     }
     if (method >= 0x0b80 && method < 0x0c00) {  // SET_TRANSFORM_PROGRAM: a word of a vertex program
@@ -406,13 +491,17 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
             r.primitive = argument;
             r.ranges.clear();
         } else {
-            for (const auto& [first, count] : r.ranges) draw(first, count, at);
+            for (const Rsx::Range& range : r.ranges) draw(range.first, range.count, range.indexed, at);
             r.ranges.clear();
         }
         return;
+    case 0x1824:  // DRAW_INDEX_ARRAY: indices [first, first + count) of the index array, count - 1 in the top byte
+        if (!r.primitive) fatal("DRAW_INDEX_ARRAY outside SET_BEGIN_END (at offset %08x)", at);
+        r.ranges.push_back({argument & 0xffffffu, (argument >> 24) + 1, true});
+        return;
     case 0x1814:  // DRAW_ARRAYS: vertices [first, first + count) of the arrays, count - 1 in the top byte
         if (!r.primitive) fatal("DRAW_ARRAYS outside SET_BEGIN_END (at offset %08x)", at);
-        r.ranges.emplace_back(argument & 0xffffffu, (argument >> 24) + 1);
+        r.ranges.push_back({argument & 0xffffffu, (argument >> 24) + 1, false});
         return;
     default:
         if (g_survey) {
@@ -421,7 +510,8 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
             if (method == kMethodFlip || std::chrono::steady_clock::now() > g_survey_ends) end_survey();
             return;
         }
-        fatal("the RSX is given method %04x (argument %08x, at offset %08x), which this runtime doesn't provide yet", method, argument, at);
+        fatal("the RSX is given method %04x (argument %08x, at offset %08x), which this runtime doesn't provide yet; its last jumps, newest first: %s", method, argument, at,
+              recent_transfers().c_str());
     }
 }
 
@@ -432,6 +522,9 @@ void serve() {
     // memory. *A stated choice: the game sets its other surfaces' context objects (colour B to D in the RSX's memory) but
     // never the depth surface's, whose offset fits the RSX's memory.*
     r.state[0x0198 / 4] = 0xFEED0000u;
+    // Likewise the 2D surface's (subchannel 3) source and destination: the game sets neither and its offsets fit the RSX's
+    // memory (*a stated choice, as the depth surface's*).
+    r.state[0x6184 / 4] = r.state[0x6188 / 4] = 0xFEED0000u;
     g_survey = std::getenv("RR7_RSX_SURVEY") != nullptr;
     g_trace = std::getenv("RR7_RSX_TRACE") != nullptr;
     g_survey_ends = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -454,6 +547,7 @@ void serve() {
         uint32_t next;
         if ((header & 0xe0000003u) == 0x20000000u) {  // a jump, as first made
             next = header & 0x1ffffffcu;
+            if (next != r.get) note_transfer(r.get, next);
             if (next == r.get) {  // to itself: the game's way of holding the RSX here until it writes over it
                 renderer_flush();
                 if (g_survey && std::chrono::steady_clock::now() > g_survey_ends) end_survey();
@@ -462,15 +556,18 @@ void serve() {
             }
         } else if ((header & 3) == 1) {  // a jump, as made later
             next = header & 0xfffffffcu;
+            note_transfer(r.get, next);
         } else if ((header & 3) == 2) {  // a call
             if (r.in_call) fatal("the RSX is given a call inside a call, at offset %08x", r.get);
             r.in_call = true;
             r.return_to = r.get + 4;
             next = header & 0xfffffffcu;
+            note_transfer(r.get, next);
         } else if (header == 0x00020000u) {  // a return
             if (!r.in_call) fatal("the RSX is given a return with no call, at offset %08x", r.get);
             r.in_call = false;
             next = r.return_to;
+            note_transfer(r.get, next);
         } else {
             if (header & 0xa0030003u) fatal("the RSX is given a command it can't read: %08x at offset %08x", header, r.get);
             const uint32_t count = (header >> 18) & 0x7ff, method = header & 0xfffc;

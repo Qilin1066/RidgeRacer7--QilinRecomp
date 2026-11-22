@@ -22,6 +22,7 @@ struct TextureUnit {
 // A texture's texels as RGBA8, every level one after the other, and what each level is.
 struct Texels {
     uint32_t width = 0, height = 0, levels = 0;
+    uint32_t faces = 1;  // 6 for a cube map: level_offset is then by face, then level
     std::vector<uint8_t> rgba;
     std::vector<size_t> level_offset;
     size_t guest_bytes = 0;  // how much of guest memory the texture covers

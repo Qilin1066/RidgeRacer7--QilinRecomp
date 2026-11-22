@@ -278,3 +278,24 @@ So a sum is aligned in 64 bits with what falls off remembered, a product is exac
 **Double precision** (three instructions and the two conversions, in three programs) is IEEE's on the host's doubles, with two choices the document leaves to the implementation, stated: a denormal operand is zero with its sign, and a NaN result is always the default one. Rounding is to nearest. The fused double forms and the double compares, which the game doesn't use, are outside the slice.
 
 **Checked.** The differential test now has **4,080 cases and 362,496 runs, all agree**. The reference's floating point (`ref_fp.cpp`) uses another method on purpose: every number is put whole into one 704-bit unsigned number at its true place, sums and differences are exact, and only then is the answer cut to 24 bits; it builds the estimates' tables by whole numbers of 2^-40. Float cases draw their operands from singles of every kind (zeros, denormals, the ends of the range, the largest exponent, neighbours that cancel). With the sum's borrow left out on purpose: 24,068 disagreements. **The estimates are also checked against the document's own bound**: over 2,000,000 numbers, its two sequences (estimate, interpolate, one Newton-Raphson step) give the largest single below the true value or the one beside it, as it requires (the furthest is 1 unit for each); with the tables' lowering turned the wrong way on purpose, 1,839,906 of them break the bound.
+
+## The RSX's programs (`recomp/src/rsx_program.*`)
+
+The game's first frame draws, so its vertex and fragment programs have to be translated before anything is shown; the first piece is reading them. `qilin shaders <game>` decodes and checks all 242; `--disasm` prints each with its parameters.
+
+**Sources.** The field layout is the NV40's, from the public description in the nouveau driver's documentation (Mesa's `nv40_vertprog.h` and `nvfx_shader.h`, MIT-licensed: read for the facts, no code taken), as `prior-art.md` names. The Cg binary's layout (the program header, the parameter table with types, resources, register indices, names, semantics and, for fragment programs, where each constant is patched into the microcode) is NVIDIA's, published with the Cg toolkit; it was confirmed field by field against the game's bytes before use.
+
+**Vertex programs**: four words an instruction, a vector and a scalar operation in each, with separate destinations. **Fragment programs**: four words an instruction, each word stored with its 16-bit halves exchanged; one that reads a constant is followed by the constant, four more words.
+
+**Where the RSX differs from nouveau's NV40 headers, as the game shows:**
+- a vertex instruction's constant index is **10 bits** (word 1, bits 12-21), not 8: the game reads constant 467, and the Cg tables name it so;
+- in fragment instructions, word 3's bits 19-29 (nouveau's input-address displacement) are `0x7FC` exactly when the instruction reads an input, and 0 otherwise; word 2's bits 19-21 are 5 on `NRM` and 0 everywhere else (*not understood*; held to that by the check);
+- the RSX's own operations: `NRM`, `DIV`, `DIVSQ`, `FENCT`, `FENCB` (fragment), beside the NV40's.
+
+**The check** (`check_program`) is this decoder's independent reference, as objdump is the CPU decoders': every program against its own Cg tables. **All 242 agree, over 7,702 instructions:** every set bit belongs to a decoded field; every operation is known; instruction counts match the headers (a fragment program's counts its constant slots too); each vertex program's input mask matches the inputs it reads; every constant a vertex program reads is a named uniform (by register index, or by a semantic `C<n>`, an array's elements at their offsets) or a literal the compiler made (`internal-constant-N`, variability `0x1007`, its value its default); and every place a fragment parameter's value is patched holds an inline constant. Narrowing the constant field to nouveau's 8 bits on purpose made 110 of the 242 disagree. Unit tests build instructions from the fields, not from the game's bytes.
+
+**What the game uses** (programs): vertex `MOV` 120, `MAD` 102, `MUL` 91, `ADD` 84, `DP3` 72, `RSQ` 71, `MAX` 69, `RCP` 68, `MIN` 67, `SGT` 22, and in three programs each `DP4`, `ARL`, `FLR`, `SLT`, `BRA` with indexing by the address register; condition codes in 30. Fragment `TEX` 106, `MOV` 99, `MUL` 97, `MAD` 81, `ADD` 68, `FENCB` 42, `DP3` 38, `EX2` and `LG2` 31, `FENCT` 31, `DIVSQ` 30, `DIV` 18, `NRM` 16, `MAX` 14; fp16 registers in 75, fixed point in 10, a result scale in 41, condition codes in 27; no flow control.
+
+**The uploaded program is the built one.** The vertex program the game loads for its first draw is the microcode of the Cg program at `0x10201c68`, byte for byte: the programs are found at build time and looked up at run time, as planned.
+
+Next: their translation to SPIR-V at build time, then the RSX's drawing.

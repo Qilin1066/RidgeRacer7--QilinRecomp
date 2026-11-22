@@ -111,6 +111,7 @@ bool is_state(uint32_t method) {
 // provided are counted, not run, and at the first flip (or after ten seconds) the list is printed and
 // the process stops. It shows the work ahead at once and not one stop at a time.
 bool g_survey = false;
+bool g_trace = false;  // RR7_RSX_TRACE: every method and its argument, logged
 struct Surveyed {
     uint64_t count = 0;
     uint32_t first = 0;
@@ -181,6 +182,7 @@ void serve() {
     const uint32_t control = rsx_setup().control;
     r.get = load32(control + 4);
     g_survey = std::getenv("RR7_RSX_SURVEY") != nullptr;
+    g_trace = std::getenv("RR7_RSX_TRACE") != nullptr;
     g_survey_ends = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     uint32_t idle = 0;
     for (;;) {
@@ -220,7 +222,10 @@ void serve() {
             if (header & 0xa0030003u) fatal("the RSX is given a command it can't read: %08x at offset %08x", header, r.get);
             const uint32_t count = (header >> 18) & 0x7ff, method = header & 0xfffc;
             const bool same = (header & 0x40000000u) != 0;  // every argument to the one method
-            for (uint32_t i = 0; i < count; ++i) run_method(same ? method : method + 4 * i, load32(address + 4 + 4 * i), r.get);
+            for (uint32_t i = 0; i < count; ++i) {
+                if (g_trace) qilin::rt::log("(rsx) %08x: %04x = %08x", r.get, same ? method : method + 4 * i, load32(address + 4 + 4 * i));
+                run_method(same ? method : method + 4 * i, load32(address + 4 + 4 * i), r.get);
+            }
             next = r.get + 4 + 4 * count;
             ++r.commands;
         }

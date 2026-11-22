@@ -94,6 +94,7 @@ add_library(qilin_recomp STATIC
     recomp/src/spu.cpp
     recomp/src/spu_cfg.cpp
     recomp/src/spu_lift.cpp
+    recomp/src/rsx_program.cpp
 )
 target_include_directories(qilin_recomp PUBLIC recomp/src)
 target_link_libraries(qilin_recomp PUBLIC qilin_game PRIVATE qilin_warnings)

@@ -55,6 +55,7 @@
 #include "spu.hpp"
 #include "spu_cfg.hpp"
 #include "spu_lift.hpp"
+#include "rsx_program.hpp"
 #include "shaders.hpp"
 #include "spu_image.hpp"
 #include "title.hpp"
@@ -102,7 +103,7 @@ struct Args {
     std::string command, input;
     std::optional<std::string> json, out;
     uint32_t base = 0;
-    bool list_files = false, ignore_reserved = false, keep_pc = false, keep_registers = false;
+    bool list_files = false, ignore_reserved = false, keep_pc = false, keep_registers = false, disasm = false;
 };
 
 uint32_t parse_address(std::string_view text) {
@@ -125,6 +126,7 @@ Args parse_args(std::span<char*> argv) {
         else if (arg == "--out" && i + 1 < argv.size()) a.out = argv[++i];
         else if (arg == "--base" && i + 1 < argv.size()) a.base = parse_address(argv[++i]);
         else if (arg == "--files") a.list_files = true;
+        else if (arg == "--disasm") a.disasm = true;
         else if (arg == "--pc") a.keep_pc = true;
         else if (arg == "--registers") a.keep_pc = a.keep_registers = true;
         else if (arg == "--ignore-reserved") a.ignore_reserved = true;
@@ -657,7 +659,62 @@ int cmd_shaders(const Args& a) {
     }
     std::println("{} compiled shader programs: {} vertex, {} fragment; {} bytes, {} of them microcode; {} parameters", programs->size(), vertex,
                  programs->size() - vertex, bytes, microcode, parameters);
-    return 0;
+
+    // Each program decoded and checked against its own header and parameters (rsx_program.hpp).
+    std::map<std::string, size_t> used;  // operations, by name, in how many programs
+    size_t wrong_programs = 0, instructions = 0;
+    for (const ShaderProgram& s : *programs) {
+        const auto binary = elf.bytes_at(s.address, s.size);
+        const auto p = rsx::parse_cg(binary, s.address);
+        if (!p) throw Failure{p.error()};
+        const std::vector<std::string> wrong = rsx::check_program(*p);
+        std::set<std::string> here;
+        std::string text;
+        if (p->vertex) {
+            for (size_t i = 0; i + 16 <= p->microcode.size(); i += 16) {
+                uint32_t w[4];
+                for (unsigned k = 0; k < 4; ++k) w[k] = read_be32(p->microcode.data() + i + 4 * k);
+                const rsx::VpInsn in = rsx::decode_vp(std::span<const uint32_t, 4>(w, 4));
+                if (in.vec_op) here.insert(std::format("vp {}", rsx::vp_vector_name(in.vec_op) ? rsx::vp_vector_name(in.vec_op) : "?"));
+                if (in.sca_op) here.insert(std::format("vp {}", rsx::vp_scalar_name(in.sca_op) ? rsx::vp_scalar_name(in.sca_op) : "?"));
+                if (in.cond_test || in.cond_update) here.insert("vp (condition codes)");
+                if (in.index_const || in.index_input) here.insert("vp (indexed by A0)");
+                if (in.saturate) here.insert("vp (saturate)");
+                if (in.vec_result && in.vec_temp != 0x3F && in.vec_op) here.insert("vp (output and temp at once)");
+                ++instructions;
+                text += std::format("    {:3}  {:08x} {:08x} {:08x} {:08x}  {}\n", i / 16, w[0], w[1], w[2], w[3], rsx::disasm(in));
+            }
+        } else {
+            size_t slot = 0;
+            for (const rsx::FpInsn& in : rsx::decode_fp(p->microcode)) {
+                const char* name = in.branch ? rsx::fp_branch_name(in.op) : rsx::fp_name(in.op);
+                here.insert(std::format("fp {}", name ? name : "?"));
+                if (!in.branch && in.precision) here.insert(std::format("fp (precision {})", in.precision));
+                if (!in.branch && in.scale) here.insert("fp (result scale)");
+                if (!in.branch && (in.cond_write || in.cond != 7)) here.insert("fp (condition codes)");
+                if (!in.branch && in.out_half) here.insert("fp (fp16 destination)");
+                ++instructions;
+                text += std::format("    {:3}  {:08x} {:08x} {:08x} {:08x}  {}\n", slot, in.w[0], in.w[1], in.w[2], in.w[3], rsx::disasm(in));
+                slot += in.has_constant ? 2 : 1;
+            }
+        }
+        for (const std::string& u : here) ++used[u];
+        if (!wrong.empty()) ++wrong_programs;
+        if (a.disasm || !wrong.empty()) {
+            std::println("{:#010x} {} program, header {}", s.address, p->vertex ? "vertex" : "fragment",
+                         [&] { std::string h; for (const uint32_t v : p->header) h += std::format(" {:#x}", v); return h; }());
+            for (const rsx::CgParameter& c : p->parameters)
+                std::println("    {} {}{}: type {:#x} resource {:#x} index {} {}{}", c.direction == 0x1002 ? "out" : c.direction == 0x1001 ? "in " : "   ",
+                             c.variability == 0x1006 ? "uniform " : "", c.name, c.type, c.resource, c.resource_index, c.semantic,
+                             c.referenced ? "" : " (unused)");
+            for (const std::string& w : wrong) std::println("    WRONG: {}", w);
+            if (a.disasm) std::print("{}", text);
+        }
+    }
+    std::println("decoded: {} instructions; {} of {} programs disagree with their own tables", instructions, wrong_programs, programs->size());
+    std::println("what the programs use, in how many:");
+    for (const auto& [what, n] : used) std::println("  {:4}  {}", n, what);
+    return wrong_programs ? 1 : 0;
 }
 
 // ---- the SPU programs' code ----

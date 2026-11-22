@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "archive.hpp"
+#include "rsx_program.hpp"
 #include "cfg.hpp"
 #include "elf.hpp"
 #include "elf_builder.hpp"
@@ -1069,6 +1070,64 @@ void test_title() {
 
 }  // namespace
 
+// ---------------------------------------------------------------- the RSX's programs
+
+// Instructions built field by field from the documented layout (rsx_program.hpp), not taken from any program.
+void test_rsx_program() {
+    using namespace qilin::rsx;
+    // MAD R3.xz, -v[2].yzwx, c[300], R5 (the vector unit), and RSQ o[TC1].w, R5.x (the scalar unit), last.
+    {
+        const auto source = [](uint32_t type, uint32_t temp, uint32_t x, uint32_t y, uint32_t z, uint32_t w, bool negate) {
+            return type | (temp << 2) | (w << 8) | (z << 10) | (y << 12) | (x << 14) | (negate ? 1u << 16 : 0u);
+        };
+        const uint32_t s0 = source(2, 0, 1, 2, 3, 0, true), s1 = source(3, 0, 0, 1, 2, 3, false), s2 = source(1, 5, 0, 0, 0, 0, false);
+        uint32_t w[4] = {};
+        w[0] = (3u << 15) | (7u << 10) | (0x1bu << 2);           // the vector unit's temp 3; the condition "always", swizzle xyzw
+        w[1] = (uint32_t{kScaRsq} << 27) | (uint32_t{kVecMad} << 22) | (300u << 12) | (2u << 8) | (s0 >> 9);
+        w[2] = ((s0 & 0x1ff) << 23) | (s1 << 6) | (s2 >> 11);
+        w[3] = ((s2 & 0x7ff) << 21) | (1u << 17) | (0xau << 13) | (1u << 12) | (8u << 2) | 1u;  // scalar w to the output, vector xz; output 8 (TC1); last
+        const VpInsn in = decode_vp(std::span<const uint32_t, 4>(w, 4));
+        CHECK(in.unknown == (std::array<uint32_t, 4>{}));
+        CHECK(in.vec_op == kVecMad && in.sca_op == kScaRsq && in.constant == 300 && in.input == 2 && in.last);
+        CHECK(in.vec_temp == 3 && in.vec_mask == 0xa && in.sca_result && in.sca_mask == 1 && in.dest == 8);
+        CHECK(in.src[0].type == VpRegister::input && in.src[0].negate && in.src[0].swizzle == (std::array<uint8_t, 4>{1, 2, 3, 0}));
+        CHECK(in.src[1].type == VpRegister::constant && in.src[2].type == VpRegister::temp && in.src[2].temp == 5);
+        CHECK(disasm(in) == "MAD R3.xz, -v[2].yzwx, c[300], R5.xxxx  +  RSQ o[TC1].w, R5.xxxx  (last)");
+    }
+    // ADD R1.y, H2, {1.0, 0, 0, 0}.xxxx: a constant inline after it; then MOV R0, f[COL0], the end. Stored with halves exchanged.
+    {
+        const auto source = [](uint32_t type, uint32_t index, bool half, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+            return type | (index << 2) | (half ? 1u << 8 : 0u) | (x << 9) | (y << 11) | (z << 13) | (w << 15);
+        };
+        const uint32_t words[] = {
+            (uint32_t{kFpAdd} << 24) | (1u << 10) | (1u << 1),  // R1, mask y (bit 10)
+            source(0, 2, true, 0, 1, 2, 3) | (7u << 18) | (0xe4u << 21),
+            source(2, 0, false, 0, 0, 0, 0),
+            0,
+            0x3f800000u, 0, 0, 0,
+            (uint32_t{kFpMov} << 24) | (1u << 13) | (0xfu << 9) | 1u,  // input COL0, all of R0, the end
+            source(1, 0, false, 0, 1, 2, 3) | (7u << 18) | (0xe4u << 21),
+            0,
+            0x7fcu << 19,
+        };
+        Bytes code;
+        for (const uint32_t v : words) {
+            const uint32_t stored = (v << 16) | (v >> 16);
+            code.push_back(static_cast<uint8_t>(stored >> 24)), code.push_back(static_cast<uint8_t>(stored >> 16));
+            code.push_back(static_cast<uint8_t>(stored >> 8)), code.push_back(static_cast<uint8_t>(stored));
+        }
+        size_t used = 0;
+        const std::vector<FpInsn> insns = decode_fp(code, &used);
+        CHECK(insns.size() == 2 && used == 12);
+        if (insns.size() == 2) {
+            CHECK(insns[0].op == kFpAdd && insns[0].mask == 4 && insns[0].has_constant && insns[0].constant[0] == 0x3f800000u && insns[0].src[0].half);
+            CHECK(insns[1].op == kFpMov && insns[1].end && insns[1].input == 1 && insns[1].input_displacement == 0x7fc);
+            CHECK(disasm(insns[0]) == "ADDR R1.y, H2, {0x3f800000, 0x0, 0x0, 0x0}.xxxx");
+            CHECK(disasm(insns[1]) == "MOVR R0, f[COL0]  (end)");
+        }
+    }
+}
+
 int main() {
     test_sha256();
     test_ppu();
@@ -1080,6 +1139,7 @@ int main() {
     test_spu_cfg();
     test_shaders();
     test_archive();
+    test_rsx_program();
     test_syscall_names();
     test_cfg();
     test_import_names();

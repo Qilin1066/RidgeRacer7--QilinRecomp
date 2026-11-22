@@ -181,6 +181,18 @@ uint32_t surface_location(uint32_t object) {
 }
 
 uint32_t state(uint32_t method) { return r.state[method / 4]; }
+
+// A development aid: RR7_DRAWLOG=<n> logs every draw, clear and flip of the frame after the nth flip, in one line each;
+// RR7_DRAWLOG=busy, the frame after the first with more than 300 draws, some to a surface in main memory (a race's scene).
+uint64_t g_flips = 0, g_frame_draws = 0, g_busy_frame = 0;
+bool g_frame_main_memory = false;
+std::map<uint32_t, Surface> g_logged_surfaces;  // the surfaces drawn in the logged frame, written out at its flip
+bool draw_logged() {
+    static const char* const asked = std::getenv("RR7_DRAWLOG");
+    static const uint64_t which = asked ? std::strtoull(asked, nullptr, 10) : 0;
+    if (asked && std::strcmp(asked, "busy") == 0) return g_busy_frame && g_flips == g_busy_frame;
+    return which && g_flips == which;
+}
 float state_float(uint32_t method) { return std::bit_cast<float>(r.state[method / 4]); }
 
 // One draw of vertices [first, first + count), with the state the methods have left.
@@ -313,6 +325,30 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         if (t.enabled() && (location == 1 || location == 2)) t.address = guest_address(location == 1 ? 0 : 1, t.offset, "a texture");
     }
     d.cull_face = state(0x1830), d.front_face = state(0x1834);
+    // A development aid, never a way to play: RR7_SCENE_TEST=1 draws to main-memory surfaces (a race's scene) with no depth
+    // test, culling or alpha test, to tell a fragment test's fault from the geometry's.
+    // (RR7_SCENE_TEST=depth: only the depth test.)
+    static const char* const scene_test = std::getenv("RR7_SCENE_TEST");
+    if (scene_test && d.color.address < kRsxLocal) {
+        d.depth_test = false;
+        if (std::strcmp(scene_test, "depth") != 0) d.cull = false, d.alpha_test = {0, 0, 0, 0, 1, 1, 1, 0};
+    }
+    ++g_frame_draws;
+    if (d.color.address < kRsxLocal) g_frame_main_memory = true;
+    if (draw_logged()) {
+        uint32_t textures = 0;
+        for (uint32_t u = 0; u < 16; ++u) textures |= d.textures[u].enabled() && d.textures[u].format ? 1u << u : 0;
+        qilin::rt::log("(draw) surface %08x %ux%u format %u mask %08x | depth %s func %#x write %d at %08x | blend %d %08x %08x eq %08x | alpha test %d | prim %u, %u vertices%s | cull %d | textures %#x | vp %08x fp %08x",
+                       d.color.address, d.color.width, d.color.height, d.color.format, d.color_mask, d.depth_test ? "on" : "off", d.depth_func, d.depth_write,
+                       d.depth.address, d.blend, d.blend_src, d.blend_dst, d.blend_equation, state(0x0304) != 0, d.primitive, d.count, d.indexed ? " indexed" : "", d.cull,
+                       textures, state(0x1ea0), state(0x08e4));
+        for (uint32_t u = 0; u < 16; ++u)
+            if (textures & (1u << u))
+                qilin::rt::log("(draw)   texture %u at %08x format %08x size %ux%u", u, d.textures[u].address, d.textures[u].format, d.textures[u].rect >> 16, d.textures[u].rect & 0xffff);
+        g_logged_surfaces[d.color.address] = d.color;
+        if (state(0x0a74)) g_logged_surfaces[d.depth.address != 0 ? d.depth.address : 0] = Surface{guest_address(surface_location(state(0x0198)), state(0x0214), "a depth surface"),
+                                                                                                     state(0x022c), 0x100, state(0x0200) >> 16, state(0x0204) >> 16};
+    }
     renderer_draw(d);
 }
 
@@ -321,6 +357,9 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
 // blue 0x40, alpha 0x80. *The clear rectangle is taken in the surface's own coordinates, from its top-left corner, and
 // the colour write mask is not applied to a clear: stated choices, to be compared with the console.*
 void clear(uint32_t mask, uint32_t at) {
+    if (draw_logged())
+        qilin::rt::log("(draw) clear %#x of surface offset %08x %ux%u, colour %08x, depth-stencil %08x at offset %08x", mask, state(0x0210), state(0x0200) >> 16, state(0x0204) >> 16,
+                       state(0x1d90), state(0x1d8c), state(0x0214));
     renderer_flush();
     if (mask & ~0xf3u) fatal("CLEAR_SURFACE with bits %#x, which this runtime doesn't know (at offset %08x)", mask, at);
     const uint32_t format = state(0x0208);
@@ -361,6 +400,37 @@ void clear(uint32_t mask, uint32_t at) {
 
 // A flip: the display buffer, from guest memory, to the window.
 void flip(uint32_t id, uint32_t at) {
+    if (draw_logged()) {
+        qilin::rt::log("(draw) flip of display buffer %u", id);
+        renderer_flush();
+        // Each surface drawn in the frame, as guest memory holds it, to surface-<address>.bmp (A8R8G8B8 ones).
+        for (const auto& [address, sf] : g_logged_surfaces) {
+            if (sf.format != 8 && sf.format != 0x100) continue;  // (0x100: a Z24S8 surface, its depth as grey)
+            char name[64];
+            std::snprintf(name, sizeof name, "surface-%08x.bmp", address);
+            std::FILE* f = std::fopen(name, "wb");
+            if (!f) continue;
+            const uint32_t bytes = sf.width * sf.height * 4;
+            uint8_t header[54] = {'B', 'M'};
+            const auto put = [&](size_t at, uint32_t v) { for (unsigned i = 0; i < 4; ++i) header[at + i] = static_cast<uint8_t>(v >> (8 * i)); };
+            put(2, 54 + bytes), put(10, 54), put(14, 40), put(18, sf.width), put(22, static_cast<uint32_t>(-static_cast<int32_t>(sf.height)));
+            header[26] = 1, header[28] = 32;
+            std::fwrite(header, 1, 54, f);
+            std::vector<uint8_t> row(sf.width * 4);
+            for (uint32_t y = 0; y < sf.height; ++y) {
+                const uint8_t* p = guest_memory() + address + y * sf.pitch;
+                for (uint32_t x = 0; x < sf.width; ++x) {
+                    if (sf.format == 0x100) row[4 * x] = row[4 * x + 1] = row[4 * x + 2] = p[4 * x], row[4 * x + 3] = 255;  // depth's top byte
+                    else row[4 * x] = p[4 * x + 3], row[4 * x + 1] = p[4 * x + 2], row[4 * x + 2] = p[4 * x + 1], row[4 * x + 3] = p[4 * x];
+                }
+                std::fwrite(row.data(), 1, row.size(), f);
+            }
+            std::fclose(f);
+        }
+    }
+    ++g_flips;
+    if (!g_busy_frame && g_frame_draws > 300 && g_frame_main_memory) g_busy_frame = g_flips;
+    g_frame_draws = 0, g_frame_main_memory = false;
     renderer_flush();
     const DisplayBuffer b = display_buffer(id);
     if (!b.set) fatal("the RSX is to show display buffer %u, which the game never set (at offset %08x)", id, at);
@@ -530,6 +600,9 @@ void serve() {
     // Likewise the 2D surface's (subchannel 3) source and destination: the game sets neither and its offsets fit the RSX's
     // memory (*a stated choice, as the depth surface's*).
     r.state[0x6184 / 4] = r.state[0x6188 / 4] = 0xFEED0000u;
+    // And the clear's rectangle (SET_CLEAR_RECT_HORIZONTAL, VERTICAL: origin and size) covering everything: the game never
+    // sets it and clears with it, so the system's start-up must (*a stated choice*: 0 to 4095 each way, clipped to the surface).
+    r.state[0x1d98 / 4] = r.state[0x1d9c / 4] = 0x0fff0000u;
     g_survey = std::getenv("RR7_RSX_SURVEY") != nullptr;
     g_trace = std::getenv("RR7_RSX_TRACE") != nullptr;
     g_survey_ends = std::chrono::steady_clock::now() + std::chrono::seconds(10);

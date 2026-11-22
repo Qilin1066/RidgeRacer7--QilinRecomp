@@ -344,7 +344,32 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
                        textures, state(0x1ea0), state(0x08e4));
         for (uint32_t u = 0; u < 16; ++u)
             if (textures & (1u << u))
-                qilin::rt::log("(draw)   texture %u at %08x format %08x size %ux%u", u, d.textures[u].address, d.textures[u].format, d.textures[u].rect >> 16, d.textures[u].rect & 0xffff);
+            {
+                const TextureUnit& t = d.textures[u];
+                qilin::rt::log("(draw)   texture %u at %08x format %08x size %ux%u remap %08x", u, t.address, t.format, t.rect >> 16, t.rect & 0xffff, t.remap);
+                // Each texture once, decoded as the renderer decodes it (its first level), to texture-<address>.bmp.
+                static std::map<uint32_t, bool> written;
+                Texels tx;
+                if (!written[t.address] && decode_texture(t, guest_memory(), tx).empty()) {
+                    written[t.address] = true;
+                    char name[64];
+                    std::snprintf(name, sizeof name, "texture-%08x.bmp", t.address);
+                    if (std::FILE* f = std::fopen(name, "wb")) {
+                        const uint32_t bytes = tx.width * tx.height * 4;
+                        uint8_t header[54] = {'B', 'M'};
+                        const auto put = [&](size_t at2, uint32_t v) { for (unsigned i = 0; i < 4; ++i) header[at2 + i] = static_cast<uint8_t>(v >> (8 * i)); };
+                        put(2, 54 + bytes), put(10, 54), put(14, 40), put(18, tx.width), put(22, static_cast<uint32_t>(-static_cast<int32_t>(tx.height)));
+                        header[26] = 1, header[28] = 32;
+                        std::fwrite(header, 1, 54, f);
+                        for (uint32_t i = 0; i < tx.width * tx.height; ++i) {
+                            const uint8_t* q = tx.rgba.data() + 4 * i;
+                            const uint8_t bgra[4] = {q[2], q[1], q[0], q[3]};
+                            std::fwrite(bgra, 1, 4, f);
+                        }
+                        std::fclose(f);
+                    }
+                }
+            }
         g_logged_surfaces[d.color.address] = d.color;
         if (state(0x0a74)) g_logged_surfaces[d.depth.address != 0 ? d.depth.address : 0] = Surface{guest_address(surface_location(state(0x0198)), state(0x0214), "a depth surface"),
                                                                                                      state(0x022c), 0x100, state(0x0200) >> 16, state(0x0204) >> 16};

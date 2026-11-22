@@ -44,6 +44,7 @@ std::span<const NativeImport> usbd_imports();     // usbd.cpp
 std::span<const NativeImport> mempool_imports();  // mempool.cpp
 std::span<const NativeImport> gcm_imports();      // gcm.cpp
 std::span<const NativeImport> savedata_imports();  // savedata.cpp
+std::span<const NativeImport> film_imports();  // film.cpp
 std::span<const NativeImport> rtc_imports();  // rtc.cpp
 std::span<const NativeImport> spu_imports();      // spu.cpp
 std::span<const NativeImport> audio_imports();  // audio.cpp

@@ -25,6 +25,8 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The game draws its first screen (the Dolby Digital logo) in the window.
 - The depth test (Z24S8, as D32S8 where the GPU has it) and culling; the game reaches its title screen.
 - The renderer's speed: host-cached staging, surfaces not uploaded again while guest memory is unchanged, only written surfaces copied back, a texture cache checked by hash. About 33 flips a second on the title screen, from 26 a minute.
+- Films: PAMF, the demultiplexer and the MPEG-2 decoder (`film.cpp`), with FFmpeg's libavcodec built from the files two decoders and a parser need (`cmake/ffmpeg.cmake`). The game plays its title film.
+- B8 textures.
 - SPURS tasks, run as SPU programs on host threads, and SPURS event flags; tasksets joined and shut down.
 - `RR7_SECONDS`: a timed run that saves its last picture and reports where the renderer's time went.
 - The controller: the window's gamepad or the keyboard as the first port's DualShock 3. `RR7_ANSWER` and `RR7_PRESS` for runs with nobody there.

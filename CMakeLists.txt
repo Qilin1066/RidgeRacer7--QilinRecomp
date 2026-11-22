@@ -208,6 +208,7 @@ set(qilin_saved_shared ${BUILD_SHARED_LIBS})
 set(BUILD_SHARED_LIBS OFF)
 FetchContent_MakeAvailable(freetype)
 set(BUILD_SHARED_LIBS ${qilin_saved_shared})
+include(cmake/ffmpeg.cmake)
 
 add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/events.cpp
@@ -229,6 +230,7 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/textures.cpp
     ridgeracer7/src/rtc.cpp
     ridgeracer7/src/savedata.cpp
+    ridgeracer7/src/film.cpp
     ridgeracer7/src/rsx.cpp
     ridgeracer7/src/spu.cpp
     ridgeracer7/src/spurs.cpp
@@ -250,7 +252,7 @@ endif()
 if(NOT TARGET qilin_host)
     message(FATAL_ERROR "the game's machine needs the host layer: configure with -DQILIN_HOST=ON")
 endif()
-target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt qilin_host PRIVATE qilin_warnings freetype)
+target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt qilin_host PRIVATE qilin_warnings freetype qilin_ffmpeg)
 # FreeType's headers are not ours to warn about.
 target_include_directories(ridgeracer7_machine SYSTEM PRIVATE $<TARGET_PROPERTY:freetype,INTERFACE_INCLUDE_DIRECTORIES>)
 set(QILIN_GEN_DIR "" CACHE PATH "The folder `qilin lift <game> --out` wrote: the lifted code of your own copy")

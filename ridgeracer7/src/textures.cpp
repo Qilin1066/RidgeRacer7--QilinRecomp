@@ -15,10 +15,13 @@ std::string what(const char* format, uint32_t value) {
 }
 
 // The formats taken (the format word's bits 8 to 12), with their bytes per texel, or per 4 by 4 block when compressed.
-enum : uint32_t { kA1R5G5B5 = 2, kA4R4G4B4 = 3, kR5G6B5 = 4, kA8R8G8B8 = 5, kDxt1 = 6, kDxt23 = 7, kDxt45 = 8 };
+// B8 (1) is NV40's L8: its byte is in source channel B, the only one Mesa's nouveau driver reads (its nv30_format.c), so a
+// remap that takes another channel of it is refused.
+enum : uint32_t { kB8 = 1, kA1R5G5B5 = 2, kA4R4G4B4 = 3, kR5G6B5 = 4, kA8R8G8B8 = 5, kDxt1 = 6, kDxt23 = 7, kDxt45 = 8 };
 bool compressed(uint32_t f) { return f == kDxt1 || f == kDxt23 || f == kDxt45; }
 uint32_t unit_bytes(uint32_t f) {
     switch (f) {
+    case kB8: return 1;
     case kA1R5G5B5: case kA4R4G4B4: case kR5G6B5: return 2;
     case kA8R8G8B8: return 4;
     case kDxt1: return 8;
@@ -39,6 +42,7 @@ void texel(uint32_t f, const uint8_t* p, uint8_t* argb) {
     const uint32_t h = (uint32_t{p[0]} << 8) | p[1];
     switch (f) {
     case kA8R8G8B8: argb[0] = p[0], argb[1] = p[1], argb[2] = p[2], argb[3] = p[3]; break;
+    case kB8: argb[0] = argb[1] = argb[2] = 0, argb[3] = p[0]; break;
     case kA1R5G5B5: argb[0] = (h >> 15) ? 255 : 0, argb[1] = expand(h >> 10, 5), argb[2] = expand(h >> 5, 5), argb[3] = expand(h, 5); break;
     case kA4R4G4B4: argb[0] = expand(h >> 12, 4), argb[1] = expand(h >> 8, 4), argb[2] = expand(h >> 4, 4), argb[3] = expand(h, 4); break;
     case kR5G6B5: argb[0] = 255, argb[1] = expand(h >> 11, 5), argb[2] = expand(h >> 5, 6), argb[3] = expand(h, 5); break;
@@ -140,6 +144,9 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
     for (unsigned c = 0; c < 4; ++c)
         if (kind[c] == 3) return what("texture remap %08x", t.remap);
     if (t.remap >> 17) return what("texture remap %08x", t.remap);
+    if (f == kB8)
+        for (unsigned c = 0; c < 4; ++c)
+            if (kind[c] == 2 && source[c] != 3) return what("a B8 texture's remap %08x, which reads a channel other than B", t.remap);
 
     out = {width, height, levels, {}, {}};
     size_t at = 0;  // in guest memory, from the texture's start

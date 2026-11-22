@@ -11,6 +11,7 @@
 // data is read from your copy each time; nothing of the game is in this
 // repository.
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
@@ -227,7 +228,19 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> picture;
     const std::vector<Press> presses = presses_asked();
     uint32_t width = 0, height = 0;
+    // A development aid: RR7_SECONDS=<n> ends the run after n seconds, writing the last flip's picture (frame-0.bmp) and
+    // where the renderer's time went.
+    const char* seconds = std::getenv("RR7_SECONDS");
+    const auto ends = std::chrono::steady_clock::now() + std::chrono::seconds(seconds ? std::strtoull(seconds, nullptr, 10) : 0);
     while (display.poll()) {
+        if (seconds && std::chrono::steady_clock::now() > ends) {
+            const std::lock_guard lock(frame_mutex);
+            if (!frame.empty()) write_bmp(0, frame.data(), frame_width, frame_height);
+            rr7::renderer_report();
+            qilin::rt::log("stopped: RR7_SECONDS's %s seconds are over, at flip %llu", seconds, static_cast<unsigned long long>(flips.load()));
+            std::fflush(nullptr);
+            std::_Exit(0);
+        }
         {
             uint16_t pressed1 = 0, pressed2 = 0;
             const uint64_t now = flips;

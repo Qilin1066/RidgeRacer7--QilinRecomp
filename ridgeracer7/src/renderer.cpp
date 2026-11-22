@@ -1,6 +1,9 @@
 #include "renderer.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -29,9 +32,75 @@ struct Pipeline {
 struct SurfaceEntry {
     Surface desc;
     host::Image image;
-    host::Buffer staging;
+    host::Buffer staging;  // colour: RGBA rows; depth: the depth aspect's words, then the stencil aspect's bytes
+    bool depth = false;
+    bool coherent = true;  // whether its memory needs invalidating before the CPU reads what the GPU wrote
+    // After a write-back the image holds what guest memory does, until something else writes there: the hash of the
+    // guest bytes as written back tells.
+    bool resident = false;
+    uint64_t written_hash = 0;
     bool touched = false;  // drawn in the batch being recorded
+    bool written = false;  // and written by a draw in it (a depth surface only tested isn't): only then copied back
 };
+
+// A buffer the CPU reads back from: in host-cached memory where there is some (uncached memory is read a word at a time
+// across the bus: a 1920 by 1080 surface took most of a second), else as host_visible makes it.
+host::Buffer readback_buffer(const host::Gpu& gpu, VkDeviceSize size, bool& coherent) {
+    host::Buffer b;
+    b.size = size;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    host::check(vkCreateBuffer(gpu.device, &bci, nullptr, &b.buffer), "vkCreateBuffer");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(gpu.device, b.buffer, &req);
+    VkPhysicalDeviceMemoryProperties memory{};
+    vkGetPhysicalDeviceMemoryProperties(gpu.physical, &memory);
+    uint32_t chosen = UINT32_MAX;
+    for (const VkMemoryPropertyFlags want : {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                                             VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT),
+                                             VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)}) {
+        for (uint32_t i = 0; i < memory.memoryTypeCount && chosen == UINT32_MAX; ++i)
+            if ((req.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & want) == want) chosen = i;
+        if (chosen != UINT32_MAX) break;
+    }
+    if (chosen == UINT32_MAX) fatal("the GPU has no memory the CPU can read back from");
+    coherent = (memory.memoryTypes[chosen].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = chosen;
+    host::check(vkAllocateMemory(gpu.device, &mai, nullptr, &b.memory), "vkAllocateMemory");
+    host::check(vkBindBufferMemory(gpu.device, b.buffer, b.memory, 0), "vkBindBufferMemory");
+    host::check(vkMapMemory(gpu.device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped), "vkMapMemory");
+    return b;
+}
+
+// A texture kept on the GPU between draws, by its fields; its texels are decoded again only when the guest bytes it
+// covers hash differently.
+struct CachedTexture {
+    host::Image image;
+    uint64_t hash = 0;
+    uint64_t used = 0;  // the batch it was last used in
+    uint64_t checked = UINT64_MAX, checked_epoch = 0;  // the batch, and the texture cache's epoch, its hash was last taken in
+};
+
+// A hash of guest bytes (not for security: to see that a texture has changed), in four lanes of eight bytes the CPU can
+// run side by side, so that it goes at about the speed memory is read.
+uint64_t hash_bytes(const uint8_t* p, size_t n) {
+    constexpr uint64_t kMul = 0xff51afd7ed558ccdull;
+    uint64_t h[4] = {0x9e3779b97f4a7c15ull ^ n, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull};
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32)
+        for (unsigned k = 0; k < 4; ++k) {
+            uint64_t w;
+            std::memcpy(&w, p + i + 8 * k, 8);
+            h[k] = (h[k] ^ w) * kMul;
+            h[k] ^= h[k] >> 29;
+        }
+    uint64_t out = h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7);
+    for (; i < n; ++i) out = (out ^ p[i]) * 0x100000001b3ull;
+    return out;
+}
 
 constexpr uint32_t kMostSets = 1024;                   // descriptor sets in a batch
 constexpr VkDeviceSize kArenaBytes = 64u << 20;        // vertices, indices, constants and texels of a batch
@@ -54,14 +123,28 @@ struct Renderer {
     host::Buffer arena;
     VkDeviceSize arena_used = 0, align = 256;
     uint32_t sets_used = 0;
-    std::vector<host::Image> batch_images;  // its textures
+    std::map<std::array<uint32_t, 6>, CachedTexture> textures;  // by address, format, size, pitch and remap
     std::vector<SurfaceEntry*> touched;     // the surfaces it draws to
     SurfaceEntry* rendering = nullptr;      // the surface a rendering instance is open on
+    SurfaceEntry* rendering_depth = nullptr;  // and its depth surface, if any
+    VkFormat depth_format = VK_FORMAT_UNDEFINED;  // for Z24S8: D32_SFLOAT_S8_UINT, or D24_UNORM_S8_UINT where the GPU lacks it
     uint64_t draws = 0, flushes = 0;
+    uint64_t texture_epoch = 0;
+    VkQueryPool timestamps = VK_NULL_HANDLE;  // three a batch: its start, before its copies back, its end  // moved on by the texture cache's invalidation (renderer_invalidate_textures)
     std::map<std::vector<uint32_t>, VkSampler> samplers;  // by the fields they're made from
     host::Buffer dummy;  // bound where a program has no inline constants
 };
 Renderer* g_renderer = nullptr;
+
+// The renderer's time, by part (nanoseconds), for renderer_report.
+struct Stats {
+    std::atomic<uint64_t> draws{0}, flushes{0}, textures{0}, texture_bytes{0}, uploads{0};
+    std::atomic<uint64_t> draw_ns{0}, texture_ns{0}, upload_ns{0}, flush_ns{0}, wait_ns{0}, writeback_ns{0};
+    std::atomic<uint64_t> gpu_draw_ns{0}, gpu_copy_ns{0};  // the GPU's own time: the batch's commands, and its copies back
+};
+Stats g_stats;
+using Clock = std::chrono::steady_clock;
+uint64_t since(Clock::time_point t) { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
 std::mutex g_present_mutex;
 std::function<void(const uint8_t*, uint32_t, uint32_t)> g_present;
 
@@ -220,10 +303,13 @@ VkSampler sampler_for(uint32_t unit, const SamplerFields& s, uint32_t levels) {
     return sampler;
 }
 
+VkCompareOp compare_op(uint32_t f) { return static_cast<VkCompareOp>(f - 0x200); }  // OpenGL's order is Vulkan's
+
 VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, const qilin::rt::TranslatedShader& fs, VkFormat format, VkPrimitiveTopology topology) {
     std::vector<uint32_t> key{static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs) >> 32),
                               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs) >> 32),
-                              static_cast<uint32_t>(format), static_cast<uint32_t>(topology), d.color_mask, d.blend, d.blend_src, d.blend_dst, d.blend_equation};
+                              static_cast<uint32_t>(format), static_cast<uint32_t>(topology), d.color_mask, d.blend, d.blend_src, d.blend_dst, d.blend_equation,
+                              d.depth_test, d.depth_write, d.depth_func, d.cull, d.cull_face, d.front_face};
     auto& p = g_renderer->pipelines[key];
     if (p) return p;
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -246,6 +332,19 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
     VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     raster.lineWidth = 1.0f;
     raster.cullMode = VK_CULL_MODE_NONE;
+    // Culling (OpenGL's faces: front 0x404, back 0x405, both 0x408; windings: clockwise 0x900, anticlockwise 0x901). The
+    // winding is in window coordinates, which count down from the top as Vulkan's framebuffer does (rsx.cpp: the window's
+    // origin), so the RSX's anticlockwise is Vulkan's (*a stated reading, held to the picture*).
+    if (d.cull) {
+        switch (d.cull_face) {
+        case 0x404: raster.cullMode = VK_CULL_MODE_FRONT_BIT; break;
+        case 0x405: raster.cullMode = VK_CULL_MODE_BACK_BIT; break;
+        case 0x408: raster.cullMode = VK_CULL_MODE_FRONT_AND_BACK; break;
+        default: fatal("culling of face %#x", d.cull_face);
+        }
+    }
+    if (d.front_face != 0x900 && d.front_face != 0x901 && d.cull) fatal("a front face of %#x", d.front_face);
+    raster.frontFace = d.front_face == 0x900 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineColorBlendAttachmentState blend{};
@@ -263,13 +362,21 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
     const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = 2, dynamic.pDynamicStates = dynamic_states;
+    VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    if (d.depth_test) {
+        depth.depthTestEnable = VK_TRUE;
+        depth.depthWriteEnable = d.depth_write ? VK_TRUE : VK_FALSE;
+        depth.depthCompareOp = compare_op(d.depth_func);
+    }
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = 1, rendering.pColorAttachmentFormats = &format;
+    if (d.depth_test) rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat = g_renderer->depth_format;
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     info.pNext = &rendering;
     info.stageCount = 2, info.pStages = stages;
     info.pVertexInputState = &vertex, info.pInputAssemblyState = &assembly, info.pViewportState = &viewport;
     info.pRasterizationState = &raster, info.pMultisampleState = &multisample, info.pColorBlendState = &blending, info.pDynamicState = &dynamic;
+    info.pDepthStencilState = &depth;
     info.layout = g_renderer->layout;
     host::check(vkCreateGraphicsPipelines(g_renderer->gpu->device, VK_NULL_HANDLE, 1, &info, nullptr, &p), "vkCreateGraphicsPipelines");
     return p;
@@ -318,6 +425,21 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
     r->dummy = host::Buffer::host_visible(gpu, 16, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     r->arena = host::Buffer::host_visible(gpu, kArenaBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                                                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    // D32S8 first: NVIDIA's copies of D24S8's depth out of the image took 32 ms a 1920 by 1080 surface against D32S8's 4.5,
+    // and AMD has no D24S8 at all.
+    for (const VkFormat f : {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT}) {
+        VkFormatProperties p{};
+        vkGetPhysicalDeviceFormatProperties(gpu.physical, f, &p);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        if ((p.optimalTilingFeatures & need) == need) {
+            r->depth_format = f;
+            break;
+        }
+    }
+    if (r->depth_format == VK_FORMAT_UNDEFINED) fatal("the GPU has no depth-stencil format the renderer can use (D24S8 or D32S8)");
+    VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    query.queryType = VK_QUERY_TYPE_TIMESTAMP, query.queryCount = 3;
+    host::check(vkCreateQueryPool(gpu.device, &query, nullptr, &r->timestamps), "vkCreateQueryPool");
     r->align = std::max<VkDeviceSize>({256, gpu.properties.limits.minUniformBufferOffsetAlignment, gpu.properties.limits.optimalBufferCopyOffsetAlignment});
     g_renderer = r;
     qilin::rt::log("the renderer draws on %s, with %zu translated shaders", gpu.name.c_str(), qilin::rt::kTranslatedShaderCount);
@@ -337,7 +459,7 @@ VkDeviceSize arena_take(Renderer& r, VkDeviceSize size) {
 uint8_t* arena_at(Renderer& r, VkDeviceSize offset) { return static_cast<uint8_t*>(r.arena.mapped) + offset; }
 
 void end_rendering(Renderer& r) {
-    if (r.rendering) vkCmdEndRendering(r.cmd), r.rendering = nullptr;
+    if (r.rendering) vkCmdEndRendering(r.cmd), r.rendering = nullptr, r.rendering_depth = nullptr;
 }
 
 bool overlaps(uint32_t a, uint64_t a_bytes, uint32_t b, uint64_t b_bytes) { return a < b + b_bytes && b < a + a_bytes; }
@@ -350,20 +472,106 @@ bool touched_overlap(const Renderer& r, uint32_t address, uint64_t bytes, const 
     return false;
 }
 
+VkImageAspectFlags aspects(const SurfaceEntry& s) {
+    return s.depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
+// The copies between a surface's image and its staging buffer: one for a colour surface; a depth surface's two aspects,
+// depth words first, then stencil bytes.
+uint32_t surface_copies(const SurfaceEntry& s, VkBufferImageCopy (&copies)[2]) {
+    copies[0] = {}, copies[1] = {};
+    copies[0].imageExtent = copies[1].imageExtent = {s.desc.width, s.desc.height, 1};
+    if (!s.depth) {
+        copies[0].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        return 1;
+    }
+    copies[0].imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    copies[1].imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
+    copies[1].bufferOffset = VkDeviceSize{s.desc.width} * s.desc.height * 4;
+    return 2;
+}
+
+// A Z24S8 surface's words to the staging buffer's two aspects and back. With D24_UNORM_S8_UINT the depth aspect is a word
+// with depth in its low 24 bits; with D32_SFLOAT_S8_UINT a float, depth / (2^24 - 1) (*then the test compares floats, not
+// 24-bit numbers: a stated difference. Each 24-bit depth is a float of its own, so order and the value written back are
+// kept; a fragment exactly at a stored depth may test otherwise than on the RSX*).
+void depth_to_host(const SurfaceEntry& s) {
+    const bool unorm = g_renderer->depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
+    const size_t texels = size_t{s.desc.width} * s.desc.height;
+    uint32_t* depth = static_cast<uint32_t*>(s.staging.mapped);
+    uint8_t* stencil = static_cast<uint8_t*>(s.staging.mapped) + texels * 4;
+    for (uint32_t y = 0; y < s.desc.height; ++y)
+        for (uint32_t x = 0; x < s.desc.width; ++x) {
+            const uint32_t w = load32(s.desc.address + y * s.desc.pitch + 4 * x);
+            const size_t i = size_t{y} * s.desc.width + x;
+            depth[i] = unorm ? w >> 8 : std::bit_cast<uint32_t>(static_cast<float>(w >> 8) / 16777215.0f);
+            stencil[i] = static_cast<uint8_t>(w);
+        }
+}
+void surface_to_guest(const SurfaceEntry& s) {
+    if (!s.depth) {
+        for (uint32_t y = 0; y < s.desc.height; ++y)
+            to_guest(s.desc.format, static_cast<const uint8_t*>(s.staging.mapped) + size_t{y} * s.desc.width * 4, guest_memory() + s.desc.address + size_t{y} * s.desc.pitch,
+                     s.desc.width);
+        return;
+    }
+    const bool unorm = g_renderer->depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
+    const size_t texels = size_t{s.desc.width} * s.desc.height;
+    const uint32_t* depth = static_cast<const uint32_t*>(s.staging.mapped);
+    const uint8_t* stencil = static_cast<const uint8_t*>(s.staging.mapped) + texels * 4;
+    for (uint32_t y = 0; y < s.desc.height; ++y)
+        for (uint32_t x = 0; x < s.desc.width; ++x) {
+            const size_t i = size_t{y} * s.desc.width + x;
+            uint32_t d = depth[i] & 0xffffffu;
+            if (!unorm) d = static_cast<uint32_t>(std::lround(std::clamp(std::bit_cast<float>(depth[i]), 0.0f, 1.0f) * 16777215.0f));
+            store32(s.desc.address + y * s.desc.pitch + 4 * x, (d << 8) | stencil[i]);
+        }
+}
+
+// The surface from guest memory into its image, as a batch first draws to it, ready to draw to.
+void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s) {
+    // (Not copied when the image already holds what guest memory does.)
+    const VkImageLayout ready = s.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    if (s.resident && hash_bytes(guest_memory() + s.desc.address, surface_bytes(s.desc)) == s.written_hash) {
+        host::transition(cmd, s.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ready, aspects(s));
+        return;
+    }
+    ++g_stats.uploads;
+    if (s.depth) {
+        depth_to_host(s);
+    } else {
+        for (uint32_t y = 0; y < s.desc.height; ++y)
+            to_host(s.desc.format, guest_memory() + s.desc.address + size_t{y} * s.desc.pitch, static_cast<uint8_t*>(s.staging.mapped) + size_t{y} * s.desc.width * 4, s.desc.width);
+    }
+    if (!s.coherent) {
+        const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s.staging.memory, 0, VK_WHOLE_SIZE};
+        host::check(vkFlushMappedMemoryRanges(g_renderer->gpu->device, 1, &range), "vkFlushMappedMemoryRanges");
+    }
+    host::transition(cmd, s.image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, aspects(s));
+    VkBufferImageCopy copies[2];
+    const uint32_t n = surface_copies(s, copies);
+    vkCmdCopyBufferToImage(cmd, s.staging.buffer, s.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, copies);
+    host::transition(cmd, s.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     s.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, aspects(s));
+}
+
 }  // namespace
 
 // The batch: everything drawn since the last flush is submitted, waited for, and its surfaces written back to guest memory.
 void renderer_flush() {
     if (!g_renderer || !g_renderer->recording) return;
+    const Clock::time_point flush_start = Clock::now();
     Renderer& r = *g_renderer;
     const host::Gpu& gpu = *r.gpu;
     end_rendering(r);
+    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.timestamps, 1);
     for (SurfaceEntry* s : r.touched) {
-        host::transition(r.cmd, s->image.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        VkBufferImageCopy copy{};
-        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.imageExtent = {s->desc.width, s->desc.height, 1};
-        vkCmdCopyImageToBuffer(r.cmd, s->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->staging.buffer, 1, &copy);
+        const VkImageLayout layout = s->depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        host::transition(r.cmd, s->image.image, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, aspects(*s));
+        if (!s->written) continue;
+        VkBufferImageCopy copies[2];
+        const uint32_t n = surface_copies(*s, copies);
+        vkCmdCopyImageToBuffer(r.cmd, s->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->staging.buffer, n, copies);
     }
     // Everything copied back is visible to the host once the fence is signalled.
     VkMemoryBarrier2 to_host_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -372,6 +580,7 @@ void renderer_flush() {
     VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     dependency.memoryBarrierCount = 1, dependency.pMemoryBarriers = &to_host_barrier;
     vkCmdPipelineBarrier2(r.cmd, &dependency);
+    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.timestamps, 2);
     host::check(vkEndCommandBuffer(r.cmd), "vkEndCommandBuffer");
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1, submit.pCommandBuffers = &r.cmd;
@@ -379,27 +588,76 @@ void renderer_flush() {
         const std::lock_guard lock(*r.queue);
         host::check(vkQueueSubmit(gpu.queue, 1, &submit, r.fence), "vkQueueSubmit");
     }
+    const Clock::time_point wait_start = Clock::now();
     host::check(vkWaitForFences(gpu.device, 1, &r.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
     host::check(vkResetFences(gpu.device, 1, &r.fence), "vkResetFences");
+    g_stats.wait_ns += since(wait_start);
+    {
+        uint64_t t[3];
+        host::check(vkGetQueryPoolResults(gpu.device, r.timestamps, 0, 3, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT), "vkGetQueryPoolResults");
+        const double period = gpu.properties.limits.timestampPeriod;
+        g_stats.gpu_draw_ns += static_cast<uint64_t>(static_cast<double>(t[1] - t[0]) * period);
+        g_stats.gpu_copy_ns += static_cast<uint64_t>(static_cast<double>(t[2] - t[1]) * period);
+    }
+    const Clock::time_point writeback_start = Clock::now();
     // The surfaces back to guest memory: drawn, as the game expects to find them.
     for (SurfaceEntry* s : r.touched) {
-        for (uint32_t y = 0; y < s->desc.height; ++y)
-            to_guest(s->desc.format, static_cast<const uint8_t*>(s->staging.mapped) + size_t{y} * s->desc.width * 4, guest_memory() + s->desc.address + size_t{y} * s->desc.pitch,
-                     s->desc.width);
+        if (!s->written) {
+            // Unchanged by the batch: the image still holds what guest memory does.
+            s->written_hash = hash_bytes(guest_memory() + s->desc.address, surface_bytes(s->desc));
+            s->resident = true;
+            s->touched = false;
+            continue;
+        }
+        s->written = false;
+        if (!s->coherent) {
+            const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s->staging.memory, 0, VK_WHOLE_SIZE};
+            host::check(vkInvalidateMappedMemoryRanges(gpu.device, 1, &range), "vkInvalidateMappedMemoryRanges");
+        }
+        surface_to_guest(*s);
+        s->written_hash = hash_bytes(guest_memory() + s->desc.address, surface_bytes(s->desc));
+        s->resident = true;
         s->touched = false;
     }
     r.touched.clear();
-    for (host::Image& image : r.batch_images) image.destroy(gpu);
-    r.batch_images.clear();
+    g_stats.writeback_ns += since(writeback_start);
+    // (The GPU is idle here: textures unused for a while can go.)
+    if (r.textures.size() > 1024) {
+        for (auto it = r.textures.begin(); it != r.textures.end();) {
+            if (it->second.used + 300 < r.flushes) {
+                it->second.image.destroy(gpu);
+                it = r.textures.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     host::check(vkResetDescriptorPool(gpu.device, r.descriptors, 0), "vkResetDescriptorPool");
     r.sets_used = 0;
     r.arena_used = 0;
     r.recording = false;
     ++r.flushes;
+    ++g_stats.flushes;
+    g_stats.flush_ns += since(flush_start);
+}
+
+void renderer_invalidate_textures() {
+    if (g_renderer) ++g_renderer->texture_epoch;
+}
+
+void renderer_report() {
+    const auto ms = [](const std::atomic<uint64_t>& ns) { return static_cast<double>(ns.load()) / 1e6; };
+    qilin::rt::log("renderer: %llu draws (%.0f ms, of which textures %.0f ms: %llu decoded, %llu MB; surfaces from guest memory %.0f ms, %llu times), "
+                   "%llu flushes (%.0f ms, of which waiting for the GPU %.0f ms, writing back %.0f ms); on the GPU, batches %.0f ms and copies back %.0f ms",
+                   static_cast<unsigned long long>(g_stats.draws.load()), ms(g_stats.draw_ns), ms(g_stats.texture_ns), static_cast<unsigned long long>(g_stats.textures.load()),
+                   static_cast<unsigned long long>(g_stats.texture_bytes.load() >> 20), ms(g_stats.upload_ns), static_cast<unsigned long long>(g_stats.uploads.load()),
+                   static_cast<unsigned long long>(g_stats.flushes.load()), ms(g_stats.flush_ns), ms(g_stats.wait_ns), ms(g_stats.writeback_ns),
+                   ms(g_stats.gpu_draw_ns), ms(g_stats.gpu_copy_ns));
 }
 
 void renderer_draw(const Draw& d) {
     if (!g_renderer) fatal("the game draws, and there is no renderer (no window)");
+    const Clock::time_point draw_start = Clock::now();
     Renderer& r = *g_renderer;
     const host::Gpu& gpu = *r.gpu;
     const qilin::rt::TranslatedShader& vs = find_shader(d.vertex_program, true);
@@ -436,7 +694,6 @@ void renderer_draw(const Draw& d) {
         break;
     default: fatal("a draw of primitive %u, which the renderer doesn't take yet", d.primitive);
     }
-    if (d.cull) fatal("a draw with culling, which the renderer doesn't take yet");
     uint32_t pixel_bytes = 0;
     const VkFormat format = surface_format(d.color.format, pixel_bytes);
 
@@ -447,19 +704,35 @@ void renderer_draw(const Draw& d) {
         target.desc = d.color;
         target.image = host::Image::create(gpu, d.color.width, d.color.height, format,
                                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-        target.staging = host::Buffer::host_visible(gpu, VkDeviceSize{d.color.width} * d.color.height * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        target.staging = readback_buffer(gpu, VkDeviceSize{d.color.width} * d.color.height * 4, target.coherent);
     }
     if (target.desc.pitch != d.color.pitch) fatal("a surface at %08x drawn with pitch %u, and before with %u", d.color.address, d.color.pitch, target.desc.pitch);
-    if (touched_overlap(r, d.color.address, surface_bytes(d.color), &target)) renderer_flush();
+    SurfaceEntry* depth = nullptr;
+    if (d.depth_test) {
+        depth = &r.surfaces[{d.depth.address, 0x100 | d.depth.format, d.depth.width, d.depth.height}];
+        if (!depth->image.image) {
+            depth->desc = d.depth, depth->depth = true;
+            depth->image = host::Image::create(gpu, d.depth.width, d.depth.height, r.depth_format,
+                                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            depth->staging = readback_buffer(gpu, VkDeviceSize{d.depth.width} * d.depth.height * 5, depth->coherent);
+        }
+        if (depth->desc.pitch != d.depth.pitch) fatal("a depth surface at %08x used with pitch %u, and before with %u", d.depth.address, d.depth.pitch, depth->desc.pitch);
+        if (overlaps(d.depth.address, surface_bytes(d.depth), d.color.address, surface_bytes(d.color))) fatal("a draw's depth surface overlaps its colour surface");
+    }
+    if (touched_overlap(r, d.color.address, surface_bytes(d.color), &target) || (depth && touched_overlap(r, d.depth.address, surface_bytes(d.depth), depth)))
+        renderer_flush();
 
     // The textures the fragment program samples, read from guest memory: after the batch is written back, if they
     // overlap a surface drawn in it (a picture drawn and then sampled).
     struct Upload {
         uint32_t unit;
-        Texels texels;
+        CachedTexture* cached;
+        bool decode;    // its texels changed (or are new): decoded, and uploaded in this draw
+        Texels texels;  // when decoded
         VkSampler sampler;
     };
     std::vector<Upload> uploads;
+    const Clock::time_point texture_start = Clock::now();
     for (int pass = 0; pass < 2; ++pass) {
         uploads.clear();
         bool overlap = false;
@@ -467,24 +740,47 @@ void renderer_draw(const Draw& d) {
             if (!(fs.textures & (1u << u))) continue;
             const TextureUnit& t = d.textures[u];
             if (!t.enabled()) fatal("the fragment program at %08x samples texture %u, which is not enabled", fs.address, u);
+            size_t bytes = 0;
+            if (const std::string why = texture_extent(t, bytes); !why.empty())
+                fatal("texture %u (at %08x, format %08x): %s, which the renderer doesn't take yet", u, t.address, t.format, why.c_str());
+            overlap = overlap || touched_overlap(r, t.address, bytes, nullptr);
             Upload& up = uploads.emplace_back();
             up.unit = u;
-            if (const std::string why = decode_texture(t, guest_memory(), up.texels); !why.empty())
-                fatal("texture %u (at %08x, format %08x): %s, which the renderer doesn't take yet", u, t.address, t.format, why.c_str());
+            up.cached = &r.textures[{t.address, t.format, t.rect, t.control3, t.remap, 0}];
+            // Its bytes are hashed once a batch: within one, the game can't know the RSX has finished with a texture, so it
+            // changes none, except as it tells the texture cache (the epoch).
+            if (!up.cached->image.image || up.cached->checked != r.flushes || up.cached->checked_epoch != r.texture_epoch) {
+                const uint64_t hash = hash_bytes(guest_memory() + t.address, bytes);
+                up.decode = !up.cached->image.image || up.cached->hash != hash;
+                up.cached->hash = hash;
+                up.cached->checked = r.flushes, up.cached->checked_epoch = r.texture_epoch;
+            } else {
+                up.decode = false;
+            }
+            up.cached->used = r.flushes;
             SamplerFields fields;
             if (const std::string why = decode_sampler(t, fields); !why.empty()) fatal("texture %u: %s, which the renderer doesn't take yet", u, why.c_str());
-            up.sampler = sampler_for(u, fields, up.texels.levels);
-            overlap = overlap || touched_overlap(r, t.address, up.texels.guest_bytes, nullptr);
+            up.sampler = sampler_for(u, fields, (t.format >> 16) & 0xffff);
         }
         if (!overlap) break;
         renderer_flush();
     }
+    for (Upload& up : uploads) {
+        if (!up.decode) continue;
+        const TextureUnit& t = d.textures[up.unit];
+        if (const std::string why = decode_texture(t, guest_memory(), up.texels); !why.empty())
+            fatal("texture %u (at %08x, format %08x): %s, which the renderer doesn't take yet", up.unit, t.address, t.format, why.c_str());
+        ++g_stats.textures, g_stats.texture_bytes += up.texels.rgba.size();
+    }
+    g_stats.texture_ns += since(texture_start);
+    bool any_decoded = false;
+    for (const Upload& up : uploads) any_decoded = any_decoded || up.decode;
 
     // What the draw takes from the arena, and two descriptor sets: if the batch hasn't room, it is flushed first.
     uint32_t attributes = 0;
     for (uint32_t a = 0; a < 16; ++a) attributes += (vs.inputs >> a) & 1;
     VkDeviceSize needed = r.align * 8 + VkDeviceSize{16} * attributes * d.count + indices.size() * 4 + kVertexConstants * 16 + fs.constant_slot_count * 16;
-    for (const Upload& up : uploads) needed += up.texels.rgba.size() + r.align;
+    for (const Upload& up : uploads) needed += up.decode ? up.texels.rgba.size() + r.align : 0;
     if (needed > r.arena.size) fatal("a draw needs %llu bytes of the renderer's arena, which has %llu", static_cast<unsigned long long>(needed), static_cast<unsigned long long>(r.arena.size));
     if (r.recording && (r.arena_used + needed > r.arena.size || r.sets_used + 2 > kMostSets)) renderer_flush();
     VkCommandBuffer cmd = r.cmd;
@@ -493,6 +789,8 @@ void renderer_draw(const Draw& d) {
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         host::check(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
+        vkCmdResetQueryPool(cmd, r.timestamps, 0, 3);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.timestamps, 0);
         r.recording = true;
     }
 
@@ -543,8 +841,8 @@ void renderer_draw(const Draw& d) {
     vkUpdateDescriptorSets(gpu.device, 2, writes, 0, nullptr);
 
     // The textures' uploads, and the surface's own when it is first drawn in this batch: outside a rendering instance.
-    const bool first_touch = !target.touched;
-    if (!uploads.empty() || first_touch || r.rendering != &target) end_rendering(r);
+    const bool first_touch = !target.touched, depth_first_touch = depth && !depth->touched;
+    if (any_decoded || first_touch || depth_first_touch || r.rendering != &target || r.rendering_depth != depth) end_rendering(r);
     VkDescriptorSet set1 = VK_NULL_HANDLE;
     if (!uploads.empty()) {
         ds.pSetLayouts = &r.sets[1];
@@ -554,8 +852,15 @@ void renderer_draw(const Draw& d) {
         std::vector<VkWriteDescriptorSet> texture_writes(uploads.size(), {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
         for (size_t i = 0; i < uploads.size(); ++i) {
             Upload& up = uploads[i];
-            host::Image& image = r.batch_images.emplace_back(host::Image::create(gpu, up.texels.width, up.texels.height, VK_FORMAT_R8G8B8A8_UNORM,
-                                                                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, up.texels.levels));
+            host::Image& image = up.cached->image;
+            if (!image.image)
+                image = host::Image::create(gpu, up.texels.width, up.texels.height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                            up.texels.levels);
+            images[i] = {up.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            texture_writes[i].dstSet = set1, texture_writes[i].dstBinding = up.unit, texture_writes[i].descriptorCount = 1;
+            texture_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_writes[i].pImageInfo = &images[i];
+            if (!up.decode) continue;
+            // (Draws earlier in the batch that sampled it are ordered before this copy by the transition's barrier.)
             const VkDeviceSize at = arena_take(r, up.texels.rgba.size());
             std::memcpy(arena_at(r, at), up.texels.rgba.data(), up.texels.rgba.size());
             host::transition(cmd, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -567,37 +872,42 @@ void renderer_draw(const Draw& d) {
             }
             vkCmdCopyBufferToImage(cmd, r.arena.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, up.texels.levels, levels.data());
             host::transition(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            images[i] = {up.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            texture_writes[i].dstSet = set1, texture_writes[i].dstBinding = up.unit, texture_writes[i].descriptorCount = 1;
-            texture_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_writes[i].pImageInfo = &images[i];
         }
         vkUpdateDescriptorSets(gpu.device, static_cast<uint32_t>(texture_writes.size()), texture_writes.data(), 0, nullptr);
     }
+    // The surfaces from guest memory, as the batch begins with them.
+    const Clock::time_point upload_start = Clock::now();
     if (first_touch) {
-        // The surface from guest memory, as the batch begins with it.
-        for (uint32_t y = 0; y < d.color.height; ++y)
-            to_host(d.color.format, guest_memory() + d.color.address + size_t{y} * d.color.pitch, static_cast<uint8_t*>(target.staging.mapped) + size_t{y} * d.color.width * 4,
-                    d.color.width);
-        host::transition(cmd, target.image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkBufferImageCopy copy{};
-        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.imageExtent = {d.color.width, d.color.height, 1};
-        vkCmdCopyBufferToImage(cmd, target.staging.buffer, target.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        host::transition(cmd, target.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        surface_from_guest(cmd, target);
         target.touched = true;
         r.touched.push_back(&target);
     }
+    if (depth_first_touch) {
+        surface_from_guest(cmd, *depth);
+        depth->touched = true;
+        r.touched.push_back(depth);
+    }
+    g_stats.upload_ns += since(upload_start);
     if (r.rendering != &target) {
         // (Between rendering instances on a surface, its earlier draws are made visible to the next.)
         if (!first_touch) host::transition(cmd, target.image.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        if (depth && !depth_first_touch)
+            host::transition(cmd, depth->image.image, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, aspects(*depth));
+        VkRenderingAttachmentInfo depth_attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        if (depth) {
+            depth_attachment.imageView = depth->image.view, depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        }
         VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         attachment.imageView = target.image.view, attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
         rendering.renderArea = {{0, 0}, {d.color.width, d.color.height}};
         rendering.layerCount = 1, rendering.colorAttachmentCount = 1, rendering.pColorAttachments = &attachment;
+        if (depth) rendering.pDepthAttachment = &depth_attachment;
         vkCmdBeginRendering(cmd, &rendering);
         r.rendering = &target;
+        r.rendering_depth = depth;
     }
 
     // The viewport, as the translated programs take it (rsx_spirv.hpp): the RSX's scale and offset give window coordinates
@@ -644,7 +954,11 @@ void renderer_draw(const Draw& d) {
     } else {
         vkCmdDraw(cmd, d.count, 1, 0, 0);
     }
+    target.written = true;
+    if (depth && d.depth_write) depth->written = true;
     ++r.draws;
+    ++g_stats.draws;
+    g_stats.draw_ns += since(draw_start);
 }
 
 void set_present_sink(std::function<void(const uint8_t*, uint32_t, uint32_t)> sink) {

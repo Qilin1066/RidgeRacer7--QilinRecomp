@@ -182,7 +182,17 @@ void draw(uint32_t first, uint32_t count, uint32_t at) {
     if ((state(0x0200) & 0xffff) || (state(0x0204) & 0xffff)) fatal("a surface whose clip doesn't start at 0, 0 (at offset %08x)", at);
     d.color_mask = state(0x0324);
     // What the first renderer doesn't take: said by name.
-    if (state(0x0a74)) fatal("a draw with the depth test, which the renderer doesn't take yet (at offset %08x)", at);
+    if (state(0x0a74)) {
+        d.depth_test = true;
+        d.depth_func = state(0x0a6c), d.depth_write = state(0x0a70) != 0;
+        if (d.depth_func < 0x200 || d.depth_func > 0x207) fatal("a depth test with function %#x (at offset %08x)", d.depth_func, at);
+        const uint32_t depth_format = (format >> 5) & 7;  // 1 Z16, 2 Z24S8
+        if (depth_format != 2) fatal("a depth test on a depth surface of format %u, which the renderer doesn't take yet (at offset %08x)", depth_format, at);
+        d.depth.format = depth_format, d.depth.pitch = state(0x022c);
+        d.depth.address = guest_address(surface_location(state(0x0198)), state(0x0214), "a depth surface");
+        d.depth.width = state(0x0200) >> 16, d.depth.height = state(0x0204) >> 16;
+    }
+    if (state(0x0a68)) fatal("a draw with polygon offset, which the renderer doesn't take yet (at offset %08x)", at);
     if (state(0x032c)) fatal("a draw with the stencil test, which the renderer doesn't take yet (at offset %08x)", at);
     // The alpha test (SET_ALPHA_FUNC: OpenGL's NEVER 0x200 to ALWAYS 0x207, bit 0 less, bit 1 equal, bit 2 greater; SET_ALPHA_REF):
     // on 8-bit surfaces the reference's low byte against the alpha as stored. *Its reference on a float surface isn't known here.*
@@ -388,8 +398,9 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     case 0x1714:  // INVALIDATE_VERTEX_FILE: the RSX's caches of vertices; this one reads guest memory at each draw
         return;
     case 0x1fd8:  // the texture cache's control (PSL1GHT's TEX_CACHE_CTL): 1 invalidates the fragment programs' textures, 2 the
-                  // vertex programs'. Textures are read from guest memory at each draw here, so there is nothing to invalidate.
+                  // vertex programs'. Here textures are checked against guest memory once a batch, and again after this.
         if (argument != 1 && argument != 2) qilin::rt::fatal("the RSX's texture cache is given %08x", argument);
+        renderer_invalidate_textures();
         return;
     case 0x1808:  // SET_BEGIN_END: a primitive's start (its kind), or 0 for its end, when the ranges since are drawn
         if (argument) {

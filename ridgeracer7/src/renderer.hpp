@@ -54,6 +54,11 @@ struct Draw {
     // The alpha test, for the fragment program (rsx_spirv.cpp): {reference, scale, -, -}, {less, equal, greater, -} passing.
     std::array<float, 8> alpha_test{0, 0, 0, 0, 1, 1, 1, 0};
     std::array<TextureUnit, 16> textures{};
+    // The depth test: on or off, its function (OpenGL's NEVER 0x200 to ALWAYS 0x207), whether depth is written, and the
+    // depth-stencil surface (format 2: Z24S8, a big-endian word of depth in the top 24 bits and stencil in the low 8).
+    bool depth_test = false, depth_write = false;
+    uint32_t depth_func = 0;
+    Surface depth;
 };
 
 // The device to draw with, and the lock every use of its queue takes (the window's presentation uses the queue too).
@@ -64,6 +69,10 @@ bool renderer_started();
 // draw would read a surface drawn in the batch (a texture, or the same memory as another surface), or its batch is full.
 void renderer_draw(const Draw& d);
 void renderer_flush();
+// The texture cache's invalidation (RSX method 0x1FD8): textures are hashed again at their next draw.
+void renderer_invalidate_textures();
+// Where the renderer's time has gone (a development aid: logged when a timed run ends).
+void renderer_report();
 
 // Where a flip's picture goes (main.cpp: the window): RGBA8, `width` by `height`, rows packed.
 void set_present_sink(std::function<void(const uint8_t* rgba, uint32_t width, uint32_t height)> sink);

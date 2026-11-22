@@ -27,6 +27,10 @@ struct Texels {
     size_t guest_bytes = 0;  // how much of guest memory the texture covers
 };
 
+// Checks a texture's fields and finds how many bytes of guest memory it covers, without reading it. An empty string on
+// success; otherwise what isn't taken.
+std::string texture_extent(const TextureUnit& t, size_t& guest_bytes);
+
 // Reads a texture's texels from `memory` (guest memory). An empty string on success; otherwise what isn't taken, and
 // the texture is not read.
 std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& out);

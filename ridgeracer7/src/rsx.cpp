@@ -184,7 +184,14 @@ void draw(uint32_t first, uint32_t count, uint32_t at) {
     // What the first renderer doesn't take: said by name.
     if (state(0x0a74)) fatal("a draw with the depth test, which the renderer doesn't take yet (at offset %08x)", at);
     if (state(0x032c)) fatal("a draw with the stencil test, which the renderer doesn't take yet (at offset %08x)", at);
-    if (state(0x0304)) fatal("a draw with the alpha test, which the renderer doesn't take yet (at offset %08x)", at);
+    // The alpha test (SET_ALPHA_FUNC: OpenGL's NEVER 0x200 to ALWAYS 0x207, bit 0 less, bit 1 equal, bit 2 greater; SET_ALPHA_REF):
+    // on 8-bit surfaces the reference's low byte against the alpha as stored. *Its reference on a float surface isn't known here.*
+    if (state(0x0304)) {
+        const uint32_t function = state(0x0308);
+        if (function < 0x200 || function > 0x207) fatal("an alpha test with function %#x (at offset %08x)", function, at);
+        if (d.color.format != 8) fatal("an alpha test on a surface of format %u, which the renderer doesn't take yet (at offset %08x)", d.color.format, at);
+        d.alpha_test = {static_cast<float>(state(0x030c) & 0xff), 255.0f, 0, 0, float(function & 1), float((function >> 1) & 1), float((function >> 2) & 1), 0};
+    }
     if (state(0x173c)) fatal("a draw with a base vertex index, which the renderer doesn't take yet (at offset %08x)", at);
     d.primitive = r.primitive, d.first = first, d.count = count;
     for (uint32_t a = 0; a < 16; ++a) {
@@ -227,12 +234,28 @@ void draw(uint32_t first, uint32_t count, uint32_t at) {
     d.clip_x = state(0x0a00) & 0xffff, d.clip_width = state(0x0a00) >> 16, d.clip_y = state(0x0a04) & 0xffff, d.clip_height = state(0x0a04) >> 16;
     const uint32_t window = state(0x1d88);
     d.window_height = window & 0xfff;
-    d.origin_bottom = ((window >> 12) & 0xf) == 1;
+    // The window's origin field (bits 12 to 15): 1 has window y counting down from the top row. *A reading from evidence:
+    // PSL1GHT always writes 1 with a negative y scale and its samples draw upright, and this game does the same (its logo
+    // came out upside down when 1 was taken as the bottom).* What 0 does isn't known here.
+    const uint32_t origin = (window >> 12) & 0xf;
+    if (origin != 1) fatal("a window with origin field %u, which the renderer doesn't take yet (at offset %08x)", origin, at);
+    d.origin_bottom = false;
     if ((window >> 16) & 0xf) fatal("a window whose pixel centres are on whole numbers, which the renderer doesn't take yet (at offset %08x)", at);
     d.scissor_x = state(0x08c0) & 0xffff, d.scissor_width = state(0x08c0) >> 16, d.scissor_y = state(0x08c4) & 0xffff, d.scissor_height = state(0x08c4) >> 16;
     d.blend = state(0x0310) != 0;
     d.blend_src = state(0x0314), d.blend_dst = state(0x0318), d.blend_equation = state(0x0320);
     d.cull = state(0x183c) != 0;
+    // The texture units: their state, and where an enabled one's texels are (the format word's location: 1 the RSX's memory, 2 main memory).
+    for (uint32_t u = 0; u < 16; ++u) {
+        TextureUnit& t = d.textures[u];
+        const uint32_t base = 0x1a00 + 32 * u;
+        t.offset = state(base), t.format = state(base + 4), t.wrap = state(base + 8), t.control0 = state(base + 0xc);
+        t.remap = state(base + 0x10), t.filter = state(base + 0x14), t.rect = state(base + 0x18), t.border = state(base + 0x1c);
+        t.control3 = state(0x1840 + 4 * u);
+        // (Units the program doesn't sample may be enabled with no texture at all: the renderer checks those it reads.)
+        const uint32_t location = t.format & 3;
+        if (t.enabled() && (location == 1 || location == 2)) t.address = guest_address(location == 1 ? 0 : 1, t.offset, "a texture");
+    }
     d.cull_face = state(0x1830), d.front_face = state(0x1834);
     renderer_draw(d);
 }
@@ -242,6 +265,7 @@ void draw(uint32_t first, uint32_t count, uint32_t at) {
 // blue 0x40, alpha 0x80. *The clear rectangle is taken in the surface's own coordinates, from its top-left corner, and
 // the colour write mask is not applied to a clear: stated choices, to be compared with the console.*
 void clear(uint32_t mask, uint32_t at) {
+    renderer_flush();
     if (mask & ~0xf3u) fatal("CLEAR_SURFACE with bits %#x, which this runtime doesn't know (at offset %08x)", mask, at);
     const uint32_t format = state(0x0208);
     if (((format >> 8) & 0xf) != 1) fatal("a clear of a surface of type %u (not linear) (at offset %08x)", (format >> 8) & 0xf, at);
@@ -281,6 +305,7 @@ void clear(uint32_t mask, uint32_t at) {
 
 // A flip: the display buffer, from guest memory, to the window.
 void flip(uint32_t id, uint32_t at) {
+    renderer_flush();
     const DisplayBuffer b = display_buffer(id);
     if (!b.set) fatal("the RSX is to show display buffer %u, which the game never set (at offset %08x)", id, at);
     const VideoMode mode = video_mode();
@@ -313,7 +338,9 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
         return;
     }
     switch (method) {
+    // (Before every label, reference or wait, everything drawn so far is written back to guest memory: renderer.hpp.)
     case 0x0050:  // NV406E_SET_REFERENCE: the game's own mark of how far the RSX has got, readable beside put and get
+        renderer_flush();
         store32(rsx_setup().control + 8, argument);
         return;
     case 0x0100:  // NO_OPERATION
@@ -324,16 +351,20 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
         r.label = argument;
         return;
     case 0x006c:  // NV406E_SEMAPHORE_RELEASE: write it
+        renderer_flush();
         store32(label_address(r.label, at), argument);
         return;
     case 0x0068:  // NV406E_SEMAPHORE_ACQUIRE: wait until the game has made it this value
+        renderer_flush();
         for (const uint32_t address = label_address(r.label, at); load32(address) != argument;) std::this_thread::yield();
         return;
     case 0x1d70:  // BACK_END_WRITE_SEMAPHORE_RELEASE: write the label at SET_SEMAPHORE_OFFSET once everything drawn so far is in the surface.
+        renderer_flush();
         // The chip writes the argument's red and blue bytes exchanged (the game's library exchanges them first, so the label reads as meant).
         store32(label_address(r.state[0x1d6c / 4], at), (argument & 0xff00ff00u) | ((argument & 0xff) << 16) | ((argument >> 16) & 0xff));
         return;
     case 0x1d74:  // TEXTURE_READ_SEMAPHORE_RELEASE: the same label, as given, once every texture read so far is done
+        renderer_flush();
         store32(label_address(r.state[0x1d6c / 4], at), argument);
         return;
     case kMethodWaitFlip:  // (the runtime's own) wait until the last flip has been shown: a flip is shown at once here
@@ -355,6 +386,10 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
         return;
     case 0x1710:  // INVALIDATE_VERTEX_CACHE_FILE
     case 0x1714:  // INVALIDATE_VERTEX_FILE: the RSX's caches of vertices; this one reads guest memory at each draw
+        return;
+    case 0x1fd8:  // the texture cache's control (PSL1GHT's TEX_CACHE_CTL): 1 invalidates the fragment programs' textures, 2 the
+                  // vertex programs'. Textures are read from guest memory at each draw here, so there is nothing to invalidate.
+        if (argument != 1 && argument != 2) qilin::rt::fatal("the RSX's texture cache is given %08x", argument);
         return;
     case 0x1808:  // SET_BEGIN_END: a primitive's start (its kind), or 0 for its end, when the ranges since are drawn
         if (argument) {
@@ -394,6 +429,7 @@ void serve() {
     for (;;) {
         const uint32_t put = load32(control);
         if (r.get == put) {
+            if (idle == 0) renderer_flush();  // out of commands: what was drawn goes to guest memory
             if (g_survey && std::chrono::steady_clock::now() > g_survey_ends) end_survey();
             // Nothing to do. (The console's RSX is told when put moves; here the game's own code moves it
             // in memory, so it is watched: closely at first, then at a millisecond's remove.)
@@ -409,6 +445,7 @@ void serve() {
         if ((header & 0xe0000003u) == 0x20000000u) {  // a jump, as first made
             next = header & 0x1ffffffcu;
             if (next == r.get) {  // to itself: the game's way of holding the RSX here until it writes over it
+                renderer_flush();
                 if (g_survey && std::chrono::steady_clock::now() > g_survey_ends) end_survey();
                 std::this_thread::yield();
                 continue;

@@ -20,6 +20,9 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - `RR7_SAVE_FRAME`: a flip's picture written to a file.
 - The save data utility's automatic load and save (`cellSaveDataAutoLoad`, `AutoSave`): saves as folders on the port's hard disk with their `PARAM.SFO`.
 - The message dialog (`cellMsgDialogOpen`, `Close`), shown in a message box over the window, the player's answer passed to the game.
+- The renderer draws in batches: surfaces stay on the GPU between the points where the game can look, and go back to guest memory there.
+- Textures (A8R8G8B8, the 16-bit formats, DXT1/3/5; swizzled or linear; mipmaps; the remap) and their samplers; the alpha test, in the translated fragment programs; points, lines, fans, quads and polygons.
+- The game draws its first screen (the Dolby Digital logo) in the window.
 - The controller: the window's gamepad or the keyboard as the first port's DualShock 3. `RR7_ANSWER` and `RR7_PRESS` for runs with nobody there.
 - `RR7_RSX_TRACE` logs every RSX method and its argument.
 - `RR7_ERRORS` and `RR7_FILES`: logs of the error codes handed to the game and of its file reads. `RR7_CALLS`, `RR7_DUMP` and `qilin lift --registers`, for finding a fault (`docs/runtime.md`).

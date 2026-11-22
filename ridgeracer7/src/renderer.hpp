@@ -18,6 +18,8 @@
 #include <mutex>
 #include <vector>
 
+#include "textures.hpp"
+
 namespace qilin::host {
 struct Gpu;
 }
@@ -49,13 +51,19 @@ struct Draw {
     uint32_t blend_src = 0, blend_dst = 0, blend_equation = 0;
     bool cull = false;
     uint32_t cull_face = 0, front_face = 0;
+    // The alpha test, for the fragment program (rsx_spirv.cpp): {reference, scale, -, -}, {less, equal, greater, -} passing.
+    std::array<float, 8> alpha_test{0, 0, 0, 0, 1, 1, 1, 0};
+    std::array<TextureUnit, 16> textures{};
 };
 
 // The device to draw with, and the lock every use of its queue takes (the window's presentation uses the queue too).
 void renderer_start(qilin::host::Gpu& gpu, std::mutex& queue);
 bool renderer_started();
-// Draws it, and writes the surface back to guest memory before returning.
+// Draws it, into a batch: surfaces stay on the GPU until the batch is flushed, when everything drawn is written back to
+// guest memory. The RSX's thread flushes at every point where the game may look (rsx.cpp); the renderer itself when a
+// draw would read a surface drawn in the batch (a texture, or the same memory as another surface), or its batch is full.
 void renderer_draw(const Draw& d);
+void renderer_flush();
 
 // Where a flip's picture goes (main.cpp: the window): RGBA8, `width` by `height`, rows packed.
 void set_present_sink(std::function<void(const uint8_t* rgba, uint32_t width, uint32_t height)> sink);

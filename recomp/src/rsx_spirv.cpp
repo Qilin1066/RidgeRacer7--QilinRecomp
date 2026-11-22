@@ -435,6 +435,14 @@ public:
                 m.decorate(samplers_[u], kDecorationDescriptorSet, {1});
                 m.decorate(samplers_[u], kDecorationBinding, {u});
             }
+        // The alpha test's push constants, after the vertex program's 32 bytes.
+        {
+            const uint32_t push = m.type_struct({vec4, vec4});
+            m.decorate(push, kDecorationBlock);
+            m.decorate_member(push, 0, kDecorationOffset, {32});
+            m.decorate_member(push, 1, kDecorationOffset, {48});
+            push_ = m.variable(kStoragePushConstant, push);
+        }
         // Colour outputs: 0 always; 1 to 3 if their registers are written.
         const std::array<std::pair<bool, unsigned>, 4> colour{{{from_h0, from_h0 ? 0u : 0u}, {from_h0, from_h0 ? 4u : 2u}, {from_h0, from_h0 ? 6u : 3u}, {from_h0, from_h0 ? 8u : 4u}}};
         for (unsigned t = 0; t < 4; ++t) {
@@ -461,6 +469,7 @@ public:
             }
             instruction(in, in.has_constant ? slot++ : 0);
         }
+        alpha_test(colour[0].first ? h_.at(colour[0].second) : r_.at(colour[0].second));
         for (unsigned t = 0; t < 4; ++t)
             if (colour_vars_[t]) {
                 const uint32_t var = colour[t].first ? h_.at(colour[t].second) : r_.at(colour[t].second);
@@ -629,7 +638,33 @@ private:
 
     const CgProgram& p_;
     std::vector<FpInsn> insns_;
-    uint32_t inputs_ = 0, outputs_ = 0, textures_ = 0, cubes_ = 0, constants_ = 0, cc_ = 0;
+    uint32_t inputs_ = 0, outputs_ = 0, textures_ = 0, cubes_ = 0, constants_ = 0, cc_ = 0, push_ = 0;
+
+    // The alpha test, on colour 0's alpha (the RSX's is fixed function; here the renderer's push constants describe it, so
+    // one translation serves with the test on and off): {reference, scale, -, -} and {less, equal, greater, -}, each 1 if
+    // a value on that side of the reference passes. With a scale, the alpha is first clamped to [0, 1] and rounded to that
+    // many steps, as an 8-bit surface would hold it (*a stated choice: the test on the value as stored*). A failing
+    // fragment is discarded. With the test off, all three pass.
+    void alpha_test(uint32_t colour) {
+        const uint32_t ptr = m.type_pointer(kStoragePushConstant, vec4);
+        const uint32_t p0 = m.op(OpLoad, vec4, {m.op(OpAccessChain, ptr, {push_, m.constant_int(0)})});
+        const uint32_t p1 = m.op(OpLoad, vec4, {m.op(OpAccessChain, ptr, {push_, m.constant_int(1)})});
+        const auto part = [&](uint32_t v, unsigned i) { return m.op(OpCompositeExtract, f32, {v, i}); };
+        const uint32_t a = part(m.op(OpLoad, vec4, {colour}), 3), reference = part(p0, 0), scale = part(p0, 1);
+        const uint32_t stored = m.ext(f32, GlslRound, {m.op(OpFMul, f32, {m.ext(f32, GlslFClamp, {a, zero, one}), scale})});
+        const uint32_t value = m.op(OpSelect, f32, {m.op(OpFOrdGreaterThan, b, {scale, zero}), stored, a});
+        const uint32_t half = m.constant_float(0.5f);
+        const auto fails = [&](Op compare, unsigned i) {
+            return m.op(OpLogicalAnd, b, {m.op(compare, b, {value, reference}), m.op(OpFOrdLessThan, b, {part(p1, i), half})});
+        };
+        const uint32_t killed = m.op(OpLogicalOr, b, {m.op(OpLogicalOr, b, {fails(OpFOrdLessThan, 0), fails(OpFOrdEqual, 1)}), fails(OpFOrdGreaterThan, 2)});
+        const uint32_t kill = m.id(), merge = m.id();
+        m.emit(OpSelectionMerge, {merge, kSelectionControlNone});
+        m.emit(OpBranchConditional, {killed, kill, merge});
+        m.label(kill);
+        m.emit(OpKill, {});
+        m.label(merge);
+    }
     std::set<unsigned> used_r_, used_h_, written_r_, written_h_;
     std::map<unsigned, uint32_t> r_, h_;
     std::array<uint32_t, 16> input_vars_{}, samplers_{}, sampler_types_{};

@@ -226,6 +226,7 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/np.cpp
     ridgeracer7/src/pad.cpp
     ridgeracer7/src/renderer.cpp
+    ridgeracer7/src/textures.cpp
     ridgeracer7/src/rtc.cpp
     ridgeracer7/src/savedata.cpp
     ridgeracer7/src/rsx.cpp

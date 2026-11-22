@@ -84,6 +84,7 @@ The game writes the RSX's commands itself (that code is the game's, and lifted),
 - A draw finds its programs among the translated ones by key (`docs/recompiler-core.md`) and stops the game if one is missing. Vertex arrays are converted to floats from guest memory at each draw; the vertex constants and a fragment program's inline constants (read from its microcode where the game patched them) go to uniform buffers; the viewport is folded into push constants, the RSX's bottom-left window origin turned into Vulkan's top-left.
 - **What the renderer refuses, by name:** the stencil test, polygon offset, depth formats but Z24S8, cube maps and other texture formats, surfaces other than colour surface A in formats A8R8G8B8 and F_X32, swizzled or antialiased surfaces, indexed draws. Each is the next piece of work when the game reaches it.
 - *Stated choices:* the system's start-up leaves the depth surface's context object at the RSX's memory (`0xFEED0000`; the game never sets it); a clear's rectangle is in the surface's own coordinates, and the colour write mask doesn't apply to a clear.
+- **SPURS** (`spurs.cpp`) is this runtime's own: the game's SPURS tasks are SPU programs which call nothing of a SPURS kernel (no branch below `0x3000`, their load address) and end as SPU threads do (`stop 0x102`), so a task is run at once on a host thread of its own (`start_spu_task` in `spu.cpp`), `$3` its 16-byte argument and `$4` the taskset's, as the SDK's `main(qword, uint64)` takes them; its events go out through the instance's ports. *Not as SPURS does it: tasks don't share SPUs or wait for one, and none is ever swapped out.* Event flags are kept natively (sixteen bits, automatic or manual clearing, the PPU's set and wait); an SPU transfer touching a flag's 128 bytes stops the game, since its layout is the SDK's and not known here.
 - Tiles and zcull regions are speed on a console, not results: their parameters are kept and change nothing. `cellGcmSetTile` stops the game on parameters out of the ordinary, because the library's own answer to them isn't known here.
 
 ## Fonts (`font.cpp`)
@@ -135,7 +136,7 @@ A path is kept inside its mount point (`..` can't climb out), and a name under n
 
 ## Where it stops now
 
-After v0.13.0: **`_cellSpursEventFlagInitialize`**, when START is pressed on the title screen: SPURS's tasks are next. Before that the game shows its start-up notices, makes or loads its save, shows its Dolby Digital logo and its title screen ("Press the START button"), with a black panel in the middle not yet explained. Still ahead: SPURS tasks; the stencil test and the rest the renderer refuses (above).
+After v0.13.0: **`cellPamfGetHeaderSize`**: after START on the title screen, the game plays a film (PAMF: MPEG-2 video, ATRAC3plus sound), which needs decoders for both (**open**: the owner's decision). Before that: SPURS's tasks and event flags, its title screen, its save, its logo. The black panel on the title screen is probably a film too.
 
 ### A fault on the way, and what it was
 

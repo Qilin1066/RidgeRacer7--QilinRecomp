@@ -11,9 +11,11 @@
 // Runtime code: no std::format.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <span>
 #include <string>
 #include <string_view>
@@ -139,6 +141,13 @@ struct PadState {
     uint16_t pressure[12] = {};
 };
 void set_pad_state(const PadState& state);
+// SPURS's tasks (spurs.cpp), run as SPU programs on host threads (spu.cpp): the program's ELF in guest memory, $3 and $4 as
+// the task is given them, the SPURS instance's ports for the events it sends, and what to call when it exits (with its status).
+void start_spu_task(const std::string& name, uint32_t image_address, const std::array<uint32_t, 4>& r3, const std::array<uint32_t, 4>& r4,
+                    const std::map<uint32_t, uint32_t>& ports, std::function<void(uint32_t status)> exited);
+// Guest memory no SPU transfer may touch (an object this runtime keeps natively, whose layout an SPU program would assume):
+// one that does stops the game, naming it.
+void forbid_spu_transfers(uint32_t address, uint32_t size, const char* what);
 // The program's thread-local image: each thread gets a copy.
 struct TlsImage {
     uint32_t address = 0, file_size = 0, memory_size = 0;

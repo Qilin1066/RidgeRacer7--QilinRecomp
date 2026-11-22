@@ -7,6 +7,9 @@
 // what it runs is the game's own SPU programs, lifted. What is here so far
 // is the instance itself. Tasksets, tasks and event flags stop the game by
 // name until they are provided.
+#include <array>
+#include <condition_variable>
+#include <cstring>
 #include <map>
 #include <mutex>
 
@@ -34,7 +37,18 @@ struct Taskset {
     uint64_t argument = 0;
     uint8_t priority[8] = {};
     uint32_t max_contention = 0;
+    uint32_t next_task = 0, running = 0;  // tasks made (their ids), and those not yet exited
+    bool shut_down = false;
 };
+std::condition_variable g_changed;  // a task exited, or an event flag's bits changed (both under g_mutex)
+
+// An event flag, kept natively: sixteen bits, how they clear, who sets and who waits (the SDK's directions: 0 SPU to
+// SPU, 1 SPU to PPU, 2 PPU to SPU, 3 any to any).
+struct EventFlag {
+    uint32_t spurs = 0, taskset = 0, clear_mode = 0, direction = 0;
+    uint16_t bits = 0;
+};
+std::map<uint32_t, EventFlag> g_flags;  // by the address of the game's CellSpursEventFlag
 std::map<uint32_t, Taskset> g_tasksets;  // by the address of the game's CellSpursTaskset
 
 // cellSpursInitialize(CellSpurs* spurs, SPUs, the SPU threads' priority, the handler thread's priority, exit when there is no work)
@@ -122,17 +136,164 @@ void cellSpursCreateTaskset(Cpu& c) {
 }
 
 // cellSpursCreateTask(taskset, uint32_t* task id, the task's SPU program (an ELF), context save area, its size, CellSpursTaskLsPattern*, CellSpursTaskArgument*)
-// Not provided yet: it needs the SPU programs lifted. It says what it was asked, for the work ahead.
+// The task is run at once, on a host thread of its own, as an SPU program (spu.cpp): $3 its argument (16 bytes), $4 the
+// taskset's (in the first doubleword), as the SDK's task entry main(qword, uint64) takes them. *Not as SPURS does it: no
+// SPU is shared between tasks and none waits for one; a context save area is never used, since no task is ever
+// swapped out. The game's tasks seen so far call nothing of a SPURS kernel and end as SPU threads do (stop 0x102).*
 void cellSpursCreateTask(Cpu& c) {
-    const uint32_t elf = static_cast<uint32_t>(c.r[5]), argument = static_cast<uint32_t>(c.r[9]);
-    qilin::rt::fatal("the game creates a SPURS task from the SPU program at %08x (taskset %08x, context %08x of %u bytes, pattern %08x, argument %08x %08x %08x %08x), "
-                     "and running SPU programs isn't provided yet; it would return to %08x",
-                     elf, static_cast<uint32_t>(c.r[3]), static_cast<uint32_t>(c.r[6]), static_cast<uint32_t>(c.r[7]), static_cast<uint32_t>(c.r[8]),
-                     argument ? load32(argument) : 0, argument ? load32(argument + 4) : 0, argument ? load32(argument + 8) : 0, argument ? load32(argument + 12) : 0,
-                     static_cast<uint32_t>(c.lr));
+    const uint32_t taskset = static_cast<uint32_t>(c.r[3]), id_out = static_cast<uint32_t>(c.r[4]), elf = static_cast<uint32_t>(c.r[5]),
+                   argument = static_cast<uint32_t>(c.r[9]);
+    if (!taskset || !id_out || !elf) {
+        c.r[3] = kNullPointer;
+        return;
+    }
+    std::array<uint32_t, 4> r3{}, r4{};
+    if (argument)
+        for (unsigned i = 0; i < 4; ++i) r3[i] = load32(argument + 4 * i);
+    std::map<uint32_t, uint32_t> ports;
+    uint32_t id;
+    {
+        const std::lock_guard lock(g_mutex);
+        const auto it = g_tasksets.find(taskset);
+        if (it == g_tasksets.end() || it->second.shut_down) qilin::rt::fatal("cellSpursCreateTask on taskset %08x, which isn't running", taskset);
+        Taskset& t = it->second;
+        if (t.next_task >= 32) qilin::rt::fatal("cellSpursCreateTask: a 33rd task in taskset %08x", taskset);
+        id = t.next_task++;
+        ++t.running;
+        r4[0] = static_cast<uint32_t>(t.argument >> 32), r4[1] = static_cast<uint32_t>(t.argument);
+        ports = g_instances.at(t.spurs).ports;
+    }
+    store32(id_out, id);
+    start_spu_task({}, elf, r3, r4, ports, [taskset](uint32_t) {
+        const std::lock_guard lock(g_mutex);
+        --g_tasksets.at(taskset).running;
+        g_changed.notify_all();
+    });
+    c.r[3] = kOk;
+}
+
+// cellSpursShutdownTaskset(taskset): no more tasks; it ends when those running have exited.
+void cellSpursShutdownTaskset(Cpu& c) {
+    const std::lock_guard lock(g_mutex);
+    const auto it = g_tasksets.find(static_cast<uint32_t>(c.r[3]));
+    if (it == g_tasksets.end()) qilin::rt::fatal("cellSpursShutdownTaskset on %08x, which is no taskset", static_cast<uint32_t>(c.r[3]));
+    it->second.shut_down = true;
+    c.r[3] = kOk;
+}
+
+// cellSpursJoinTaskset(taskset): waits for every task to have exited, and forgets the taskset.
+void cellSpursJoinTaskset(Cpu& c) {
+    const uint32_t taskset = static_cast<uint32_t>(c.r[3]);
+    std::unique_lock lock(g_mutex);
+    if (!g_tasksets.contains(taskset)) qilin::rt::fatal("cellSpursJoinTaskset on %08x, which is no taskset", taskset);
+    g_changed.wait(lock, [&] { return g_tasksets.at(taskset).running == 0; });
+    g_tasksets.erase(taskset);
+    c.r[3] = kOk;
+}
+
+// cellSpursFinalize(spurs): the instance ends; its tasksets must be over.
+void cellSpursFinalize(Cpu& c) {
+    const uint32_t spurs = static_cast<uint32_t>(c.r[3]);
+    const std::lock_guard lock(g_mutex);
+    if (!g_instances.contains(spurs)) qilin::rt::fatal("cellSpursFinalize on %08x, which is no SPURS instance", spurs);
+    for (const auto& [address, t] : g_tasksets)
+        if (t.spurs == spurs) qilin::rt::fatal("cellSpursFinalize with taskset %08x not yet joined", address);
+    g_instances.erase(spurs);
+    c.r[3] = kOk;
+}
+
+// cellSpursDetachLv2EventQueue(spurs, port)
+void cellSpursDetachLv2EventQueue(Cpu& c) {
+    const std::lock_guard lock(g_mutex);
+    const auto it = g_instances.find(static_cast<uint32_t>(c.r[3]));
+    if (it == g_instances.end() || !it->second.ports.erase(static_cast<uint32_t>(c.r[4])))
+        qilin::rt::fatal("cellSpursDetachLv2EventQueue: port %u of %08x isn't attached", static_cast<uint32_t>(c.r[4]), static_cast<uint32_t>(c.r[3]));
+    c.r[3] = kOk;
+}
+
+// ---- event flags, kept natively. An SPU program that touched one's memory would be using the SDK's layout of it, which
+// isn't known here: spu.cpp stops the game if one does.
+
+EventFlag& flag_at(uint32_t address, const char* call) {
+    const auto it = g_flags.find(address);
+    if (it == g_flags.end()) qilin::rt::fatal("%s on %08x, which is no event flag", call, address);
+    return it->second;
+}
+
+// _cellSpursEventFlagInitialize(spurs, taskset, CellSpursEventFlag* flag, clear mode (0 automatic, 1 manual), direction)
+void cellSpursEventFlagInitialize(Cpu& c) {
+    const uint32_t spurs = static_cast<uint32_t>(c.r[3]), taskset = static_cast<uint32_t>(c.r[4]), flag = static_cast<uint32_t>(c.r[5]);
+    const uint32_t clear_mode = static_cast<uint32_t>(c.r[6]), direction = static_cast<uint32_t>(c.r[7]);
+    if (!flag || (!spurs && !taskset)) {
+        c.r[3] = kNullPointer;
+        return;
+    }
+    if (flag & 127) {
+        c.r[3] = kAlign;
+        return;
+    }
+    if (clear_mode > 1 || direction > 3) qilin::rt::fatal("_cellSpursEventFlagInitialize: clear mode %u, direction %u", clear_mode, direction);
+    const std::lock_guard lock(g_mutex);
+    g_flags[flag] = EventFlag{spurs, taskset, clear_mode, direction, 0};
+    std::memset(guest_memory() + flag, 0, 128);
+    forbid_spu_transfers(flag, 128, "a SPURS event flag");
+    c.r[3] = kOk;
+}
+
+// cellSpursEventFlagAttachLv2EventQueue(flag), cellSpursEventFlagDetachLv2EventQueue(flag): on a console the queue by which
+// SPU tasks wake the PPU; here a PPU waiter is woken directly, so there is nothing to attach.
+void cellSpursEventFlagAttachLv2EventQueue(Cpu& c) {
+    const std::lock_guard lock(g_mutex);
+    flag_at(static_cast<uint32_t>(c.r[3]), "cellSpursEventFlagAttachLv2EventQueue");
+    c.r[3] = kOk;
+}
+void cellSpursEventFlagDetachLv2EventQueue(Cpu& c) {
+    const std::lock_guard lock(g_mutex);
+    flag_at(static_cast<uint32_t>(c.r[3]), "cellSpursEventFlagDetachLv2EventQueue");
+    c.r[3] = kOk;
+}
+
+// cellSpursEventFlagSet(flag, bits)
+void cellSpursEventFlagSet(Cpu& c) {
+    const std::lock_guard lock(g_mutex);
+    EventFlag& f = flag_at(static_cast<uint32_t>(c.r[3]), "cellSpursEventFlagSet");
+    if (f.direction == 1) qilin::rt::fatal("cellSpursEventFlagSet from the PPU on a flag the SPU sets (direction 1)");
+    f.bits |= static_cast<uint16_t>(c.r[4]);
+    g_changed.notify_all();
+    c.r[3] = kOk;
+}
+
+// cellSpursEventFlagWait(flag, uint16_t* bits, mode (0 all of them, 1 any)): waits until the bits asked for are set, and
+// gives those that are; with automatic clearing they are cleared (*the bits asked for: a stated reading*).
+void cellSpursEventFlagWait(Cpu& c) {
+    const uint32_t flag = static_cast<uint32_t>(c.r[3]), bits_at = static_cast<uint32_t>(c.r[4]), mode = static_cast<uint32_t>(c.r[5]);
+    if (!bits_at) {
+        c.r[3] = kNullPointer;
+        return;
+    }
+    if (mode > 1) qilin::rt::fatal("cellSpursEventFlagWait: mode %u", mode);
+    const uint16_t wanted = static_cast<uint16_t>((guest_memory()[bits_at] << 8) | guest_memory()[bits_at + 1]);
+    std::unique_lock lock(g_mutex);
+    EventFlag& f = flag_at(flag, "cellSpursEventFlagWait");
+    if (f.direction == 2 || f.direction == 0) qilin::rt::fatal("cellSpursEventFlagWait from the PPU on a flag the SPU waits on (direction %u)", f.direction);
+    g_changed.wait(lock, [&] { return mode == 0 ? (f.bits & wanted) == wanted : (f.bits & wanted) != 0; });
+    const uint16_t got = f.bits;
+    if (f.clear_mode == 0) f.bits &= static_cast<uint16_t>(~wanted);
+    lock.unlock();
+    guest_memory()[bits_at] = static_cast<uint8_t>(got >> 8), guest_memory()[bits_at + 1] = static_cast<uint8_t>(got);
+    c.r[3] = kOk;
 }
 
 constexpr NativeImport kImports[] = {
+    {"cellSpurs", "cellSpursShutdownTaskset", cellSpursShutdownTaskset},
+    {"cellSpurs", "cellSpursJoinTaskset", cellSpursJoinTaskset},
+    {"cellSpurs", "cellSpursFinalize", cellSpursFinalize},
+    {"cellSpurs", "cellSpursDetachLv2EventQueue", cellSpursDetachLv2EventQueue},
+    {"cellSpurs", "_cellSpursEventFlagInitialize", cellSpursEventFlagInitialize},
+    {"cellSpurs", "cellSpursEventFlagAttachLv2EventQueue", cellSpursEventFlagAttachLv2EventQueue},
+    {"cellSpurs", "cellSpursEventFlagDetachLv2EventQueue", cellSpursEventFlagDetachLv2EventQueue},
+    {"cellSpurs", "cellSpursEventFlagSet", cellSpursEventFlagSet},
+    {"cellSpurs", "cellSpursEventFlagWait", cellSpursEventFlagWait},
     {"cellSpurs", "cellSpursCreateTaskset", cellSpursCreateTaskset},
     {"cellSpurs", "cellSpursCreateTask", cellSpursCreateTask},
     {"cellSpurs", "cellSpursAttachLv2EventQueue", cellSpursAttachLv2EventQueue},

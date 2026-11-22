@@ -29,10 +29,12 @@
 // **Not as a console does it, and to be kept in mind:** SPU threads run
 // freely, each on a host thread, with no priorities (the scheduler is to
 // come).
+#include <algorithm>
 #include <array>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -83,6 +85,11 @@ struct Thread {
     bool reserved = false;
     uint32_t reserved_at = 0;
     std::array<uint8_t, 128> reserved_data{};
+
+    // A SPURS task (no group): its registers as SPURS gives them, and what to tell when it exits.
+    bool task = false;
+    SpuReg task_r3{}, task_r4{};
+    std::function<void(uint32_t)> exited;
 };
 
 struct Group {
@@ -102,6 +109,13 @@ std::map<uint32_t, std::shared_ptr<Thread>> g_threads;
 uint32_t g_next_group = 0x04000100u, g_next_thread = 0x02000000u;
 bool g_initialised = false;
 std::mutex g_atomic;  // the atomic line transfers, one at a time
+
+struct Forbidden {
+    uint32_t address, size;
+    const char* what;
+};
+std::mutex g_forbidden_mutex;
+std::vector<Forbidden> g_forbidden;  // forbid_spu_transfers
 
 struct ThreadExit {
     uint32_t status;
@@ -132,6 +146,14 @@ uint8_t* shared(Thread& t, uint32_t address, uint32_t size, uint32_t pc) {
 }
 
 void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
+    {
+        const uint32_t bytes = std::max<uint32_t>(t.size, 128);  // (an atomic transfer is a 128-byte line)
+        const std::lock_guard lock(g_forbidden_mutex);
+        for (const Forbidden& f : g_forbidden)
+            if (t.eah == 0 && t.eal < f.address + f.size && f.address < t.eal + bytes)
+                fatal("SPU program %s transfers (command %#x) at %08x, inside %s at %08x, which this runtime keeps natively: its layout is the SDK's, not known here (at %05x)",
+                      t.name.c_str(), command, t.eal, f.what, f.address, pc);
+    }
     // Bits 0 and 1 ask that the command wait for others of its tag: commands are done at once and in order here, so they say nothing.
     switch (command & ~3u) {
     case 0x40:  // get: the game's memory to the SPU's
@@ -301,6 +323,10 @@ const qilin::rt::SpuHooks kHooks{read_channel, write_channel, channel_count, sto
 // ---------------------------------------------------------------- running
 
 void finish(Thread& t, uint32_t cause, uint32_t status) {
+    if (t.task) {
+        t.exited(status);
+        return;
+    }
     const std::lock_guard lock(g_mutex);
     Group& group = *t.group;
     if (cause == kJoinGroupExit && !group.ended) {
@@ -325,6 +351,7 @@ void run_thread(std::shared_ptr<Thread> thread) {
         finish(t, 0, exit.status);
     } catch (const GroupExit& exit) {
         // (The group's other threads go on until they exit themselves: a console ends them at once. The game's groups seen so far have one thread.)
+        if (t.task) fatal("SPURS task %s ends with the SPU thread group's exit (stop 0x101)", t.name.c_str());
         if (t.group->size > 1) fatal("SPU thread %s ends its group of %u threads, which this runtime doesn't provide yet", t.name.c_str(), t.group->size);
         finish(t, kJoinGroupExit, exit.status);
     }
@@ -345,11 +372,19 @@ void prepare(Thread& t) {
     t.spu.hooks = &kHooks;
     t.spu.owner = &t;
     for (unsigned i = 0; i < 4; ++i) t.spu.r[3 + i] = SpuReg{{static_cast<uint32_t>(t.arguments[i] >> 32), static_cast<uint32_t>(t.arguments[i]), 0, 0}};
+    if (t.task) t.spu.r[3] = t.task_r3, t.spu.r[4] = t.task_r4, t.spu.r[5] = t.spu.r[6] = SpuReg{};
     t.spu.r[1] = SpuReg{{0x3fff0u, 0, 0, 0}};  // the stack starts at the top
     t.in_mailbox.clear();
     t.out_mailbox = 0;
     t.reserved = false;
     t.lsa = t.eah = t.eal = t.size = t.tag = t.tag_mask = t.atomic_status = 0;
+}
+
+const qilin::rt::LiftedSpuProgram& lifted(uint32_t image_address, const std::string& name) {
+    for (const qilin::rt::LiftedSpuProgram& program : spu_programs())
+        if (program.address == image_address) return program;
+    fatal("the game starts an SPU program at %08x (%s) that is not among the %zu lifted: every SPU program must be known when the game is built", image_address, name.c_str(),
+          spu_programs().size());
 }
 
 std::shared_ptr<Thread> thread_of(uint64_t id) {
@@ -460,11 +495,7 @@ void sys_spu_thread_initialize(Cpu& c) {
     thread->image = *parsed;
     thread->name = attribute ? guest_string(load32(attribute), load32(attribute + 4)) : std::string();
     if (thread->name.empty()) thread->name = parsed->name.empty() ? "(no name)" : parsed->name;
-    for (const qilin::rt::LiftedSpuProgram& program : spu_programs())
-        if (program.address == thread->image_address) thread->program = &program;
-    if (!thread->program)
-        fatal("the game starts an SPU program at %08x (%s) that is not among the %zu lifted: every SPU program must be known when the game is built", thread->image_address,
-              parsed->name.c_str(), spu_programs().size());
+    thread->program = &lifted(thread->image_address, parsed->name);
     if (arguments)
         for (unsigned i = 0; i < 4; ++i) thread->arguments[i] = load64(arguments + 8 * i);
     const std::lock_guard lock(g_mutex);
@@ -675,5 +706,35 @@ constexpr NativeImport kImports[] = {
 
 std::span<const NativeSystemCall> spu_system_calls() { return kCalls; }
 std::span<const NativeImport> spu_imports() { return kImports; }
+
+// A SPURS task: a thread of no group, started at once, on a host thread of its own (spurs.cpp: what SPURS makes of it).
+void start_spu_task(const std::string& name, uint32_t image_address, const std::array<uint32_t, 4>& r3, const std::array<uint32_t, 4>& r4,
+                    const std::map<uint32_t, uint32_t>& ports, std::function<void(uint32_t status)> exited) {
+    auto thread = std::make_shared<Thread>();
+    thread->image_address = image_address;
+    const auto parsed = qilin::parse_spu_image({guest_memory() + image_address, 0x40000}, image_address);
+    if (!parsed) fatal("a SPURS task's program at %08x is no SPU program: %s", image_address, parsed.error().c_str());
+    thread->image = *parsed;
+    thread->name = name.empty() ? parsed->name : name;
+    thread->program = &lifted(image_address, parsed->name);
+    thread->task = true;
+    thread->task_r3 = SpuReg{{r3[0], r3[1], r3[2], r3[3]}};
+    thread->task_r4 = SpuReg{{r4[0], r4[1], r4[2], r4[3]}};
+    thread->ports = ports;
+    thread->exited = std::move(exited);
+    {
+        const std::lock_guard lock(g_mutex);
+        thread->id = g_next_thread++;
+        g_threads.emplace(thread->id, thread);
+    }
+    prepare(*thread);
+    // (The host thread is left to end by itself: the task's record stays in g_threads, as an exited SPU thread's does.)
+    std::thread(run_thread, thread).detach();
+}
+
+void forbid_spu_transfers(uint32_t address, uint32_t size, const char* what) {
+    const std::lock_guard lock(g_forbidden_mutex);
+    g_forbidden.push_back({address, size, what});
+}
 
 }  // namespace rr7

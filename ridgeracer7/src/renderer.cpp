@@ -81,7 +81,7 @@ struct CachedTexture {
     host::Image image;
     uint64_t hash = 0;
     uint64_t used = 0;  // the batch it was last used in
-    uint64_t checked = UINT64_MAX, checked_epoch = 0;  // the batch, and the texture cache's epoch, its hash was last taken in
+    uint64_t checked = UINT64_MAX;  // the batch its hash was last taken in
 };
 
 // A hash of guest bytes (not for security: to see that a texture has changed), in four lanes of eight bytes the CPU can
@@ -129,8 +129,7 @@ struct Renderer {
     SurfaceEntry* rendering_depth = nullptr;  // and its depth surface, if any
     VkFormat depth_format = VK_FORMAT_UNDEFINED;  // for Z24S8: D32_SFLOAT_S8_UINT, or D24_UNORM_S8_UINT where the GPU lacks it
     uint64_t draws = 0, flushes = 0;
-    uint64_t texture_epoch = 0;
-    VkQueryPool timestamps = VK_NULL_HANDLE;  // three a batch: its start, before its copies back, its end  // moved on by the texture cache's invalidation (renderer_invalidate_textures)
+    VkQueryPool timestamps = VK_NULL_HANDLE;  // three a batch: its start, before its copies back, its end
     std::map<std::vector<uint32_t>, VkSampler> samplers;  // by the fields they're made from
     host::Buffer dummy;  // bound where a program has no inline constants
 };
@@ -641,9 +640,6 @@ void renderer_flush() {
     g_stats.flush_ns += since(flush_start);
 }
 
-void renderer_invalidate_textures() {
-    if (g_renderer) ++g_renderer->texture_epoch;
-}
 
 void renderer_report() {
     const auto ms = [](const std::atomic<uint64_t>& ns) { return static_cast<double>(ns.load()) / 1e6; };
@@ -747,13 +743,14 @@ void renderer_draw(const Draw& d) {
             Upload& up = uploads.emplace_back();
             up.unit = u;
             up.cached = &r.textures[{t.address, t.format, t.rect, t.control3, t.remap, 0}];
-            // Its bytes are hashed once a batch: within one, the game can't know the RSX has finished with a texture, so it
-            // changes none, except as it tells the texture cache (the epoch).
-            if (!up.cached->image.image || up.cached->checked != r.flushes || up.cached->checked_epoch != r.texture_epoch) {
+            // Its bytes are hashed once a batch. Within one the game can't change a texture the batch has drawn with: it can't
+            // know the RSX is done with it without a label, a wait or a flip, each of which ends the batch. (The texture
+            // cache's invalidation doesn't change that, and the game sends one before nearly every draw.)
+            if (!up.cached->image.image || up.cached->checked != r.flushes) {
                 const uint64_t hash = hash_bytes(guest_memory() + t.address, bytes);
                 up.decode = !up.cached->image.image || up.cached->hash != hash;
                 up.cached->hash = hash;
-                up.cached->checked = r.flushes, up.cached->checked_epoch = r.texture_epoch;
+                up.cached->checked = r.flushes;
             } else {
                 up.decode = false;
             }

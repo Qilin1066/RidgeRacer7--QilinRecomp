@@ -398,9 +398,8 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     case 0x1714:  // INVALIDATE_VERTEX_FILE: the RSX's caches of vertices; this one reads guest memory at each draw
         return;
     case 0x1fd8:  // the texture cache's control (PSL1GHT's TEX_CACHE_CTL): 1 invalidates the fragment programs' textures, 2 the
-                  // vertex programs'. Here textures are checked against guest memory once a batch, and again after this.
+                  // vertex programs'. Here textures are checked against guest memory once a batch (renderer.cpp: why that is enough).
         if (argument != 1 && argument != 2) qilin::rt::fatal("the RSX's texture cache is given %08x", argument);
-        renderer_invalidate_textures();
         return;
     case 0x1808:  // SET_BEGIN_END: a primitive's start (its kind), or 0 for its end, when the ranges since are drawn
         if (argument) {

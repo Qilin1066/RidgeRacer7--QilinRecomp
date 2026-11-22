@@ -14,7 +14,14 @@
 // low four bits (every film's stream has code 4 there and in its own sequence header, so this isn't told apart from other
 // readings); the ES filter ids are this runtime's own (the game only hands them back to cellDmuxEnableEs).
 //
-// Not yet: ATRAC3plus sound streams (enabling one stops the game, by name).
+// Sound (cellAdec, ATRAC3plus, "ATRACX"), as the game's player uses it: its parameters (CellAdecParamAtracX) give the output
+// channels at +8, the sample format at +20 (0x84: 32-bit floats, big-endian), downmixing at +24 and, at +25, that an access
+// unit keeps its 8-byte ATS header; messages 0 an access unit done, 1 PCM out, 2 an error; a PCM item's size at +12; "empty"
+// is 0x80610005. A frame of PAMF's private stream: the 8-byte header 0x0FD0, then (rate 3 bits, channel configuration 3,
+// size 10: (size + 1) * 8 bytes), checked on every frame of the three films with sound. The game reorders six channels from
+// the system's order as (0, 2, 1, 5, 3, 4): so the system gives L, C, R, Ls, Rs, LFE, and FFmpeg's planes, in the stream's
+// block order L, R, C, Ls, Rs, LFE (*the blocks' meaning a stated reading*), are put in that order.
+#include <bit>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -29,6 +36,7 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
 }
 
 namespace rr7 {
@@ -292,6 +300,23 @@ void cut(Cpu& cpu, Demuxer& d, Es& e, const uint8_t* data, size_t size, bool end
     }
 }
 
+// The sound stream's new bytes, cut into frames with their headers.
+void cut_sound(Cpu& cpu, Demuxer& d, Es& e, const uint8_t* data, size_t size, std::unique_lock<std::mutex>& lock) {
+    e.pending.insert(e.pending.end(), data, data + size);
+    size_t at = 0;
+    while (e.pending.size() - at >= 8) {
+        const uint8_t* f = e.pending.data() + at;
+        if (f[0] != 0x0f || f[1] != 0xd0) fatal("a film's sound stream has no frame header where one should be");
+        const uint32_t bytes = 8 + ((((f[2] & 3u) << 8) | f[3]) + 1) * 8;
+        if (e.pending.size() - at < bytes) break;
+        const std::vector<uint8_t> unit(f, f + bytes);
+        found(cpu, d, e, unit.data(), bytes, lock);
+        if (d.closing) return;
+        at += bytes;
+    }
+    e.pending.erase(e.pending.begin(), e.pending.begin() + static_cast<std::ptrdiff_t>(at));
+}
+
 // A chunk of the program stream: its packs, and the packets of the streams enabled.
 void demux_chunk(Cpu& cpu, Demuxer& d, const uint8_t* p, uint32_t size, std::unique_lock<std::mutex>& lock) {
     uint32_t i = 0;
@@ -314,9 +339,10 @@ void demux_chunk(Cpu& cpu, Demuxer& d, const uint8_t* p, uint32_t size, std::uni
             const uint8_t* packet = p + i + 6;
             const uint32_t payload_at = 3 + packet[2];  // MPEG-2 PES header
             if (code == 0xbd) {
-                bool wanted = false;
-                for (const auto& [handle, e] : d.es) wanted = wanted || e->id == 0xbd;
-                if (wanted) fatal("a film's sound stream, which this runtime doesn't take yet (ATRAC3plus)");
+                // PAMF's private stream: a sub-stream id, a reserved byte, the offset of the first frame begun here; then frames.
+                const uint8_t* payload = packet + payload_at;
+                for (auto& [handle, e] : d.es)
+                    if (e->id == 0xbd && e->sub == payload[0]) cut_sound(cpu, d, *e, payload + 4, length - payload_at - 4, lock);
             } else {
                 for (auto& [handle, e] : d.es)
                     if (e->id == code) cut(cpu, d, *e, packet + payload_at, length - payload_at, false, lock);
@@ -414,16 +440,17 @@ void cellDmuxEnableEs(Cpu& c) {
     const uint32_t filter = static_cast<uint32_t>(c.r[4]), resource = static_cast<uint32_t>(c.r[5]), cb = static_cast<uint32_t>(c.r[6]);
     auto e = std::make_shared<Es>();
     e->id = load32(filter), e->sub = load32(filter + 4);
-    if (e->id == 0xbd) fatal("the game enables a film's sound stream, which this runtime doesn't take yet (ATRAC3plus)");
-    if ((e->id & 0xf0) != 0xe0) fatal("cellDmuxEnableEs with filter %08x %08x, which isn't one of cellPamfStreamTypeToEsFilterId's", e->id, e->sub);
+    if (e->id != 0xbd && (e->id & 0xf0) != 0xe0) fatal("cellDmuxEnableEs with filter %08x %08x, which isn't one of cellPamfStreamTypeToEsFilterId's", e->id, e->sub);
     e->memory = load32(resource), e->memory_size = load32(resource + 4);
     e->callback = load32(cb), e->argument = load32(cb + 4);
     // The stream's own records: its message and 64 access units' infos, from the runtime's memory.
     e->message = allocate(16 + 64 * 32, 16);
     e->info_slots = e->message + 16;
-    e->parser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
-    e->parser_context = avcodec_alloc_context3(nullptr);
-    if (!e->parser || !e->parser_context) fatal("FFmpeg's MPEG video parser can't be made");
+    if (e->id != 0xbd) {
+        e->parser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
+        e->parser_context = avcodec_alloc_context3(nullptr);
+        if (!e->parser || !e->parser_context) fatal("FFmpeg's MPEG video parser can't be made");
+    }
     const std::lock_guard lock(g_mutex);
     const auto d = demuxer_of(static_cast<uint32_t>(c.r[3]));
     e->handle = g_next_handle++;
@@ -441,9 +468,11 @@ void cellDmuxResetEs(Cpu& c) {
         return;
     }
     const auto e = es_of(static_cast<uint32_t>(c.r[3]));
-    e->ready.clear(), e->taken.clear();
-    av_parser_close(e->parser);
-    e->parser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
+    e->ready.clear(), e->taken.clear(), e->pending.clear();
+    if (e->parser) {
+        av_parser_close(e->parser);
+        e->parser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
+    }
     demuxer_of(e->demuxer)->changed.notify_all();
     c.r[3] = kOk;
 }
@@ -674,7 +703,197 @@ void cellVdecGetPicture(Cpu& c) {
         }
 }
 
+// ---------------------------------------------------------------- cellAdec
+
+constexpr uint64_t kAdecEmpty = 0x80610005u;
+constexpr uint32_t kAtracX = 3;  // the codec type the game opens for its films' sound, with ATRACX's parameters
+
+struct Pcm {
+    std::vector<uint8_t> bytes;  // interleaved big-endian floats
+};
+struct SoundDecoder {
+    uint32_t handle = 0, callback = 0, argument = 0;
+    uint32_t item = 0;  // the CellAdecPcmItem, in the runtime's memory
+    uint32_t channels_out = 0;
+    AVCodecContext* context = nullptr;
+    std::deque<std::vector<uint8_t>> units;
+    std::deque<Pcm> pcm;
+    bool closing = false;
+    std::condition_variable changed;
+    std::thread thread;
+};
+std::map<uint32_t, std::shared_ptr<SoundDecoder>> g_sound;
+
+// The decoder, made at the first frame (its size and channels come from the frame's header).
+void open_atrac(SoundDecoder& d, const uint8_t* header) {
+    static constexpr int kRates[8] = {32000, 44100, 48000, 0, 0, 0, 0, 0};
+    static constexpr int kChannels[8] = {0, 1, 2, 3, 4, 6, 7, 8};
+    const int rate = kRates[header[2] >> 5], channels = kChannels[(header[2] >> 2) & 7];
+    if (!rate || !channels) fatal("a film's ATRAC3plus frame with rate code %u and channel configuration %u", header[2] >> 5, (header[2] >> 2) & 7);
+    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_ATRAC3P);
+    d.context = codec ? avcodec_alloc_context3(codec) : nullptr;
+    if (!d.context) fatal("FFmpeg's ATRAC3plus decoder can't be made");
+    d.context->sample_rate = rate;
+    av_channel_layout_default(&d.context->ch_layout, channels);
+    d.context->block_align = static_cast<int>(((((header[2] & 3u) << 8) | header[3]) + 1) * 8);
+    if (avcodec_open2(d.context, codec, nullptr) < 0) fatal("FFmpeg's ATRAC3plus decoder can't be opened");
+    if (static_cast<uint32_t>(channels) != d.channels_out)
+        fatal("a film's sound of %d channels, which the game wants as %u (downmixing isn't provided yet)", channels, d.channels_out);
+}
+
+void sound_thread(std::shared_ptr<SoundDecoder> d) {
+    Cpu cpu;
+    become_guest_thread(cpu, 0x10000, 0);
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    std::unique_lock lock(g_mutex);
+    for (;;) {
+        d->changed.wait(lock, [&] { return d->closing || !d->units.empty(); });
+        if (d->closing) break;
+        std::vector<uint8_t> unit = std::move(d->units.front());
+        d->units.pop_front();
+        lock.unlock();
+        if (unit.size() < 8 || unit[0] != 0x0f || unit[1] != 0xd0) fatal("a film's sound access unit without its ATS header");
+        if (!d->context) open_atrac(*d, unit.data());
+        packet->data = unit.data() + 8, packet->size = static_cast<int>(unit.size() - 8);
+        if (avcodec_send_packet(d->context, packet) < 0) fatal("FFmpeg's ATRAC3plus decoder refuses a film's frame");
+        std::vector<Pcm> out;
+        while (avcodec_receive_frame(d->context, frame) == 0) {
+            if (frame->format != AV_SAMPLE_FMT_FLTP) fatal("FFmpeg's ATRAC3plus decoder gives sample format %d", frame->format);
+            const int channels = frame->ch_layout.nb_channels;
+            // FFmpeg's planes in the stream's order to the system's (above): for six, L R C Ls Rs LFE to L C R Ls Rs LFE.
+            int from[8];
+            for (int k = 0; k < channels; ++k) from[k] = k;
+            if (channels == 6) from[1] = 2, from[2] = 1;
+            else if (channels > 2) fatal("a film's sound of %d channels, whose order isn't known here", channels);
+            Pcm p;
+            p.bytes.resize(size_t{4} * static_cast<size_t>(channels) * static_cast<size_t>(frame->nb_samples));
+            for (int i = 0; i < frame->nb_samples; ++i)
+                for (int k = 0; k < channels; ++k) {
+                    const uint32_t v = std::bit_cast<uint32_t>(reinterpret_cast<const float*>(frame->extended_data[from[k]])[i]);
+                    uint8_t* q = p.bytes.data() + (size_t{static_cast<uint32_t>(i)} * static_cast<size_t>(channels) + static_cast<size_t>(k)) * 4;
+                    q[0] = static_cast<uint8_t>(v >> 24), q[1] = static_cast<uint8_t>(v >> 16), q[2] = static_cast<uint8_t>(v >> 8), q[3] = static_cast<uint8_t>(v);
+                }
+            out.push_back(std::move(p));
+        }
+        callback(cpu, d->callback, d->handle, 0, 0, d->argument);  // the access unit is done
+        for (Pcm& p : out) {
+            {
+                const std::lock_guard pcm_lock(g_mutex);
+                d->pcm.push_back(std::move(p));
+            }
+            callback(cpu, d->callback, d->handle, 1, 0, d->argument);  // PCM out
+        }
+        lock.lock();
+    }
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+}
+
+std::shared_ptr<SoundDecoder> sound_of(uint32_t handle) {
+    const auto it = g_sound.find(handle);
+    if (it == g_sound.end()) fatal("a sound decoder %08x that was never opened", handle);
+    return it->second;
+}
+void check_sound_codec(uint32_t type) {
+    if (load32(type) != kAtracX) fatal("the game opens a sound decoder for codec type %u (only ATRAC3plus, %u, is provided)", load32(type), kAtracX);
+}
+// cellAdecQueryAttr(CellAdecType* {codec}, CellAdecAttr* {memory size, version upper, lower})
+void cellAdecQueryAttr(Cpu& c) {
+    check_sound_codec(static_cast<uint32_t>(c.r[3]));
+    const uint32_t attr = static_cast<uint32_t>(c.r[4]);
+    store32(attr, 0x10000), store32(attr + 4, 0), store32(attr + 8, 0);
+    c.r[3] = kOk;
+}
+// cellAdecOpen(type, CellAdecResource*, CellAdecCb* {function, argument}, uint32_t* handle)
+void cellAdecOpen(Cpu& c) {
+    check_sound_codec(static_cast<uint32_t>(c.r[3]));
+    const uint32_t cb = static_cast<uint32_t>(c.r[5]);
+    auto d = std::make_shared<SoundDecoder>();
+    d->callback = load32(cb), d->argument = load32(cb + 4);
+    d->item = allocate(128, 16);
+    const std::lock_guard lock(g_mutex);
+    d->handle = g_next_handle++;
+    g_sound[d->handle] = d;
+    d->thread = std::thread(sound_thread, d);
+    store32(static_cast<uint32_t>(c.r[6]), d->handle);
+    c.r[3] = kOk;
+}
+// cellAdecStartSeq(handle, CellAdecParamAtracX*)
+void cellAdecStartSeq(Cpu& c) {
+    const uint32_t param = static_cast<uint32_t>(c.r[4]);
+    const uint32_t channels = load32(param + 8), word = load32(param + 20);
+    const uint8_t downmix = guest_memory()[param + 24], ats = guest_memory()[param + 25];
+    if (word != 0x84 || downmix != 0 || ats != 1)
+        fatal("cellAdecStartSeq for ATRAC3plus with sample format %#x, downmix %u, ATS headers %u (only floats, none, present are taken)", word, downmix, ats);
+    const std::lock_guard lock(g_mutex);
+    sound_of(static_cast<uint32_t>(c.r[3]))->channels_out = channels;
+    c.r[3] = kOk;
+}
+// cellAdecClose(handle)
+void cellAdecClose(Cpu& c) {
+    std::shared_ptr<SoundDecoder> d;
+    {
+        const std::lock_guard lock(g_mutex);
+        d = sound_of(static_cast<uint32_t>(c.r[3]));
+        d->closing = true;
+        d->changed.notify_all();
+    }
+    d->thread.join();
+    if (d->context) avcodec_free_context(&d->context);
+    const std::lock_guard lock(g_mutex);
+    g_sound.erase(d->handle);
+    c.r[3] = kOk;
+}
+// cellAdecDecodeAu(handle, CellAdecAuInfo* {address, size, ...}): copied now.
+void cellAdecDecodeAu(Cpu& c) {
+    const uint32_t info = static_cast<uint32_t>(c.r[4]);
+    const uint32_t address = load32(info), size = load32(info + 4);
+    const std::lock_guard lock(g_mutex);
+    const auto d = sound_of(static_cast<uint32_t>(c.r[3]));
+    d->units.emplace_back(guest_memory() + address, guest_memory() + address + size);
+    d->changed.notify_all();
+    c.r[3] = kOk;
+}
+// cellAdecGetPcmItem(handle, const CellAdecPcmItem** item): the next PCM's item; its size at +12.
+void cellAdecGetPcmItem(Cpu& c) {
+    const std::lock_guard lock(g_mutex);
+    const auto d = sound_of(static_cast<uint32_t>(c.r[3]));
+    if (d->pcm.empty()) {
+        c.r[3] = kAdecEmpty;
+        return;
+    }
+    std::memset(guest_memory() + d->item, 0, 128);
+    store32(d->item + 12, static_cast<uint32_t>(d->pcm.front().bytes.size()));
+    store32(static_cast<uint32_t>(c.r[4]), d->item);
+    c.r[3] = kOk;
+}
+// cellAdecGetPcm(handle, buffer): the next PCM, into the buffer (or dropped, with none).
+void cellAdecGetPcm(Cpu& c) {
+    const uint32_t out = static_cast<uint32_t>(c.r[4]);
+    Pcm p;
+    {
+        const std::lock_guard lock(g_mutex);
+        const auto d = sound_of(static_cast<uint32_t>(c.r[3]));
+        if (d->pcm.empty()) {
+            c.r[3] = kAdecEmpty;
+            return;
+        }
+        p = std::move(d->pcm.front());
+        d->pcm.pop_front();
+    }
+    if (out) std::memcpy(guest_memory() + out, p.bytes.data(), p.bytes.size());
+    c.r[3] = kOk;
+}
+
 constexpr NativeImport kImports[] = {
+    {"cellAdec", "cellAdecQueryAttr", cellAdecQueryAttr},
+    {"cellAdec", "cellAdecOpen", cellAdecOpen},
+    {"cellAdec", "cellAdecStartSeq", cellAdecStartSeq},
+    {"cellAdec", "cellAdecClose", cellAdecClose},
+    {"cellAdec", "cellAdecDecodeAu", cellAdecDecodeAu},
+    {"cellAdec", "cellAdecGetPcmItem", cellAdecGetPcmItem},
+    {"cellAdec", "cellAdecGetPcm", cellAdecGetPcm},
     {"cellPamf", "cellPamfGetHeaderSize", cellPamfGetHeaderSize},
     {"cellPamf", "cellPamfGetStreamOffsetAndSize", cellPamfGetStreamOffsetAndSize},
     {"cellPamf", "cellPamfReaderInitialize", cellPamfReaderInitialize},

@@ -86,11 +86,9 @@ struct Thread {
     uint32_t reserved_at = 0;
     std::array<uint8_t, 128> reserved_data{};
 
-    // A SPURS task (no group): its registers as SPURS gives them, and what to tell when it exits.
+    // A SPURS task (no group): how it was started.
     bool task = false;
-    SpuReg task_r3{}, task_r4{};
-    std::function<void(uint32_t)> exited;
-    std::function<uint32_t(uint32_t)> port_queue;  // a task's ports: its SPURS instance's, as they are now
+    SpuTaskSetup setup;
 };
 
 struct Group {
@@ -110,6 +108,9 @@ std::map<uint32_t, std::shared_ptr<Thread>> g_threads;
 uint32_t g_next_group = 0x04000100u, g_next_thread = 0x02000000u;
 bool g_initialised = false;
 std::mutex g_atomic;  // the atomic line transfers, one at a time
+std::condition_variable g_atomic_changed;  // an atomic put has changed a line
+// Where a task's SPURS kernel is, in its local store below the program (spu.cpp's prepare): its context and its entry.
+constexpr uint32_t kTaskContext = 0x2d00, kKernelEntry = 0x2e00;
 
 struct Forbidden {
     uint32_t address, size;
@@ -196,6 +197,7 @@ void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
         if (t.reserved && t.reserved_at == line && std::memcmp(there, t.reserved_data.data(), 128) == 0) {
             std::memcpy(there, local(t, t.lsa & 0x3ff80u, 128, pc), 128);
             t.atomic_status = 0;
+            g_atomic_changed.notify_all();
         } else {
             t.atomic_status = 1;
         }
@@ -207,6 +209,7 @@ void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
         std::memcpy(shared(t, t.eal & ~127u, 128, pc), local(t, t.lsa & 0x3ff80u, 128, pc), 128);
         if ((command & ~3u) == 0xB0) t.atomic_status = 2;
         t.reserved = false;
+        g_atomic_changed.notify_all();
         return;
     }
     default: fatal("SPU thread %s: memory-transfer command %#x, which this runtime doesn't provide yet (at %05x)", t.name.c_str(), command, pc);
@@ -225,7 +228,7 @@ void interrupt_word(Thread& t, uint32_t value, uint32_t pc) {
     uint32_t queue = 0, data1;
     {
         const std::lock_guard lock(t.mutex);
-        if (t.task) queue = t.port_queue(port);
+        if (t.task) queue = t.setup.port_queue(port);
         else if (const auto it = t.ports.find(port); it != t.ports.end()) queue = it->second;
         data1 = t.out_mailbox;
     }
@@ -320,13 +323,28 @@ void stop(Spu& s, uint32_t code, uint32_t pc) {
 
 [[noreturn]] void halt(Spu& s, uint32_t pc, const char* why) { fatal("SPU thread %s at %05x: %s", self(s).name.c_str(), pc, why); }
 
-const qilin::rt::SpuHooks kHooks{read_channel, write_channel, channel_count, stop, [](Spu& s, uint32_t pc, const char* why) { halt(s, pc, why); }};
+// A task's calls to the SPURS kernel's entry, by the number in $3: 0 the task ends; 2 it waits to be signalled.
+void native_call(Spu& s, uint32_t target, uint32_t pc) {
+    Thread& t = self(s);
+    if (!t.task || target != kKernelEntry) halt(s, pc, "a branch through a register to an address that is not a function");
+    const uint32_t call = s.r[3].w[0];
+    switch (call) {
+    case 0: throw ThreadExit{0};
+    case 2:
+        t.setup.wait_signal();
+        s.r[3] = SpuReg{};
+        return;
+    default: fatal("SPURS task %s calls the kernel with %u, which this runtime doesn't provide yet (at %05x)", t.name.c_str(), call, pc);
+    }
+}
+
+const qilin::rt::SpuHooks kHooks{read_channel, write_channel, channel_count, stop, [](Spu& s, uint32_t pc, const char* why) { halt(s, pc, why); }, native_call};
 
 // ---------------------------------------------------------------- running
 
 void finish(Thread& t, uint32_t cause, uint32_t status) {
     if (t.task) {
-        t.exited(status);
+        t.setup.exited(status);
         return;
     }
     const std::lock_guard lock(g_mutex);
@@ -374,7 +392,26 @@ void prepare(Thread& t) {
     t.spu.hooks = &kHooks;
     t.spu.owner = &t;
     for (unsigned i = 0; i < 4; ++i) t.spu.r[3 + i] = SpuReg{{static_cast<uint32_t>(t.arguments[i] >> 32), static_cast<uint32_t>(t.arguments[i]), 0, 0}};
-    if (t.task) t.spu.r[3] = t.task_r3, t.spu.r[4] = t.task_r4, t.spu.r[5] = t.spu.r[6] = SpuReg{};
+    if (t.task) {
+        const auto& a = t.setup.r3;
+        const auto& b = t.setup.r4;
+        t.spu.r[3] = SpuReg{{a[0], a[1], a[2], a[3]}}, t.spu.r[4] = SpuReg{{b[0], b[1], b[2], b[3]}}, t.spu.r[5] = t.spu.r[6] = SpuReg{};
+        // The kernel's data, where the SDK's code linked into the task reads it (docs/runtime.md): the instance's address at
+        // 0x1C0, the taskset's workload number in 0x1D0's last word, and at 0x2FB8 the address of a context: +152 non-zero
+        // in a task, +184 the taskset's 64-bit address, +196 the kernel's entry, +208 the DMA tag the kernel lends the library, +212 the task.
+        // *The tag (31) and +152's value (1) are stated choices.*
+        const auto put = [&](uint32_t at, uint32_t v) {
+            t.ls[at] = static_cast<uint8_t>(v >> 24), t.ls[at + 1] = static_cast<uint8_t>(v >> 16), t.ls[at + 2] = static_cast<uint8_t>(v >> 8), t.ls[at + 3] = static_cast<uint8_t>(v);
+        };
+        put(0x1c4, t.setup.spurs);
+        put(0x1dc, t.setup.workload);
+        put(0x2fb8, kTaskContext);
+        put(kTaskContext + 152, 1);
+        put(kTaskContext + 188, t.setup.taskset);  // (+184: a 64-bit address, its high word 0)
+        put(kTaskContext + 196, kKernelEntry);
+        put(kTaskContext + 208, 31);
+        put(kTaskContext + 212, t.setup.id);
+    }
     t.spu.r[1] = SpuReg{{0x3fff0u, 0, 0, 0}};  // the stack starts at the top
     t.in_mailbox.clear();
     t.out_mailbox = 0;
@@ -710,8 +747,9 @@ std::span<const NativeSystemCall> spu_system_calls() { return kCalls; }
 std::span<const NativeImport> spu_imports() { return kImports; }
 
 // A SPURS task: a thread of no group, started at once, on a host thread of its own (spurs.cpp: what SPURS makes of it).
-void start_spu_task(const std::string& name, uint32_t image_address, const std::array<uint32_t, 4>& r3, const std::array<uint32_t, 4>& r4,
-                    std::function<uint32_t(uint32_t port)> port_queue, std::function<void(uint32_t status)> exited) {
+void start_spu_task(SpuTaskSetup setup) {
+    const uint32_t image_address = setup.image;
+    const std::string name = setup.name;
     auto thread = std::make_shared<Thread>();
     thread->image_address = image_address;
     const auto parsed = qilin::parse_spu_image({guest_memory() + image_address, 0x40000}, image_address);
@@ -720,10 +758,7 @@ void start_spu_task(const std::string& name, uint32_t image_address, const std::
     thread->name = name.empty() ? parsed->name : name;
     thread->program = &lifted(image_address, parsed->name);
     thread->task = true;
-    thread->task_r3 = SpuReg{{r3[0], r3[1], r3[2], r3[3]}};
-    thread->task_r4 = SpuReg{{r4[0], r4[1], r4[2], r4[3]}};
-    thread->port_queue = std::move(port_queue);
-    thread->exited = std::move(exited);
+    thread->setup = std::move(setup);
     {
         const std::lock_guard lock(g_mutex);
         thread->id = g_next_thread++;
@@ -735,6 +770,7 @@ void start_spu_task(const std::string& name, uint32_t image_address, const std::
 }
 
 std::mutex& spu_atomic_mutex() { return g_atomic; }
+std::condition_variable& spu_atomic_changed() { return g_atomic_changed; }
 
 void forbid_spu_transfers(uint32_t address, uint32_t size, const char* what) {
     const std::lock_guard lock(g_forbidden_mutex);

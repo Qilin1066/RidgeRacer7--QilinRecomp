@@ -241,6 +241,14 @@ struct Es {
     AVCodecParserContext* parser = nullptr;
     AVCodecContext* parser_context = nullptr;
     uint32_t info_slots = 0, next_slot = 0;
+    bool disabled = false;  // the game is done with it; the demultiplexer's thread may still hold it while it calls the game
+    Es() = default;
+    Es(const Es&) = delete;
+    Es& operator=(const Es&) = delete;
+    ~Es() {
+        if (parser) av_parser_close(parser);
+        avcodec_free_context(&parser_context);
+    }
 };
 struct Demuxer {
     uint32_t handle = 0, callback = 0, argument = 0, message = 0;
@@ -294,7 +302,7 @@ void cut(Cpu& cpu, Demuxer& d, Es& e, const uint8_t* data, size_t size, bool end
         if (out_size > 0) {
             const std::vector<uint8_t> unit(out, out + out_size);  // (the parser's buffer is its own)
             found(cpu, d, e, unit.data(), static_cast<uint32_t>(unit.size()), lock);
-            if (d.closing) return;
+            if (d.closing || e.disabled) return;
         }
         if (end && size == 0 && out_size == 0) break;
     }
@@ -311,7 +319,7 @@ void cut_sound(Cpu& cpu, Demuxer& d, Es& e, const uint8_t* data, size_t size, st
         if (e.pending.size() - at < bytes) break;
         const std::vector<uint8_t> unit(f, f + bytes);
         found(cpu, d, e, unit.data(), bytes, lock);
-        if (d.closing) return;
+        if (d.closing || e.disabled) return;
         at += bytes;
     }
     e.pending.erase(e.pending.begin(), e.pending.begin() + static_cast<std::ptrdiff_t>(at));
@@ -327,9 +335,12 @@ void demux_chunk(Cpu& cpu, Demuxer& d, const uint8_t* p, uint32_t size, std::uni
             i += 14 + (p[i + 13] & 7);
             continue;
         }
+        // (The streams as they are now, held: the game may disable one while its callback runs.)
+        std::vector<std::shared_ptr<Es>> streams;
+        for (const auto& [handle, e] : d.es) streams.push_back(e);
         if (code == 0xb9) {  // the program's end: what the parsers hold is the last access unit
-            for (auto& [handle, e] : d.es)
-                if (e->parser) cut(cpu, d, *e, nullptr, 0, true, lock);
+            for (const auto& e : streams)
+                if (e->parser && !e->disabled) cut(cpu, d, *e, nullptr, 0, true, lock);
             i += 4;
             continue;
         }
@@ -341,11 +352,11 @@ void demux_chunk(Cpu& cpu, Demuxer& d, const uint8_t* p, uint32_t size, std::uni
             if (code == 0xbd) {
                 // PAMF's private stream: a sub-stream id, a reserved byte, the offset of the first frame begun here; then frames.
                 const uint8_t* payload = packet + payload_at;
-                for (auto& [handle, e] : d.es)
-                    if (e->id == 0xbd && e->sub == payload[0]) cut_sound(cpu, d, *e, payload + 4, length - payload_at - 4, lock);
+                for (const auto& e : streams)
+                    if (!e->disabled && e->id == 0xbd && e->sub == payload[0]) cut_sound(cpu, d, *e, payload + 4, length - payload_at - 4, lock);
             } else {
-                for (auto& [handle, e] : d.es)
-                    if (e->id == code) cut(cpu, d, *e, packet + payload_at, length - payload_at, false, lock);
+                for (const auto& e : streams)
+                    if (!e->disabled && e->id == code) cut(cpu, d, *e, packet + payload_at, length - payload_at, false, lock);
             }
         }
         i += 6 + length;  // (system header 0xbb, padding 0xbe, private 2 0xbf and streams not enabled: passed over)
@@ -415,8 +426,7 @@ void cellDmuxClose(Cpu& c) {
     d->thread.join();
     const std::lock_guard lock(g_mutex);
     for (auto& [handle, e] : d->es) {
-        av_parser_close(e->parser);
-        avcodec_free_context(&e->parser_context);
+        e->disabled = true;
         g_es.erase(handle);
     }
     g_demuxers.erase(d->handle);
@@ -484,10 +494,9 @@ void cellDmuxDisableEs(Cpu& c) {
     }
     const auto e = es_of(static_cast<uint32_t>(c.r[3]));
     const auto d = demuxer_of(e->demuxer);
+    e->disabled = true;
     d->es.erase(e->handle);
     g_es.erase(e->handle);
-    av_parser_close(e->parser);
-    avcodec_free_context(&e->parser_context);
     d->changed.notify_all();
     c.r[3] = kOk;
 }

@@ -32,6 +32,7 @@ const qilin::rt::SpuHooks kHooks{
     [](Spu&, uint32_t channel, uint32_t) { return channel_count(channel); },
     [](Spu&, uint32_t code, uint32_t) { g_seen.stopped = true, g_seen.stop_code = code; },
     [](Spu&, uint32_t, const char*) { g_seen.halted = true; },  // (the test's goes on, to compare; a real one may not)
+    [](Spu&, uint32_t, uint32_t) { g_seen.halted = true; },
 };
 
 // A word that is often something an instruction treats specially.

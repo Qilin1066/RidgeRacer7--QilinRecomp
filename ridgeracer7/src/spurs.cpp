@@ -29,6 +29,7 @@ struct Instance {
     int32_t spu_priority = 0, ppu_priority = 0;
     bool exit_if_no_work = false;
     std::map<uint32_t, uint32_t> ports;  // SPU port -> the event queue attached to it
+    uint32_t workloads = 0;              // tasksets made: each is a workload of the instance's, numbered from 0
 };
 std::mutex g_mutex;
 std::map<uint32_t, Instance> g_instances;  // by the address of the game's CellSpurs
@@ -39,8 +40,20 @@ struct Taskset {
     uint8_t priority[8] = {};
     uint32_t max_contention = 0;
     uint32_t next_task = 0, running = 0;  // tasks made (their ids), and those not yet exited
+    uint32_t workload = 0;
     bool shut_down = false;
 };
+
+// A taskset's first 128 bytes, as the SDK's code in the tasks reads and changes them (docs/runtime.md): masks of one bit a
+// task (task 0 the top bit) at +0x00 running, +0x10 ready, +0x20 pending, +0x30 enabled, +0x40 signalled, +0x50 waiting;
+// +0x60 the instance's address (as the kernel's 0x1C0); +0x74 the workload's number. Changed under the SPU's atomic lock.
+constexpr uint32_t kRunning = 0x00, kEnabled = 0x30, kSignalled = 0x40, kWaiting = 0x50;
+bool task_bit(uint32_t taskset, uint32_t mask, uint32_t id) { return (guest_memory()[taskset + mask + id / 8] >> (7 - id % 8)) & 1; }
+void set_task_bit(uint32_t taskset, uint32_t mask, uint32_t id, bool on) {
+    uint8_t& b = guest_memory()[taskset + mask + id / 8];
+    const uint8_t bit = static_cast<uint8_t>(0x80u >> (id % 8));
+    b = on ? static_cast<uint8_t>(b | bit) : static_cast<uint8_t>(b & ~bit);
+}
 std::condition_variable g_changed;  // a task exited (under g_mutex)
 
 // An event flag. It lives in the game's memory in the SDK's layout, since the game's SPU tasks change it themselves, with the
@@ -136,6 +149,15 @@ void cellSpursCreateTaskset(Cpu& c) {
     t.argument = c.r[5];
     for (uint32_t i = 0; i < 8; ++i) t.priority[i] = guest_memory()[priority + i];
     t.max_contention = static_cast<uint32_t>(c.r[7]);
+    Instance& instance = g_instances.at(spurs);
+    if (instance.workloads >= 16) qilin::rt::fatal("a 17th workload in the SPURS instance at %08x", spurs);
+    t.workload = instance.workloads++;
+    {
+        const std::lock_guard atomic(spu_atomic_mutex());
+        std::memset(guest_memory() + taskset, 0, 128);
+        store32(taskset + 0x64, spurs);
+        store32(taskset + 0x74, t.workload);
+    }
     qilin::rt::log("the game makes a SPURS taskset at %08x: priorities %u %u %u %u %u %u %u %u, on %u SPUs at most", taskset, t.priority[0], t.priority[1], t.priority[2],
                    t.priority[3], t.priority[4], t.priority[5], t.priority[6], t.priority[7], t.max_contention);
     g_tasksets.emplace(taskset, t);
@@ -170,10 +192,16 @@ void cellSpursCreateTask(Cpu& c) {
         r4[0] = static_cast<uint32_t>(t.argument >> 32), r4[1] = static_cast<uint32_t>(t.argument);
     }
     store32(id_out, id);
-    uint32_t spurs;
+    uint32_t spurs, workload;
     {
         const std::lock_guard lock(g_mutex);
         spurs = g_tasksets.at(taskset).spurs;
+        workload = g_tasksets.at(taskset).workload;
+    }
+    {
+        const std::lock_guard atomic(spu_atomic_mutex());
+        set_task_bit(taskset, kEnabled, id, true);
+        set_task_bit(taskset, kRunning, id, true);
     }
     const auto port_queue = [spurs](uint32_t port) -> uint32_t {
         const std::lock_guard lock(g_mutex);
@@ -182,11 +210,34 @@ void cellSpursCreateTask(Cpu& c) {
         const auto p = it->second.ports.find(port);
         return p == it->second.ports.end() ? 0 : p->second;
     };
-    start_spu_task({}, elf, r3, r4, port_queue, [taskset](uint32_t) {
+    SpuTaskSetup setup;
+    setup.image = elf, setup.spurs = spurs, setup.taskset = taskset, setup.workload = workload, setup.id = id, setup.r3 = r3, setup.r4 = r4;
+    setup.port_queue = port_queue;
+    setup.exited = [taskset, id](uint32_t) {
+        {
+            const std::lock_guard atomic(spu_atomic_mutex());
+            for (const uint32_t mask : {kRunning, kEnabled, kSignalled, kWaiting}) set_task_bit(taskset, mask, id, false);
+            spu_atomic_changed().notify_all();
+        }
         const std::lock_guard lock(g_mutex);
         --g_tasksets.at(taskset).running;
         g_changed.notify_all();
-    });
+    };
+    // The kernel's wait: a task not yet signalled is waiting, not running, until it is (cellSpursSendSignal in the tasks sets
+    // the signalled bit); the signal is used up.
+    setup.wait_signal = [taskset, id] {
+        std::unique_lock atomic(spu_atomic_mutex());
+        if (!task_bit(taskset, kSignalled, id)) {
+            set_task_bit(taskset, kRunning, id, false);
+            set_task_bit(taskset, kWaiting, id, true);
+            spu_atomic_changed().notify_all();
+            spu_atomic_changed().wait(atomic, [&] { return task_bit(taskset, kSignalled, id); });
+            set_task_bit(taskset, kWaiting, id, false);
+            set_task_bit(taskset, kRunning, id, true);
+        }
+        set_task_bit(taskset, kSignalled, id, false);
+    };
+    start_spu_task(std::move(setup));
     c.r[3] = kOk;
 }
 

@@ -977,7 +977,7 @@ int cmd_lift(const Args& a) {
                                    std::format("// Lifted from one of the game's SPU programs by qilin: do not share.\n#include \"qilin/rt/spu.hpp\"\n#include \"qilin/rt/spu_fp.hpp\"\nusing namespace qilin::rt;\n\n"
                                                "namespace {} {{\n\nvoid call(Spu& s, uint32_t target, uint32_t pc);\n{}{}\n"
                                                "// The function at an address the program worked out.\nvoid call(Spu& s, uint32_t target, uint32_t pc) {{\n    switch (target) {{\n{}"
-                                               "    default: s.hooks->halt(s, pc, \"a branch through a register to an address that is not a function\");\n    }}\n}}\n\n}}  // namespace {}\n",
+                                               "    default: s.hooks->native_call(s, target, pc);\n    }}\n}}\n\n}}  // namespace {}\n",
                                                space, own, definitions, cases, space));
             spu_declarations += std::format("namespace {} {{ void call(Spu& s, uint32_t target, uint32_t pc); }}\n", space);
             spu_table += std::format("    {{0x{:08X}u, 0x{:X}u, 0x{:05X}u, &{}::call}},\n", image.address, image.size, image.entry, space);

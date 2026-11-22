@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -143,11 +144,20 @@ struct PadState {
     uint16_t pressure[12] = {};
 };
 void set_pad_state(const PadState& state);
-// SPURS's tasks (spurs.cpp), run as SPU programs on host threads (spu.cpp): the program's ELF in guest memory, $3 and $4 as
-// the task is given them, the queue behind each of its SPURS instance's ports (0 for none) when it sends an event, and what
-// to call when it exits (with its status).
-void start_spu_task(const std::string& name, uint32_t image_address, const std::array<uint32_t, 4>& r3, const std::array<uint32_t, 4>& r4,
-                    std::function<uint32_t(uint32_t port)> port_queue, std::function<void(uint32_t status)> exited);
+// SPURS's tasks (spurs.cpp), run as SPU programs on host threads (spu.cpp), with a SPURS kernel of the runtime's in their
+// memory (spu.cpp: what of it the tasks use). A task is started from:
+struct SpuTaskSetup {
+    std::string name;
+    uint32_t image = 0;                     // the program's ELF in guest memory
+    uint32_t spurs = 0, taskset = 0, workload = 0, id = 0;
+    std::array<uint32_t, 4> r3{}, r4{};     // as the task is given them
+    std::function<uint32_t(uint32_t port)> port_queue;  // the queue behind its instance's port, as it is when it sends (0: none)
+    std::function<void(uint32_t status)> exited;        // it has ended (stop 0x102, or the kernel's call 0)
+    std::function<void()> wait_signal;                  // the kernel's call 2: returns when the task has been signalled
+};
+void start_spu_task(SpuTaskSetup setup);
+// Woken whenever an SPU program's atomic put succeeds (with spu_atomic_mutex), for native code waiting on a line to change.
+std::condition_variable& spu_atomic_changed();
 // The lock SPU programs' atomic transfers take (spu.cpp): native code changing a line an SPU program reserves takes it too,
 // so that the program's conditional put fails and it reads the line again.
 std::mutex& spu_atomic_mutex();

@@ -35,6 +35,9 @@ struct SpuHooks {
     uint32_t (*channel_count)(Spu&, uint32_t channel, uint32_t pc);              // rchcnt
     void (*stop)(Spu&, uint32_t code, uint32_t pc);  // stop and signal; if it returns, the program goes on
     void (*halt)(Spu&, uint32_t pc, const char* why);  // a halt instruction that fired, or code that can't go on; must not return
+    // A call through a register to an address that is no function of the program's (a system's code in its memory, such as
+    // SPURS's kernel): the runtime's to answer as a function would ($3 on), or to halt.
+    void (*native_call)(Spu&, uint32_t target, uint32_t pc);
 };
 
 struct SpuReg {

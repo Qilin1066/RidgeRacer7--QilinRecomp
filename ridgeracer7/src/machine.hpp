@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -143,9 +144,13 @@ struct PadState {
 };
 void set_pad_state(const PadState& state);
 // SPURS's tasks (spurs.cpp), run as SPU programs on host threads (spu.cpp): the program's ELF in guest memory, $3 and $4 as
-// the task is given them, the SPURS instance's ports for the events it sends, and what to call when it exits (with its status).
+// the task is given them, the queue behind each of its SPURS instance's ports (0 for none) when it sends an event, and what
+// to call when it exits (with its status).
 void start_spu_task(const std::string& name, uint32_t image_address, const std::array<uint32_t, 4>& r3, const std::array<uint32_t, 4>& r4,
-                    const std::map<uint32_t, uint32_t>& ports, std::function<void(uint32_t status)> exited);
+                    std::function<uint32_t(uint32_t port)> port_queue, std::function<void(uint32_t status)> exited);
+// The lock SPU programs' atomic transfers take (spu.cpp): native code changing a line an SPU program reserves takes it too,
+// so that the program's conditional put fails and it reads the line again.
+std::mutex& spu_atomic_mutex();
 // Guest memory no SPU transfer may touch (an object this runtime keeps natively, whose layout an SPU program would assume):
 // one that does stops the game, naming it.
 void forbid_spu_transfers(uint32_t address, uint32_t size, const char* what);

@@ -29,6 +29,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - B8 textures; `cellFontGetFontIdCode`. The game reaches its main menu.
 - Films' sound: `cellAdec` with FFmpeg's ATRAC3plus decoder. The game reaches Ridge State Grand Prix.
 - Textures hashed once a batch, not at every draw.
+- SPURS event flags in guest memory, in the SDK's layout as the game's tasks use it.
 - SPURS tasks, run as SPU programs on host threads, and SPURS event flags; tasksets joined and shut down.
 - `RR7_SECONDS`: a timed run that saves its last picture and reports where the renderer's time went.
 - The controller: the window's gamepad or the keyboard as the first port's DualShock 3. `RR7_ANSWER` and `RR7_PRESS` for runs with nobody there.

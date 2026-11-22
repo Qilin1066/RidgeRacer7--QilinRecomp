@@ -90,6 +90,7 @@ struct Thread {
     bool task = false;
     SpuReg task_r3{}, task_r4{};
     std::function<void(uint32_t)> exited;
+    std::function<uint32_t(uint32_t)> port_queue;  // a task's ports: its SPURS instance's, as they are now
 };
 
 struct Group {
@@ -224,7 +225,8 @@ void interrupt_word(Thread& t, uint32_t value, uint32_t pc) {
     uint32_t queue = 0, data1;
     {
         const std::lock_guard lock(t.mutex);
-        if (const auto it = t.ports.find(port); it != t.ports.end()) queue = it->second;
+        if (t.task) queue = t.port_queue(port);
+        else if (const auto it = t.ports.find(port); it != t.ports.end()) queue = it->second;
         data1 = t.out_mailbox;
     }
     // *The event's layout is from public descriptions of the system: to be checked against the game's reading of it.*
@@ -709,7 +711,7 @@ std::span<const NativeImport> spu_imports() { return kImports; }
 
 // A SPURS task: a thread of no group, started at once, on a host thread of its own (spurs.cpp: what SPURS makes of it).
 void start_spu_task(const std::string& name, uint32_t image_address, const std::array<uint32_t, 4>& r3, const std::array<uint32_t, 4>& r4,
-                    const std::map<uint32_t, uint32_t>& ports, std::function<void(uint32_t status)> exited) {
+                    std::function<uint32_t(uint32_t port)> port_queue, std::function<void(uint32_t status)> exited) {
     auto thread = std::make_shared<Thread>();
     thread->image_address = image_address;
     const auto parsed = qilin::parse_spu_image({guest_memory() + image_address, 0x40000}, image_address);
@@ -720,7 +722,7 @@ void start_spu_task(const std::string& name, uint32_t image_address, const std::
     thread->task = true;
     thread->task_r3 = SpuReg{{r3[0], r3[1], r3[2], r3[3]}};
     thread->task_r4 = SpuReg{{r4[0], r4[1], r4[2], r4[3]}};
-    thread->ports = ports;
+    thread->port_queue = std::move(port_queue);
     thread->exited = std::move(exited);
     {
         const std::lock_guard lock(g_mutex);
@@ -731,6 +733,8 @@ void start_spu_task(const std::string& name, uint32_t image_address, const std::
     // (The host thread is left to end by itself: the task's record stays in g_threads, as an exited SPU thread's does.)
     std::thread(run_thread, thread).detach();
 }
+
+std::mutex& spu_atomic_mutex() { return g_atomic; }
 
 void forbid_spu_transfers(uint32_t address, uint32_t size, const char* what) {
     const std::lock_guard lock(g_forbidden_mutex);

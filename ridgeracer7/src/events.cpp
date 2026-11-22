@@ -235,6 +235,12 @@ uint64_t receive_event(uint32_t queue_id, Event& event) {
     return kOk;
 }
 
+uint32_t make_event_queue(size_t capacity) {
+    auto queue = std::make_shared<Queue>();
+    queue->capacity = capacity;
+    return g_queues.add(std::move(queue));
+}
+
 uint32_t event_queue_by_key(uint64_t key) {
     const std::lock_guard lock(g_keys_mutex);
     const auto it = g_keys.find(key);

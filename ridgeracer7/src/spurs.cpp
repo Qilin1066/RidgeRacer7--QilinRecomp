@@ -13,6 +13,7 @@
 #include <map>
 #include <mutex>
 
+#include "events.hpp"
 #include "kernel.hpp"
 #include "qilin/rt/report.hpp"
 
@@ -40,13 +41,19 @@ struct Taskset {
     uint32_t next_task = 0, running = 0;  // tasks made (their ids), and those not yet exited
     bool shut_down = false;
 };
-std::condition_variable g_changed;  // a task exited, or an event flag's bits changed (both under g_mutex)
+std::condition_variable g_changed;  // a task exited (under g_mutex)
 
-// An event flag, kept natively: sixteen bits, how they clear, who sets and who waits (the SDK's directions: 0 SPU to
-// SPU, 1 SPU to PPU, 2 PPU to SPU, 3 any to any).
+// An event flag. It lives in the game's memory in the SDK's layout, since the game's SPU tasks change it themselves, with the
+// SDK's code linked into them (seen in LightBlurFrameMove_r.elf at 0x46d8: an atomic update of the 128-byte line, then an
+// event thrown to the PPU). What that code reads and writes, so what this runtime keeps there:
+//   +0 the sixteen event bits; +4 the bits the PPU waits for and +6 how (0 any of them, 1 all); +7 set when the PPU is
+//   woken, with the bits it got at +0x30; +12 the SPU port to wake it through; +14 the direction (0 SPU to SPU, 1 SPU to
+//   PPU, 2 PPU to SPU: an SPU setting that is refused); +15 the clearing (0: the bits a waiter gets are cleared).
+// *The port is 0xff until a queue is attached: a stated choice (the task's code sends to no port above 63).*
+constexpr uint32_t kFlagEvents = 0, kFlagPpuMask = 4, kFlagPpuMode = 6, kFlagPpuWoken = 7, kFlagPort = 12, kFlagDirection = 14, kFlagClear = 15,
+                   kFlagPpuGot = 0x30;
 struct EventFlag {
-    uint32_t spurs = 0, taskset = 0, clear_mode = 0, direction = 0;
-    uint16_t bits = 0;
+    uint32_t spurs = 0, taskset = 0, queue = 0, port = 0;
 };
 std::map<uint32_t, EventFlag> g_flags;  // by the address of the game's CellSpursEventFlag
 std::map<uint32_t, Taskset> g_tasksets;  // by the address of the game's CellSpursTaskset
@@ -161,10 +168,21 @@ void cellSpursCreateTask(Cpu& c) {
         id = t.next_task++;
         ++t.running;
         r4[0] = static_cast<uint32_t>(t.argument >> 32), r4[1] = static_cast<uint32_t>(t.argument);
-        ports = g_instances.at(t.spurs).ports;
     }
     store32(id_out, id);
-    start_spu_task({}, elf, r3, r4, ports, [taskset](uint32_t) {
+    uint32_t spurs;
+    {
+        const std::lock_guard lock(g_mutex);
+        spurs = g_tasksets.at(taskset).spurs;
+    }
+    const auto port_queue = [spurs](uint32_t port) -> uint32_t {
+        const std::lock_guard lock(g_mutex);
+        const auto it = g_instances.find(spurs);
+        if (it == g_instances.end()) return 0;
+        const auto p = it->second.ports.find(port);
+        return p == it->second.ports.end() ? 0 : p->second;
+    };
+    start_spu_task({}, elf, r3, r4, port_queue, [taskset](uint32_t) {
         const std::lock_guard lock(g_mutex);
         --g_tasksets.at(taskset).running;
         g_changed.notify_all();
@@ -211,8 +229,10 @@ void cellSpursDetachLv2EventQueue(Cpu& c) {
     c.r[3] = kOk;
 }
 
-// ---- event flags, kept natively. An SPU program that touched one's memory would be using the SDK's layout of it, which
-// isn't known here: spu.cpp stops the game if one does.
+// ---- event flags (above: their layout)
+
+uint16_t half(uint32_t at) { return static_cast<uint16_t>((guest_memory()[at] << 8) | guest_memory()[at + 1]); }
+void set_half(uint32_t at, uint16_t v) { guest_memory()[at] = static_cast<uint8_t>(v >> 8), guest_memory()[at + 1] = static_cast<uint8_t>(v); }
 
 EventFlag& flag_at(uint32_t address, const char* call) {
     const auto it = g_flags.find(address);
@@ -234,37 +254,59 @@ void cellSpursEventFlagInitialize(Cpu& c) {
     }
     if (clear_mode > 1 || direction > 3) qilin::rt::fatal("_cellSpursEventFlagInitialize: clear mode %u, direction %u", clear_mode, direction);
     const std::lock_guard lock(g_mutex);
-    g_flags[flag] = EventFlag{spurs, taskset, clear_mode, direction, 0};
+    uint32_t instance = spurs;
+    if (!instance) {
+        const auto it = g_tasksets.find(taskset);
+        if (it == g_tasksets.end()) qilin::rt::fatal("_cellSpursEventFlagInitialize on taskset %08x, which isn't one", taskset);
+        instance = it->second.spurs;
+    }
+    g_flags[flag] = EventFlag{instance, taskset, 0, 0};
+    const std::lock_guard atomic(spu_atomic_mutex());
     std::memset(guest_memory() + flag, 0, 128);
-    forbid_spu_transfers(flag, 128, "a SPURS event flag");
+    guest_memory()[flag + kFlagPort] = 0xff;
+    guest_memory()[flag + kFlagDirection] = static_cast<uint8_t>(direction);
+    guest_memory()[flag + kFlagClear] = static_cast<uint8_t>(clear_mode);
     c.r[3] = kOk;
 }
 
-// cellSpursEventFlagAttachLv2EventQueue(flag), cellSpursEventFlagDetachLv2EventQueue(flag): on a console the queue by which
-// SPU tasks wake the PPU; here a PPU waiter is woken directly, so there is nothing to attach.
+// cellSpursEventFlagAttachLv2EventQueue(flag): a queue of the runtime's, attached to the SPURS instance on a free port
+// from 16 (*as cellSpursAttachLv2EventQueue's dynamic ports: a stated choice*), the port written where the tasks read it.
 void cellSpursEventFlagAttachLv2EventQueue(Cpu& c) {
+    const uint32_t flag = static_cast<uint32_t>(c.r[3]);
     const std::lock_guard lock(g_mutex);
-    flag_at(static_cast<uint32_t>(c.r[3]), "cellSpursEventFlagAttachLv2EventQueue");
+    EventFlag& f = flag_at(flag, "cellSpursEventFlagAttachLv2EventQueue");
+    if (f.queue) qilin::rt::fatal("cellSpursEventFlagAttachLv2EventQueue on flag %08x, which has a queue already", flag);
+    Instance& instance = g_instances.at(f.spurs);
+    uint32_t port = 16;
+    while (port < 64 && instance.ports.contains(port)) ++port;
+    if (port == 64) qilin::rt::fatal("cellSpursEventFlagAttachLv2EventQueue: every port of the SPURS instance at %08x is taken", f.spurs);
+    f.queue = make_event_queue(127);
+    f.port = port;
+    instance.ports[port] = f.queue;
+    const std::lock_guard atomic(spu_atomic_mutex());
+    guest_memory()[flag + kFlagPort] = static_cast<uint8_t>(port);
     c.r[3] = kOk;
 }
+// cellSpursEventFlagDetachLv2EventQueue(flag)
 void cellSpursEventFlagDetachLv2EventQueue(Cpu& c) {
+    const uint32_t flag = static_cast<uint32_t>(c.r[3]);
     const std::lock_guard lock(g_mutex);
-    flag_at(static_cast<uint32_t>(c.r[3]), "cellSpursEventFlagDetachLv2EventQueue");
+    EventFlag& f = flag_at(flag, "cellSpursEventFlagDetachLv2EventQueue");
+    if (!f.queue) qilin::rt::fatal("cellSpursEventFlagDetachLv2EventQueue on flag %08x, which has no queue", flag);
+    if (const auto it = g_instances.find(f.spurs); it != g_instances.end()) it->second.ports.erase(f.port);
+    f.queue = 0;
+    const std::lock_guard atomic(spu_atomic_mutex());
+    guest_memory()[flag + kFlagPort] = 0xff;
     c.r[3] = kOk;
 }
 
-// cellSpursEventFlagSet(flag, bits)
+// cellSpursEventFlagSet(flag, bits) from the PPU: waking SPU tasks would need SPURS's signals, which aren't provided.
 void cellSpursEventFlagSet(Cpu& c) {
-    const std::lock_guard lock(g_mutex);
-    EventFlag& f = flag_at(static_cast<uint32_t>(c.r[3]), "cellSpursEventFlagSet");
-    if (f.direction == 1) qilin::rt::fatal("cellSpursEventFlagSet from the PPU on a flag the SPU sets (direction 1)");
-    f.bits |= static_cast<uint16_t>(c.r[4]);
-    g_changed.notify_all();
-    c.r[3] = kOk;
+    qilin::rt::fatal("cellSpursEventFlagSet from the PPU on flag %08x (waking SPU tasks isn't provided yet)", static_cast<uint32_t>(c.r[3]));
 }
 
-// cellSpursEventFlagWait(flag, uint16_t* bits, mode (0 all of them, 1 any)): waits until the bits asked for are set, and
-// gives those that are; with automatic clearing they are cleared (*the bits asked for: a stated reading*).
+// cellSpursEventFlagWait(flag, uint16_t* bits, mode (0 any, 1 all)): as the tasks' own code treats a waiting PPU (above).
+// The bits it gets, it gives back in *bits.
 void cellSpursEventFlagWait(Cpu& c) {
     const uint32_t flag = static_cast<uint32_t>(c.r[3]), bits_at = static_cast<uint32_t>(c.r[4]), mode = static_cast<uint32_t>(c.r[5]);
     if (!bits_at) {
@@ -272,15 +314,42 @@ void cellSpursEventFlagWait(Cpu& c) {
         return;
     }
     if (mode > 1) qilin::rt::fatal("cellSpursEventFlagWait: mode %u", mode);
-    const uint16_t wanted = static_cast<uint16_t>((guest_memory()[bits_at] << 8) | guest_memory()[bits_at + 1]);
-    std::unique_lock lock(g_mutex);
-    EventFlag& f = flag_at(flag, "cellSpursEventFlagWait");
-    if (f.direction == 2 || f.direction == 0) qilin::rt::fatal("cellSpursEventFlagWait from the PPU on a flag the SPU waits on (direction %u)", f.direction);
-    g_changed.wait(lock, [&] { return mode == 0 ? (f.bits & wanted) == wanted : (f.bits & wanted) != 0; });
-    const uint16_t got = f.bits;
-    if (f.clear_mode == 0) f.bits &= static_cast<uint16_t>(~wanted);
-    lock.unlock();
-    guest_memory()[bits_at] = static_cast<uint8_t>(got >> 8), guest_memory()[bits_at + 1] = static_cast<uint8_t>(got);
+    const uint16_t wanted = half(bits_at);
+    uint32_t queue;
+    {
+        const std::lock_guard lock(g_mutex);
+        queue = flag_at(flag, "cellSpursEventFlagWait").queue;
+    }
+    uint16_t got = 0;
+    {
+        const std::lock_guard atomic(spu_atomic_mutex());
+        const uint8_t direction = guest_memory()[flag + kFlagDirection];
+        if (direction != 1) qilin::rt::fatal("cellSpursEventFlagWait from the PPU on a flag of direction %u (only SPU to PPU, 1, is provided)", direction);
+        if (half(flag + kFlagPpuMask) != 0) qilin::rt::fatal("cellSpursEventFlagWait on flag %08x, which the PPU waits on already", flag);
+        const uint16_t events = half(flag + kFlagEvents);
+        const uint16_t matched = events & wanted;
+        if (mode == 1 ? matched == wanted : matched != 0) {
+            got = matched;
+            if (guest_memory()[flag + kFlagClear] == 0) set_half(flag + kFlagEvents, static_cast<uint16_t>(events & ~matched));
+        } else {
+            if (!queue) qilin::rt::fatal("cellSpursEventFlagWait on flag %08x, which has no queue to be woken through", flag);
+            set_half(flag + kFlagPpuMask, wanted);
+            guest_memory()[flag + kFlagPpuMode] = static_cast<uint8_t>(mode);
+            guest_memory()[flag + kFlagPpuWoken] = 0;
+        }
+    }
+    // Woken by a task: it has cleared the mask, set +7 and left the bits at +0x30, and thrown an event to the queue.
+    while (wanted && !got) {
+        Event event;
+        if (receive_event(queue, event) != kOk) qilin::rt::fatal("cellSpursEventFlagWait: the flag's queue is gone");
+        const std::lock_guard atomic(spu_atomic_mutex());
+        if (guest_memory()[flag + kFlagPpuWoken]) {
+            got = half(flag + kFlagPpuGot);
+            guest_memory()[flag + kFlagPpuWoken] = 0;
+            set_half(flag + kFlagPpuGot, 0);
+        }
+    }
+    set_half(bits_at, got);
     c.r[3] = kOk;
 }
 

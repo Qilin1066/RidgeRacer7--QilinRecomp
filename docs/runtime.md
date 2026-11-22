@@ -150,7 +150,7 @@ A path is kept inside its mount point (`..` can't climb out), and a name under n
 
 ## Where it stops now
 
-After v0.13.0: **the race's loading, about seven minutes in, where the process has died twice with no report**: once while the owner was also running another game, which ran the PC out of memory. This runtime's own use of memory is to be measured and cut first (its texture cache, the decoded cube maps: one draw needed 86 MB of texels). The music decoder (`cellAtrac`, `atrac.cpp`) is in and is reached.
+After v0.13.0: **nowhere in an 8-minute run: the game is in its first race** (the Grand Prix's, through its menus, films and loading), with its heads-up display drawn (course map, position, lap time, nitrous, rev counter) **and the 3D world black**: its draws are made, so a depth test that fails everywhere or a render target composited wrongly is suspected first. The race is slow (writing surfaces back took 172 of 480 seconds, the GPU's copies back 130). The process's memory peaks at 1.3 GB (it reached 10 GB, leaking a task's 256 KiB local store each time a task ended, and decoding films far ahead of the game).
 
 ### A fault on the way, and what it was
 

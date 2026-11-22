@@ -541,6 +541,9 @@ struct Decoder {
     std::thread thread;
 };
 std::map<uint32_t, std::shared_ptr<Decoder>> g_decoders;
+// The pictures a decoder holds before it waits for the game to take one: as a console's decoder's memory is finite, this
+// holds the film back (its access units wait, and with them the demultiplexer), instead of decoding a whole film ahead.
+constexpr size_t kMostPictures = 4;
 
 void decoder_thread(std::shared_ptr<Decoder> d) {
     Cpu cpu;
@@ -549,7 +552,7 @@ void decoder_thread(std::shared_ptr<Decoder> d) {
     AVFrame* frame = av_frame_alloc();
     std::unique_lock lock(g_mutex);
     for (;;) {
-        d->changed.wait(lock, [&] { return d->closing || !d->units.empty(); });
+        d->changed.wait(lock, [&] { return d->closing || (!d->units.empty() && d->pictures.size() < kMostPictures); });
         if (d->closing) break;
         std::vector<uint8_t> unit = std::move(d->units.front());
         d->units.pop_front();
@@ -681,6 +684,7 @@ void cellVdecGetPicture(Cpu& c) {
         }
         p = std::move(d->pictures.front());
         d->pictures.pop_front();
+        d->changed.notify_all();  // (room for the next)
     }
     c.r[3] = kOk;
     if (!out) return;  // dropped

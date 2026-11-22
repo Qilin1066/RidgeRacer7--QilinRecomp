@@ -354,6 +354,9 @@ const qilin::rt::SpuHooks kHooks{read_channel, write_channel, channel_count, sto
 void finish(Thread& t, uint32_t cause, uint32_t status) {
     if (t.task) {
         t.setup.exited(status);
+        // Its record goes with it: the game starts tasks every frame, each with its own local store.
+        const std::lock_guard lock(g_mutex);
+        g_threads.erase(t.id);
         return;
     }
     const std::lock_guard lock(g_mutex);
@@ -774,7 +777,7 @@ void start_spu_task(SpuTaskSetup setup) {
         g_threads.emplace(thread->id, thread);
     }
     prepare(*thread);
-    // (The host thread is left to end by itself: the task's record stays in g_threads, as an exited SPU thread's does.)
+    // (The host thread is left to end by itself; the task's record is dropped when it ends: finish.)
     std::thread(run_thread, thread).detach();
 }
 

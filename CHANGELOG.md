@@ -30,6 +30,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - Films' sound: `cellAdec` with FFmpeg's ATRAC3plus decoder. The game reaches Ridge State Grand Prix.
 - Textures hashed once a batch, not at every draw.
 - SPURS event flags in guest memory, in the SDK's layout as the game's tasks use it.
+- Memory: an ended SPURS task's record (with its 256 KiB local store) is dropped, and the film decoder holds at most four pictures. The process peaked at 10 GB; now 1.3 GB. The game reaches its first race (heads-up display drawn, 3D world black).
 - The music: `cellAtrac` on FFmpeg's ATRAC3plus decoder. An event flag's queue is freed when it is detached (the game does so every frame).
 - Tasks made by other tasks (the taskset's records); the RSX's inline transfers (NV3062, NV308A), indexed draws, primitive restart, cube maps, polygon offset; a renderer arena that grows. `RR7_QUIET` for test runs. The game reaches the loading of its first race.
 - A SPURS kernel for the tasks: its data in their local store, its calls (end, wait to be signalled), the taskset's masks in guest memory; `SpuHooks::native_call` for the lifted code's calls outside the program. The game reaches Machine Select.

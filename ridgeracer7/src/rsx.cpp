@@ -437,7 +437,7 @@ void flip(uint32_t id, uint32_t at) {
             if (!f) continue;
             const uint32_t bytes = sf.width * sf.height * 4;
             uint8_t header[54] = {'B', 'M'};
-            const auto put = [&](size_t at, uint32_t v) { for (unsigned i = 0; i < 4; ++i) header[at + i] = static_cast<uint8_t>(v >> (8 * i)); };
+            const auto put = [&](size_t pos, uint32_t v) { for (unsigned i = 0; i < 4; ++i) header[pos + i] = static_cast<uint8_t>(v >> (8 * i)); };
             put(2, 54 + bytes), put(10, 54), put(14, 40), put(18, sf.width), put(22, static_cast<uint32_t>(-static_cast<int32_t>(sf.height)));
             header[26] = 1, header[28] = 32;
             std::fwrite(header, 1, 54, f);

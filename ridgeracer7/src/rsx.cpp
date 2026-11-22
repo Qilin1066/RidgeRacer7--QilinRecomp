@@ -208,6 +208,7 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
     d.color.address = guest_address(surface_location(state(0x0194)), state(0x0210), "a colour surface");
     d.color.width = state(0x0200) >> 16, d.color.height = state(0x0204) >> 16;
     if ((state(0x0200) & 0xffff) || (state(0x0204) & 0xffff)) fatal("a surface whose clip doesn't start at 0, 0 (at offset %08x)", at);
+    if (state(0x02b8)) fatal("a draw with window offset %08x, which the renderer doesn't take yet (at offset %08x)", state(0x02b8), at);
     d.color_mask = state(0x0324);
     // What the first renderer doesn't take: said by name.
     if (state(0x0a74)) {

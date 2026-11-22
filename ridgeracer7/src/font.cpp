@@ -311,6 +311,25 @@ void cellFontRenderSurfaceSetScissor(Cpu& c) {
 }
 
 // cellFontGetHorizontalLayout(font, CellFontHorizontalLayout* {baseline's y, line height, effect height})
+// cellFontGetFontIdCode(CellFont*, character, uint32_t* font id, uint32_t* code in that font): which of a set's fonts has the
+// character's glyph. *The id given is that font's place in the set, from 0, and the code the character itself: a stated
+// reading (the SDK's numbering of fonts isn't known here; the game passes the id over and asks the glyph by character).*
+// A character no font has gets the first font, as the glyph lookup's fallback does.
+void cellFontGetFontIdCode(Cpu& c) {
+    const uint32_t code = static_cast<uint32_t>(c.r[4]), id_at = static_cast<uint32_t>(c.r[5]), code_at = static_cast<uint32_t>(c.r[6]);
+    Font* font = font_of(static_cast<uint32_t>(c.r[3]));
+    if (!font || font->faces.empty()) fatal("cellFontGetFontIdCode on a font that isn't open");
+    uint32_t id = 0;
+    for (uint32_t i = 0; i < font->faces.size(); ++i)
+        if (FT_Get_Char_Index(font->faces[i], code)) {
+            id = i;
+            break;
+        }
+    if (id_at) store32(id_at, id);
+    if (code_at) store32(code_at, code);
+    c.r[3] = kOk;
+}
+
 void cellFontGetHorizontalLayout(Cpu& c) {
     const std::lock_guard lock(g_mutex);
     Font* font = font_of(static_cast<uint32_t>(c.r[3]));
@@ -423,6 +442,7 @@ constexpr NativeImport kImports[] = {
     {"cellFont", "cellFontRenderSurfaceInit", cellFontRenderSurfaceInit},
     {"cellFont", "cellFontRenderSurfaceSetScissor", cellFontRenderSurfaceSetScissor},
     {"cellFont", "cellFontGetHorizontalLayout", cellFontGetHorizontalLayout},
+    {"cellFont", "cellFontGetFontIdCode", cellFontGetFontIdCode},
     {"cellFont", "cellFontGetCharGlyphMetrics", cellFontGetCharGlyphMetrics},
     {"cellFont", "cellFontGetRenderCharGlyphMetrics", cellFontGetRenderCharGlyphMetrics},
     {"cellFont", "cellFontRenderCharGlyphImage", cellFontRenderCharGlyphImage},

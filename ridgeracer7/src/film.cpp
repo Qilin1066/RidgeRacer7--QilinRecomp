@@ -214,6 +214,10 @@ void cellPamfReaderGetStreamInfo(Cpu& c) {
 // ---------------------------------------------------------------- cellDmux
 
 constexpr uint64_t kVdecEmpty = 0x80610104u;
+// The demultiplexer's argument error (*as recalled*): what a stream call on a handle never given gets. The game's film
+// player resets and disables both its stream slots when a film ends, the sound one too when it was never enabled, and
+// doesn't look at the answer.
+constexpr uint64_t kDmuxArgument = 0x80610201u;
 
 struct Au {
     uint32_t address = 0, size = 0;  // in the stream's memory
@@ -432,6 +436,10 @@ void cellDmuxEnableEs(Cpu& c) {
 // cellDmuxDisableEs(es), cellDmuxResetEs(es): its access units dropped (and with Disable, the stream).
 void cellDmuxResetEs(Cpu& c) {
     const std::lock_guard lock(g_mutex);
+    if (!g_es.contains(static_cast<uint32_t>(c.r[3]))) {
+        c.r[3] = kDmuxArgument;
+        return;
+    }
     const auto e = es_of(static_cast<uint32_t>(c.r[3]));
     e->ready.clear(), e->taken.clear();
     av_parser_close(e->parser);
@@ -441,6 +449,10 @@ void cellDmuxResetEs(Cpu& c) {
 }
 void cellDmuxDisableEs(Cpu& c) {
     const std::lock_guard lock(g_mutex);
+    if (!g_es.contains(static_cast<uint32_t>(c.r[3]))) {
+        c.r[3] = kDmuxArgument;
+        return;
+    }
     const auto e = es_of(static_cast<uint32_t>(c.r[3]));
     const auto d = demuxer_of(e->demuxer);
     d->es.erase(e->handle);

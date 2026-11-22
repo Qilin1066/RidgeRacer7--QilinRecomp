@@ -137,7 +137,7 @@ A path is kept inside its mount point (`..` can't climb out), and a name under n
 
 ## Where it stops now
 
-After v0.13.0: **nowhere yet in a 75-second run.** After START on the title screen the game plays its title film ("RIDGE RACER 7 / PRESS START BUTTON") through its own player: PAMF, the demultiplexer and the MPEG-2 decoder are provided (`film.cpp`), with FFmpeg's libavcodec. Next: START on that screen, the menus; films with sound (ATRAC3plus) stop the game, by name, until they are provided.
+After v0.13.0: **nowhere in a 90-second run: the game reaches its main menu** (START on the title screen, its title film, START again). The menu is drawn with faults: translucent layers come out opaque and too bright, and some text appears twice (perhaps an animation caught mid-way). Next: find out why, against a reference; films with sound and the music (ATRAC3plus).
 
 ### A fault on the way, and what it was
 

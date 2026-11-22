@@ -225,6 +225,7 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/net.cpp
     ridgeracer7/src/np.cpp
     ridgeracer7/src/pad.cpp
+    ridgeracer7/src/renderer.cpp
     ridgeracer7/src/rtc.cpp
     ridgeracer7/src/rsx.cpp
     ridgeracer7/src/spu.cpp
@@ -240,7 +241,14 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/video.cpp
 )
 target_include_directories(ridgeracer7_machine PUBLIC ridgeracer7/src)
-target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt PRIVATE qilin_warnings freetype)
+# Vulkan structures are written {sType} with the rest zeroed: the idiom, not a mistake (as host/'s sources).
+if(NOT MSVC)
+    set_source_files_properties(ridgeracer7/src/renderer.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
+endif()
+if(NOT TARGET qilin_host)
+    message(FATAL_ERROR "the game's machine needs the host layer: configure with -DQILIN_HOST=ON")
+endif()
+target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt qilin_host PRIVATE qilin_warnings freetype)
 # FreeType's headers are not ours to warn about.
 target_include_directories(ridgeracer7_machine SYSTEM PRIVATE $<TARGET_PROPERTY:freetype,INTERFACE_INCLUDE_DIRECTORIES>)
 set(QILIN_GEN_DIR "" CACHE PATH "The folder `qilin lift <game> --out` wrote: the lifted code of your own copy")

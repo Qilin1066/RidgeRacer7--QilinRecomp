@@ -11,17 +11,47 @@
 // data is read from your copy each time; nothing of the game is in this
 // repository.
 #include <cstdio>
+#include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include <string>
 
 #include "machine.hpp"
 #include "qilin/host/audio.hpp"
+#include "qilin/host/display.hpp"
+#include "renderer.hpp"
 #include "qilin/host/paths.hpp"
 #include "qilin/rt/lifted.hpp"
 #include "qilin/rt/report.hpp"
 #include "sfo.hpp"
 #include "title.hpp"
+
+// A picture as a 32-bit BMP (bottom row first, B, G, R, A).
+void write_bmp(uint64_t n, const uint8_t* rgba, uint32_t width, uint32_t height) {
+    char name[64];
+    std::snprintf(name, sizeof name, "frame-%llu.bmp", static_cast<unsigned long long>(n));
+    std::FILE* f = std::fopen(name, "wb");
+    if (!f) return;
+    const uint32_t image = width * height * 4, file = 54 + image;
+    uint8_t header[54] = {'B', 'M'};
+    const auto put = [&](size_t at, uint32_t v) { for (unsigned i = 0; i < 4; ++i) header[at + i] = static_cast<uint8_t>(v >> (8 * i)); };
+    put(2, file), put(10, 54), put(14, 40), put(18, width), put(22, height);
+    header[26] = 1, header[28] = 32;
+    put(34, image);
+    std::fwrite(header, 1, sizeof header, f);
+    std::vector<uint8_t> row(size_t{width} * 4);
+    for (uint32_t y = height; y-- > 0;) {
+        const uint8_t* p = rgba + size_t{y} * width * 4;
+        for (uint32_t x = 0; x < width; ++x) row[4 * x] = p[4 * x + 2], row[4 * x + 1] = p[4 * x + 1], row[4 * x + 2] = p[4 * x], row[4 * x + 3] = p[4 * x + 3];
+        std::fwrite(row.data(), 1, row.size(), f);
+    }
+    std::fclose(f);
+    qilin::rt::log("flip %llu written to %s", static_cast<unsigned long long>(n), name);
+}
 
 int main(int argc, char** argv) {
     using qilin::rt::fatal;
@@ -65,5 +95,59 @@ int main(int argc, char** argv) {
         static qilin::host::AudioOut out;
         out.push(left_right, frames, 48000);
     });
-    return rr7::run(*elf, {qilin::rt::kLiftedFunctions, qilin::rt::kLiftedFunctionCount}, {qilin::rt::kLiftedSpuPrograms, qilin::rt::kLiftedSpuProgramCount}, std::move(info));
+    // The window, on this thread (the window system wants its events here); the game on a thread of its own.
+    namespace host = qilin::host;
+    host::Display::Options o;
+    o.title = "Ridge Racer 7";
+    o.width = 1280, o.height = 720;
+    host::Display display(o);
+    qilin::rt::log("graphics device: %s", display.device_name().c_str());
+    static std::mutex queue;  // the GPU's queue: the renderer's draws and the window's presentation take turns on it
+    rr7::renderer_start(display.gpu(), queue);
+    // Each flip's picture, kept for the window until it is shown.
+    static std::mutex frame_mutex;
+    static std::vector<uint8_t> frame;
+    static uint32_t frame_width = 0, frame_height = 0;
+    static std::atomic<uint64_t> flips{0};
+    // A development aid: RR7_SAVE_FRAME=<n> writes the nth flip's picture to frame-<n>.bmp in the current folder.
+    static const uint64_t save_frame = std::getenv("RR7_SAVE_FRAME") ? std::strtoull(std::getenv("RR7_SAVE_FRAME"), nullptr, 10) : 0;
+    rr7::set_present_sink([](const uint8_t* rgba, uint32_t width, uint32_t height) {
+        const std::lock_guard lock(frame_mutex);
+        frame.assign(rgba, rgba + size_t{width} * height * 4);
+        frame_width = width, frame_height = height;
+        const uint64_t n = ++flips;
+        if (n == 1 || n % 600 == 0) qilin::rt::log("flip %llu: %ux%u", static_cast<unsigned long long>(n), width, height);
+        if (n == save_frame) write_bmp(n, rgba, width, height);
+    });
+    static rr7::GameInfo game_info = std::move(info);
+    static const qilin::Elf* program = &*elf;
+    std::thread([] {
+        rr7::run(*program, {qilin::rt::kLiftedFunctions, qilin::rt::kLiftedFunctionCount}, {qilin::rt::kLiftedSpuPrograms, qilin::rt::kLiftedSpuProgramCount}, std::move(game_info));
+    }).detach();
+    // Until the game's first flip, black.
+    const uint8_t black[4] = {0, 0, 0, 255};
+    {
+        const std::lock_guard lock(queue);
+        display.present(1, 1, black, 16.0f / 9.0f, 1080);
+    }
+    uint64_t shown = 0;
+    std::vector<uint8_t> picture;
+    uint32_t width = 0, height = 0;
+    while (display.poll()) {
+        if (flips != shown) {
+            {
+                const std::lock_guard lock(frame_mutex);
+                picture = frame;
+                width = frame_width, height = frame_height;
+                shown = flips;
+            }
+            const std::lock_guard lock(queue);
+            display.present(width, height, picture.data(), 16.0f / 9.0f, height);
+        } else {
+            const std::lock_guard lock(queue);
+            display.present_again();
+        }
+    }
+    qilin::rt::log("the window was closed");
+    rr7::exit_process(0);
 }

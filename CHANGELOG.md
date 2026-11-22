@@ -16,6 +16,8 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - SPU threads (system calls 170 to 194, `sys_spu_image_import`): a thread runs its program's lifted code on a host thread, with memory transfers, the atomic line pair, mailboxes, events to the game's queues and the system's stop codes as hooks (`docs/runtime.md`).
 - A decoder for the RSX's vertex and fragment programs (`recomp/src/rsx_program.*`), checked against each program's own Cg tables: all 242 of the game's agree. `qilin shaders --disasm` prints them (`docs/recompiler-core.md`).
 - The RSX's programs translated to SPIR-V at build time, by a SPIR-V writer of the project's own (`recomp/src/rsx_spirv.*`, `spirv.*`): all 242. `qilin shaders --out` writes them; `ridgeracer7_shader_check` gives them to the local Vulkan driver, which takes all 242, and `tools/check/validate_shaders.py` to Khronos' `spirv-val`, which passes all 242 (`docs/recompiler-core.md`).
+- The RSX's drawing on Vulkan, in a first design that keeps guest memory the only truth (`docs/runtime.md`): vertex program and constant uploads, draws of arrays, clears, flips into the window. The window opens on the main thread, the game runs on a thread of its own. The game's frames reach the window (black: it is loading).
+- `RR7_SAVE_FRAME`: a flip's picture written to a file.
 - `RR7_RSX_TRACE` logs every RSX method and its argument.
 - `RR7_ERRORS` and `RR7_FILES`: logs of the error codes handed to the game and of its file reads. `RR7_CALLS`, `RR7_DUMP` and `qilin lift --registers`, for finding a fault (`docs/runtime.md`).
 - The clock library (`cellRtc`).

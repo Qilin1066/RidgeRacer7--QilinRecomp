@@ -10,13 +10,19 @@
 // the few that do something (draw, clear, write a label) act on that
 // state. **A method that isn't in the table of known ones stops the game
 // with its number**: none is skipped.
+#include <algorithm>
 #include <array>
+#include <bit>
+#include <cstring>
+#include <vector>
 #include <chrono>
 #include <cstdlib>
 #include <map>
 #include <thread>
 
 #include "gcm.hpp"
+#include "renderer.hpp"
+#include "video.hpp"
 #include "kernel.hpp"
 #include "qilin/rt/report.hpp"
 
@@ -34,6 +40,15 @@ struct Rsx {
     bool flip_pending = false;  // a flip has been asked for and not yet shown
     std::array<uint32_t, 0x10000 / 4> state{};  // the last argument given to each method
     uint64_t commands = 0;
+    // The vertex programs' memory (512 instructions of four words) and their constants (468 vec4), and where the next
+    // word written to each goes.
+    std::array<uint32_t, 512 * 4> program{};
+    uint32_t program_at = 0;
+    std::array<float, 468 * 4> constants{};
+    uint32_t constant_at = 0;
+    // Between SET_BEGIN_END's begin and its end: the primitive, and the ranges of vertices drawn.
+    uint32_t primitive = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
 };
 Rsx r;
 
@@ -134,10 +149,167 @@ uint32_t label_address(uint32_t offset, uint32_t at) {
     return rsx_setup().labels + offset;
 }
 
+// An address in guest memory from an offset and the RSX's location for it: 0 its own memory, 1 the mapped main memory.
+uint32_t guest_address(uint32_t location, uint32_t offset, const char* what) {
+    if (location == 0) return kRsxLocal + offset;
+    const uint32_t address = rsx_io_address(offset);
+    if (!address) fatal("the RSX is to find %s at offset %08x of main memory, where nothing is mapped", what, offset);
+    return address;
+}
+
+// A surface's memory, by its context object: SET_CONTEXT_DMA_COLOR_A's 0xFEED0000 is the RSX's memory, 0xFEED0001 the mapped main memory.
+uint32_t surface_location(uint32_t object) {
+    if (object == 0xFEED0000u) return 0;
+    if (object == 0xFEED0001u) return 1;
+    fatal("a surface in context object %08x, which this runtime doesn't know", object);
+}
+
+uint32_t state(uint32_t method) { return r.state[method / 4]; }
+float state_float(uint32_t method) { return std::bit_cast<float>(r.state[method / 4]); }
+
+// One draw of vertices [first, first + count), with the state the methods have left.
+void draw(uint32_t first, uint32_t count, uint32_t at) {
+    Draw d;
+    // The colour surface: only surface A, linear, not antialiased, in this first renderer.
+    const uint32_t format = state(0x0208);
+    if (((format >> 8) & 0xf) != 1) fatal("a draw to a surface of type %u (not linear), which the renderer doesn't take yet (at offset %08x)", (format >> 8) & 0xf, at);
+    if ((format >> 12) & 0xf) fatal("a draw to an antialiased surface, which the renderer doesn't take yet (at offset %08x)", at);
+    if (state(0x0220) != 1) fatal("a draw to colour targets %#x (only surface A is taken yet) (at offset %08x)", state(0x0220), at);
+    d.color.format = format & 0x1f;
+    d.color.pitch = state(0x020c);
+    d.color.address = guest_address(surface_location(state(0x0194)), state(0x0210), "a colour surface");
+    d.color.width = state(0x0200) >> 16, d.color.height = state(0x0204) >> 16;
+    if ((state(0x0200) & 0xffff) || (state(0x0204) & 0xffff)) fatal("a surface whose clip doesn't start at 0, 0 (at offset %08x)", at);
+    d.color_mask = state(0x0324);
+    // What the first renderer doesn't take: said by name.
+    if (state(0x0a74)) fatal("a draw with the depth test, which the renderer doesn't take yet (at offset %08x)", at);
+    if (state(0x032c)) fatal("a draw with the stencil test, which the renderer doesn't take yet (at offset %08x)", at);
+    if (state(0x0304)) fatal("a draw with the alpha test, which the renderer doesn't take yet (at offset %08x)", at);
+    if (state(0x173c)) fatal("a draw with a base vertex index, which the renderer doesn't take yet (at offset %08x)", at);
+    d.primitive = r.primitive, d.first = first, d.count = count;
+    for (uint32_t a = 0; a < 16; ++a) {
+        d.attribute_format[a] = state(0x1740 + 4 * a);
+        if (((d.attribute_format[a] >> 4) & 0xf) == 0) continue;
+        const uint32_t offset = state(0x1680 + 4 * a);
+        d.attribute_address[a] = guest_address(offset >> 31, (offset & 0x7fffffffu) + state(0x1738), "a vertex array");
+    }
+    d.vertex_constants = r.constants.data();
+    // The vertex program: from its start to the instruction marked last.
+    for (uint32_t i = state(0x1ea0); i < 512; ++i) {
+        for (unsigned k = 0; k < 4; ++k)
+            for (int b = 24; b >= 0; b -= 8) d.vertex_program.push_back(static_cast<uint8_t>(r.program[4 * i + k] >> b));
+        if (r.program[4 * i + 3] & 1) break;
+        if (i == 511) fatal("the vertex program from slot %u has no last instruction", state(0x1ea0));
+    }
+    // The fragment program: from its address to the instruction marked as the end, with its inline constants.
+    {
+        const uint32_t program = state(0x08e4);
+        const uint32_t location = program & 3;
+        if (location != 1 && location != 2) fatal("a fragment program in location %u (at offset %08x)", location, at);
+        const uint32_t address = guest_address(location == 1 ? 0 : 1, program & ~3u, "a fragment program");
+        for (uint32_t offset = 0;; ) {
+            const uint8_t* p = guest_memory() + address + offset;
+            const auto word = [&](unsigned i) {
+                const uint32_t w = (uint32_t{p[4 * i]} << 24) | (uint32_t{p[4 * i + 1]} << 16) | (uint32_t{p[4 * i + 2]} << 8) | p[4 * i + 3];
+                return (w << 16) | (w >> 16);
+            };
+            const bool end = word(0) & 1, branch = word(2) >> 31;
+            const bool constant = !branch && ((word(1) & 3) == 2 || (word(2) & 3) == 2 || (word(3) & 3) == 2);
+            const uint32_t size = constant ? 32 : 16;
+            d.fragment_program.insert(d.fragment_program.end(), p, p + size);
+            offset += size;
+            if (end) break;
+            if (offset > 0x10000) fatal("the fragment program at %08x has no end in 64 KiB", address);
+        }
+    }
+    // The viewport and the window.
+    for (unsigned i = 0; i < 4; ++i) d.viewport_offset[i] = state_float(0x0a20 + 4 * i), d.viewport_scale[i] = state_float(0x0a30 + 4 * i);
+    d.clip_x = state(0x0a00) & 0xffff, d.clip_width = state(0x0a00) >> 16, d.clip_y = state(0x0a04) & 0xffff, d.clip_height = state(0x0a04) >> 16;
+    const uint32_t window = state(0x1d88);
+    d.window_height = window & 0xfff;
+    d.origin_bottom = ((window >> 12) & 0xf) == 1;
+    if ((window >> 16) & 0xf) fatal("a window whose pixel centres are on whole numbers, which the renderer doesn't take yet (at offset %08x)", at);
+    d.scissor_x = state(0x08c0) & 0xffff, d.scissor_width = state(0x08c0) >> 16, d.scissor_y = state(0x08c4) & 0xffff, d.scissor_height = state(0x08c4) >> 16;
+    d.blend = state(0x0310) != 0;
+    d.blend_src = state(0x0314), d.blend_dst = state(0x0318), d.blend_equation = state(0x0320);
+    d.cull = state(0x183c) != 0;
+    d.cull_face = state(0x1830), d.front_face = state(0x1834);
+    renderer_draw(d);
+}
+
+// CLEAR_SURFACE: the colour surface and the depth-stencil surface filled with their clear values, in guest memory (where
+// this first renderer keeps every surface: renderer.hpp). The argument's bits: depth 1, stencil 2, red 0x10, green 0x20,
+// blue 0x40, alpha 0x80. *The clear rectangle is taken in the surface's own coordinates, from its top-left corner, and
+// the colour write mask is not applied to a clear: stated choices, to be compared with the console.*
+void clear(uint32_t mask, uint32_t at) {
+    if (mask & ~0xf3u) fatal("CLEAR_SURFACE with bits %#x, which this runtime doesn't know (at offset %08x)", mask, at);
+    const uint32_t format = state(0x0208);
+    if (((format >> 8) & 0xf) != 1) fatal("a clear of a surface of type %u (not linear) (at offset %08x)", (format >> 8) & 0xf, at);
+    const uint32_t x0 = state(0x1d98) & 0xffff, x1 = x0 + (state(0x1d98) >> 16), y0 = state(0x1d9c) & 0xffff, y1 = y0 + (state(0x1d9c) >> 16);
+    const uint32_t width = state(0x0200) >> 16, height = state(0x0204) >> 16;
+    const uint32_t right = std::min(x1, width), bottom = std::min(y1, height);
+    if (mask & 0xf0) {
+        if (state(0x0220) != 1) fatal("a clear of colour targets %#x (only surface A is taken yet) (at offset %08x)", state(0x0220), at);
+        if ((format & 0x1f) != 8) fatal("a clear of a colour surface of format %u, which this runtime doesn't clear yet (at offset %08x)", format & 0x1f, at);
+        const uint32_t address = guest_address(surface_location(state(0x0194)), state(0x0210), "a colour surface"), pitch = state(0x020c);
+        const uint32_t value = state(0x1d90);  // A8R8G8B8
+        // The channels kept: a pixel is A, R, G, B in memory.
+        const bool keep[4] = {!(mask & 0x80), !(mask & 0x10), !(mask & 0x20), !(mask & 0x40)};
+        const uint8_t bytes[4] = {static_cast<uint8_t>(value >> 24), static_cast<uint8_t>(value >> 16), static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value)};
+        for (uint32_t y = y0; y < bottom; ++y)
+            for (uint32_t x = x0; x < right; ++x) {
+                uint8_t* q = guest_memory() + address + y * pitch + 4 * x;
+                for (unsigned c = 0; c < 4; ++c)
+                    if (!keep[c]) q[c] = bytes[c];
+            }
+    }
+    if (mask & 3) {
+        const uint32_t depth_format = (format >> 5) & 7;  // 1 Z16, 2 Z24S8
+        if (depth_format != 2) fatal("a clear of a depth surface of format %u, which this runtime doesn't clear yet (at offset %08x)", depth_format, at);
+        const uint32_t address = guest_address(surface_location(state(0x0198)), state(0x0214), "a depth surface"), pitch = state(0x022c);
+        const uint32_t value = state(0x1d8c);  // depth in the top 24 bits, stencil in the bottom 8
+        for (uint32_t y = y0; y < bottom; ++y)
+            for (uint32_t x = x0; x < right; ++x) {
+                const uint32_t at_pixel = address + y * pitch + 4 * x;
+                uint32_t word = load32(at_pixel);
+                if (mask & 1) word = (word & 0xffu) | (value & 0xffffff00u);
+                if (mask & 2) word = (word & 0xffffff00u) | (value & 0xffu);
+                store32(at_pixel, word);
+            }
+    }
+}
+
+// A flip: the display buffer, from guest memory, to the window.
+void flip(uint32_t id, uint32_t at) {
+    const DisplayBuffer b = display_buffer(id);
+    if (!b.set) fatal("the RSX is to show display buffer %u, which the game never set (at offset %08x)", id, at);
+    const VideoMode mode = video_mode();
+    if (!mode.configured || mode.format != 0) fatal("a flip with the video output in format %u, which this runtime doesn't show yet", mode.format);
+    std::vector<uint8_t> rgba(size_t{b.width} * b.height * 4);
+    const uint8_t* from = guest_memory() + kRsxLocal + b.offset;
+    for (uint32_t y = 0; y < b.height; ++y)
+        for (uint32_t x = 0; x < b.width; ++x) {
+            const uint8_t* p = from + size_t{y} * b.pitch + 4 * x;  // X8R8G8B8: X, R, G, B in memory
+            uint8_t* q = rgba.data() + (size_t{y} * b.width + x) * 4;
+            q[0] = p[1], q[1] = p[2], q[2] = p[3], q[3] = 255;
+        }
+    present_frame(rgba.data(), b.width, b.height);
+}
+
 // One method with one argument.
 void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     if (is_state(method)) {
         r.state[method / 4] = argument;
+        return;
+    }
+    if (method >= 0x0b80 && method < 0x0c00) {  // SET_TRANSFORM_PROGRAM: a word of a vertex program
+        if (r.program_at >= r.program.size()) fatal("a vertex program written past its 512 instructions (at offset %08x)", at);
+        r.program[r.program_at++] = argument;
+        return;
+    }
+    if (method >= 0x1f00 && method < 0x1f80) {  // SET_TRANSFORM_CONSTANT: a word of the constants
+        if (r.constant_at >= r.constants.size()) fatal("vertex constants written past the 468 (at offset %08x)", at);
+        r.constants[r.constant_at++] = std::bit_cast<float>(argument);
         return;
     }
     switch (method) {
@@ -164,8 +336,38 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     case 0x1d74:  // TEXTURE_READ_SEMAPHORE_RELEASE: the same label, as given, once every texture read so far is done
         store32(label_address(r.state[0x1d6c / 4], at), argument);
         return;
-    case kMethodWaitFlip:  // (the runtime's own) wait until the last flip has been shown
-        if (r.flip_pending) fatal("the RSX is to wait for a flip, and showing pictures isn't provided yet");
+    case kMethodWaitFlip:  // (the runtime's own) wait until the last flip has been shown: a flip is shown at once here
+        return;
+    case 0x1d94:  // CLEAR_SURFACE
+        clear(argument, at);
+        return;
+    case kMethodFlip:  // (the runtime's own) show a display buffer
+        flip(argument, at);
+        return;
+    // Vertex programs and their constants: uploaded a word at a time from where the load methods point.
+    case 0x1e9c:  // SET_TRANSFORM_PROGRAM_LOAD: the instruction slot the next words go to
+        if (argument >= 512) fatal("a vertex program loaded at slot %u, past the 512 (at offset %08x)", argument, at);
+        r.program_at = argument * 4;
+        return;
+    case 0x1efc:  // SET_TRANSFORM_CONSTANT_LOAD: the constant the next words go to
+        if (argument >= 468) fatal("vertex constants loaded at %u, past the 468 (at offset %08x)", argument, at);
+        r.constant_at = argument * 4;
+        return;
+    case 0x1710:  // INVALIDATE_VERTEX_CACHE_FILE
+    case 0x1714:  // INVALIDATE_VERTEX_FILE: the RSX's caches of vertices; this one reads guest memory at each draw
+        return;
+    case 0x1808:  // SET_BEGIN_END: a primitive's start (its kind), or 0 for its end, when the ranges since are drawn
+        if (argument) {
+            r.primitive = argument;
+            r.ranges.clear();
+        } else {
+            for (const auto& [first, count] : r.ranges) draw(first, count, at);
+            r.ranges.clear();
+        }
+        return;
+    case 0x1814:  // DRAW_ARRAYS: vertices [first, first + count) of the arrays, count - 1 in the top byte
+        if (!r.primitive) fatal("DRAW_ARRAYS outside SET_BEGIN_END (at offset %08x)", at);
+        r.ranges.emplace_back(argument & 0xffffffu, (argument >> 24) + 1);
         return;
     default:
         if (g_survey) {
@@ -181,6 +383,10 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
 void serve() {
     const uint32_t control = rsx_setup().control;
     r.get = load32(control + 4);
+    // The state the system's start-up leaves, which the game relies on without setting: the depth surface in the RSX's own
+    // memory. *A stated choice: the game sets its other surfaces' context objects (colour B to D in the RSX's memory) but
+    // never the depth surface's, whose offset fits the RSX's memory.*
+    r.state[0x0198 / 4] = 0xFEED0000u;
     g_survey = std::getenv("RR7_RSX_SURVEY") != nullptr;
     g_trace = std::getenv("RR7_RSX_TRACE") != nullptr;
     g_survey_ends = std::chrono::steady_clock::now() + std::chrono::seconds(10);

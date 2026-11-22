@@ -41,6 +41,7 @@ std::span<const NativeImport> pad_imports();      // pad.cpp
 std::span<const NativeImport> usbd_imports();     // usbd.cpp
 std::span<const NativeImport> mempool_imports();  // mempool.cpp
 std::span<const NativeImport> gcm_imports();      // gcm.cpp
+std::span<const NativeImport> savedata_imports();  // savedata.cpp
 std::span<const NativeImport> rtc_imports();  // rtc.cpp
 std::span<const NativeImport> spu_imports();      // spu.cpp
 std::span<const NativeImport> audio_imports();  // audio.cpp
@@ -124,6 +125,20 @@ void set_audio_sink(std::function<void(const int16_t* left_right, size_t frames)
 // The console's time zone and summer time, in minutes (sysutil.cpp's settings).
 int32_t console_time_zone_minutes();
 int32_t console_summer_time_minutes();
+// The system's message dialog, for the window's thread to show (sysutil.cpp): a dialog that asks the player something, if one
+// is waiting to be shown (its text, and its buttons: 1 yes and no, 2 OK); and the player's answer (1 yes or OK, 2 no, 3 escaped).
+bool take_dialog(std::string& text, uint32_t& buttons);
+void answer_dialog(int32_t button);
+// The player's controller as the console's first (pad.cpp): the buttons as the console has them (digital1: select 1, L3 2,
+// R3 4, start 8, up 0x10, right 0x20, down 0x40, left 0x80; digital2: L2 1, R2 2, L1 4, R1 8, triangle 0x10, circle 0x20,
+// cross 0x40, square 0x80), the sticks (0 to 255, 128 the middle, y down) and the pressures (right, left, up, down, triangle,
+// circle, cross, square, L1, R1, L2, R2: 0 to 255). Set by the window's thread at each poll.
+struct PadState {
+    uint16_t digital1 = 0, digital2 = 0;
+    uint16_t right_x = 128, right_y = 128, left_x = 128, left_y = 128;
+    uint16_t pressure[12] = {};
+};
+void set_pad_state(const PadState& state);
 // The program's thread-local image: each thread gets a copy.
 struct TlsImage {
     uint32_t address = 0, file_size = 0, memory_size = 0;

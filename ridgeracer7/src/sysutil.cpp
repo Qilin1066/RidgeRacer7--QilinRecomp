@@ -118,8 +118,77 @@ void cellSysutilUnregisterCallback(Cpu& c) {
     c.r[3] = kOk;
 }
 
+// ---- the message dialog (cellMsgDialog...) ----
+// The system's dialog over the game's picture: a message, and perhaps buttons for the player. As in the system, opening one
+// returns at once, and the player's answer reaches the game's function at a later cellSysutilCheckCallback. The dialog is
+// shown by the window's thread (main.cpp: a message box of the host's own); one with no buttons is held open, its text in
+// the log, until the game closes it. *Drawing it over the game's picture, as the console does, comes with the settings menu.*
+struct Dialog {
+    bool open = false, waiting = false, answered = false;
+    uint32_t type = 0, function = 0, user = 0;
+    int32_t answer = 0;
+    std::string text;
+};
+Dialog g_dialog;  // guarded by g_callbacks_mutex
+
+// The dialog's buttons, from its type (bits 4 to 6): 1 yes and no, 2 OK. *0 is taken as OK too, a stated reading of this first
+// version of the call (cellMsgDialogOpen, before Open2): the game opens its notice at start-up with 0 and then waits for the
+// dialog's function to be called, with no other way to end it (it never aborts it), so the player must be able to dismiss it.*
+uint32_t dialog_buttons(uint32_t type) {
+    const uint32_t buttons = (type >> 4) & 7;
+    return buttons == 0 ? 2 : buttons;
+}
+
+// cellMsgDialogOpen(type, const char* message, function, user data, extra parameter)
+void cellMsgDialogOpen(Cpu& c) {
+    const uint32_t type = static_cast<uint32_t>(c.r[3]), message = static_cast<uint32_t>(c.r[4]);
+    const std::lock_guard lock(g_callbacks_mutex);
+    if (g_dialog.open) {
+        c.r[3] = 0x8002b301u;  // CELL_SYSUTIL_ERROR_BUSY *(as recalled)*
+        return;
+    }
+    if (!message || dialog_buttons(type) > 2) qilin::rt::fatal("cellMsgDialogOpen: type %#x, message %08x: the system's answer to that isn't known here", type, message);
+    const char* const p = reinterpret_cast<const char*>(guest_memory() + message);
+    g_dialog = {true, dialog_buttons(type) != 0, false, type, static_cast<uint32_t>(c.r[5]), static_cast<uint32_t>(c.r[6]), 0, std::string(p, strnlen(p, 512))};
+    qilin::rt::log("the game opens a dialog (type %#x): \"%s\"", type, g_dialog.text.c_str());
+    c.r[3] = kOk;
+}
+
+// cellMsgDialogClose(delay in milliseconds): the dialog goes, and its function is told: no button (-1).
+void cellMsgDialogClose(Cpu& c) {
+    const std::lock_guard lock(g_callbacks_mutex);
+    if (!g_dialog.open) {
+        c.r[3] = 0x8002b302u;  // *(as recalled)*
+        return;
+    }
+    g_dialog.waiting = false;
+    g_dialog.answered = true;
+    g_dialog.answer = -1;
+    c.r[3] = kOk;
+}
+
 // cellSysutilCheckCallback(): calls each registered function(status, parameter, user data) for each event waiting.
 void cellSysutilCheckCallback(Cpu& c) {
+    // A dialog's answer first: its own function(button, user data).
+    {
+        Dialog done;
+        {
+            const std::lock_guard lock(g_callbacks_mutex);
+            if (g_dialog.open && g_dialog.answered) {
+                done = g_dialog;
+                g_dialog = {};
+            }
+        }
+        if (done.open && done.function) {
+            const uint64_t toc = c.r[2], lr = c.lr;
+            c.r[3] = static_cast<uint64_t>(static_cast<int64_t>(done.answer));
+            c.r[4] = done.user;
+            c.r[2] = load32(done.function + 4);
+            c.hooks->call(c, load32(done.function));
+            c.r[2] = toc;
+            c.lr = lr;
+        }
+    }
     for (;;) {
         std::pair<uint64_t, uint64_t> event;
         Callback callbacks[4];
@@ -146,6 +215,8 @@ void cellSysutilCheckCallback(Cpu& c) {
 }
 
 constexpr NativeImport kImports[] = {
+    {"cellSysutil", "cellMsgDialogOpen", cellMsgDialogOpen},
+    {"cellSysutil", "cellMsgDialogClose", cellMsgDialogClose},
     {"cellSysutil", "cellSysutilRegisterCallback", cellSysutilRegisterCallback},
     {"cellSysutil", "cellSysutilUnregisterCallback", cellSysutilUnregisterCallback},
     {"cellSysutil", "cellSysutilCheckCallback", cellSysutilCheckCallback},
@@ -158,6 +229,22 @@ constexpr NativeImport kImports[] = {
 
 int32_t console_time_zone_minutes() { return g_settings.time_zone; }
 int32_t console_summer_time_minutes() { return g_settings.summer_time; }
+
+bool take_dialog(std::string& text, uint32_t& buttons) {
+    const std::lock_guard lock(g_callbacks_mutex);
+    if (!g_dialog.open || !g_dialog.waiting) return false;
+    g_dialog.waiting = false;
+    text = g_dialog.text;
+    buttons = dialog_buttons(g_dialog.type);
+    return true;
+}
+void answer_dialog(int32_t button) {
+    const std::lock_guard lock(g_callbacks_mutex);
+    if (!g_dialog.open) return;
+    g_dialog.answered = true;
+    g_dialog.answer = button;
+    qilin::rt::log("the player answers the dialog: %d", button);
+}
 
 void system_event(uint64_t status, uint64_t parameter) {
     const std::lock_guard lock(g_callbacks_mutex);

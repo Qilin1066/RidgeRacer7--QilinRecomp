@@ -12,7 +12,10 @@
 // repository.
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <atomic>
+#include <string>
+#include <utility>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -22,7 +25,10 @@
 
 #include "machine.hpp"
 #include "qilin/host/audio.hpp"
+#include <SDL3/SDL.h>
+
 #include "qilin/host/display.hpp"
+#include "qilin/host/pad.hpp"
 #include "renderer.hpp"
 #include "qilin/host/paths.hpp"
 #include "qilin/rt/lifted.hpp"
@@ -51,6 +57,93 @@ void write_bmp(uint64_t n, const uint8_t* rgba, uint32_t width, uint32_t height)
     }
     std::fclose(f);
     qilin::rt::log("flip %llu written to %s", static_cast<unsigned long long>(n), name);
+}
+
+// The controller from the window's gamepad, and from the keyboard until the settings menu holds a layout (*the default
+// layout is a stated choice*: arrows the d-pad, Z cross, X circle, A square, S triangle, Q L1, W R1, 1 L2, 2 R2, Return
+// start, Backspace select). `pressed` adds buttons a test asks for (RR7_PRESS).
+rr7::PadState read_pad(const qilin::host::Display& display, uint16_t pressed1, uint16_t pressed2) {
+    namespace host = qilin::host;
+    rr7::PadState pad;
+    const uint32_t b = display.buttons();
+    const auto key = [&](const char* name) { return display.key_down(display.key_code(name)); };
+    struct Map {
+        uint32_t host;
+        const char* key;
+        bool second;
+        uint16_t bit;
+        int pressure;  // its place among the pressures, or -1
+    };
+    static constexpr Map kMap[] = {
+        {host::kPadBack, "Backspace", false, 0x01, -1}, {host::kPadL3, nullptr, false, 0x02, -1},   {host::kPadR3, nullptr, false, 0x04, -1},
+        {host::kPadStart, "Return", false, 0x08, -1},   {host::kPadUp, "Up", false, 0x10, 2},        {host::kPadRight, "Right", false, 0x20, 0},
+        {host::kPadDown, "Down", false, 0x40, 3},       {host::kPadLeft, "Left", false, 0x80, 1},    {host::kPadLT, "1", true, 0x01, 10},
+        {host::kPadRT, "2", true, 0x02, 11},            {host::kPadLB, "Q", true, 0x04, 8},          {host::kPadRB, "W", true, 0x08, 9},
+        {host::kPadY, "S", true, 0x10, 4},              {host::kPadB, "X", true, 0x20, 5},           {host::kPadA, "Z", true, 0x40, 6},
+        {host::kPadX, "A", true, 0x80, 7},
+    };
+    for (const Map& m : kMap) {
+        const bool down = (b & m.host) || (m.key && key(m.key)) || ((m.second ? pressed2 : pressed1) & m.bit);
+        if (!down) continue;
+        (m.second ? pad.digital2 : pad.digital1) |= m.bit;
+        if (m.pressure >= 0) pad.pressure[m.pressure] = 255;
+    }
+    const auto axis = [](float v) { return static_cast<uint16_t>(std::clamp(128.0f + v * 127.5f, 0.0f, 255.0f)); };
+    float x = 0, y = 0;
+    display.left_stick(x, y);
+    pad.left_x = axis(x), pad.left_y = axis(-y);
+    display.right_stick(x, y);
+    pad.right_x = axis(x), pad.right_y = axis(-y);
+    return pad;
+}
+
+// A development aid: RR7_PRESS=<button>@<flip>[,...] holds a button for six flips from that flip (cross, circle, square,
+// triangle, start, select, up, down, left, right, l1, r1, l2, r2), for runs with nobody at the controller.
+struct Press {
+    uint64_t flip;
+    bool second;
+    uint16_t bit;
+};
+std::vector<Press> presses_asked() {
+    std::vector<Press> out;
+    const char* list = std::getenv("RR7_PRESS");
+    if (!list) return out;
+    struct Name {
+        const char* name;
+        bool second;
+        uint16_t bit;
+    };
+    static constexpr Name kNames[] = {
+        {"select", false, 0x01},
+        {"start", false, 0x08},
+        {"up", false, 0x10},
+        {"right", false, 0x20},
+        {"down", false, 0x40},
+        {"left", false, 0x80},
+        {"l2", true, 0x01},
+        {"r2", true, 0x02},
+        {"l1", true, 0x04},
+        {"r1", true, 0x08},
+        {"triangle", true, 0x10},
+        {"circle", true, 0x20},
+        {"cross", true, 0x40},
+        {"square", true, 0x80},
+    };
+    std::string text = list;
+    for (size_t at = 0; at < text.size();) {
+        const size_t end = std::min(text.find(',', at), text.size());
+        const std::string item = text.substr(at, end - at);
+        at = end + 1;
+        const size_t mark = item.find('@');
+        bool found = false;
+        for (const Name& n : kNames)
+            if (mark != std::string::npos && item.substr(0, mark) == n.name) {
+                out.push_back({std::strtoull(item.c_str() + mark + 1, nullptr, 10), n.second, n.bit});
+                found = true;
+            }
+        if (!found) qilin::rt::fatal("RR7_PRESS: \"%s\" is not <button>@<flip>", item.c_str());
+    }
+    return out;
 }
 
 int main(int argc, char** argv) {
@@ -132,8 +225,39 @@ int main(int argc, char** argv) {
     }
     uint64_t shown = 0;
     std::vector<uint8_t> picture;
+    const std::vector<Press> presses = presses_asked();
     uint32_t width = 0, height = 0;
     while (display.poll()) {
+        {
+            uint16_t pressed1 = 0, pressed2 = 0;
+            const uint64_t now = flips;
+            for (const Press& p : presses)
+                if (now >= p.flip && now < p.flip + 6) (p.second ? pressed2 : pressed1) |= p.bit;
+            rr7::set_pad_state(read_pad(display, pressed1, pressed2));
+        }
+        // A dialog of the system's that asks the player something: a message box of the host's, over the window.
+        {
+            std::string text;
+            uint32_t buttons = 0;
+            // A development aid: RR7_ANSWER=<1 yes or OK, 2 no, 3 back> answers the system's dialogs without showing them.
+            static const char* const answer = std::getenv("RR7_ANSWER");
+            if (answer && rr7::take_dialog(text, buttons)) {
+                rr7::answer_dialog(std::atoi(answer));
+            } else if (!answer && rr7::take_dialog(text, buttons)) {
+                const SDL_MessageBoxButtonData yes_no[] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Yes"}, {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 2, "No"}};
+                const SDL_MessageBoxButtonData ok[] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 1, "OK"}};
+                SDL_MessageBoxData box{};
+                box.flags = SDL_MESSAGEBOX_INFORMATION;
+                box.window = static_cast<SDL_Window*>(display.sdl_window());
+                box.title = "Ridge Racer 7";
+                box.message = text.c_str();
+                box.numbuttons = buttons == 1 ? 2 : 1;
+                box.buttons = buttons == 1 ? yes_no : ok;
+                int chosen = -1;
+                if (!SDL_ShowMessageBox(&box, &chosen)) qilin::rt::fatal("the host can't show the system's dialog: %s", SDL_GetError());
+                rr7::answer_dialog(chosen < 0 ? 3 : chosen);
+            }
+        }
         if (flips != shown) {
             {
                 const std::lock_guard lock(frame_mutex);

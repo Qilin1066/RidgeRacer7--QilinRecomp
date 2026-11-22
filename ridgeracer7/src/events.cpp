@@ -241,6 +241,17 @@ uint32_t make_event_queue(size_t capacity) {
     return g_queues.add(std::move(queue));
 }
 
+void destroy_event_queue(uint32_t id) {
+    const auto queue = g_queues.find(id);
+    if (!queue) return;
+    {
+        const std::lock_guard lock(queue->mutex);
+        queue->destroyed = true;
+    }
+    queue->arrived.notify_all();
+    g_queues.remove(id);
+}
+
 uint32_t event_queue_by_key(uint64_t key) {
     const std::lock_guard lock(g_keys_mutex);
     const auto it = g_keys.find(key);

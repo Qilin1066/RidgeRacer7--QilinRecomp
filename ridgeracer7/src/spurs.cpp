@@ -397,6 +397,7 @@ void cellSpursEventFlagDetachLv2EventQueue(Cpu& c) {
     EventFlag& f = flag_at(flag, "cellSpursEventFlagDetachLv2EventQueue");
     if (!f.queue) qilin::rt::fatal("cellSpursEventFlagDetachLv2EventQueue on flag %08x, which has no queue", flag);
     if (const auto it = g_instances.find(f.spurs); it != g_instances.end()) it->second.ports.erase(f.port);
+    destroy_event_queue(f.queue);  // (the game attaches and detaches each flag every frame)
     f.queue = 0;
     const std::lock_guard atomic(spu_atomic_mutex());
     guest_memory()[flag + kFlagPort] = 0xff;

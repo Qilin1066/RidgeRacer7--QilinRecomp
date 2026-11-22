@@ -863,7 +863,11 @@ void renderer_draw(const Draw& d) {
         r.arena.destroy(gpu);
         r.arena = host::Buffer::host_visible(gpu, size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                                                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        qilin::rt::log("the renderer's arena grows to %llu MB for a draw of %llu MB", static_cast<unsigned long long>(size >> 20), static_cast<unsigned long long>(needed >> 20));
+        size_t texels = 0;
+        for (const Upload& up : uploads) texels += up.decode ? up.texels.rgba.size() : 0;
+        qilin::rt::log("the renderer's arena grows to %llu MB for a draw of %llu MB: %u vertices from %u (%s, %zu indices), %u attributes, %zu MB of texels",
+                       static_cast<unsigned long long>(size >> 20), static_cast<unsigned long long>(needed >> 20), d.count, d.first, d.indexed ? "indexed" : "arrays",
+                       d.indices.size(), attributes, texels >> 20);
     }
     if (r.recording && (r.arena_used + needed > r.arena.size || r.sets_used + 2 > kMostSets)) renderer_flush();
     VkCommandBuffer cmd = r.cmd;

@@ -398,14 +398,19 @@ void inline_word(uint32_t index, uint32_t word, uint32_t at) {
 
 // The RSX's last jumps, calls and returns (from, to), for the report of a stop.
 std::array<std::pair<uint32_t, uint32_t>, 8> g_transfers{};
+std::array<uint32_t, 8> g_transfer_puts{};
 uint32_t g_transfer_count = 0;
-void note_transfer(uint32_t from, uint32_t to) { g_transfers[g_transfer_count++ % g_transfers.size()] = {from, to}; }
+uint32_t g_put = 0;  // put, as last read
+void note_transfer(uint32_t from, uint32_t to) {
+    g_transfer_puts[g_transfer_count % g_transfers.size()] = g_put;
+    g_transfers[g_transfer_count++ % g_transfers.size()] = {from, to};
+}
 std::string recent_transfers() {
     std::string out;
     for (uint32_t i = 0; i < g_transfers.size() && i < g_transfer_count; ++i) {
         const auto& [from, to] = g_transfers[(g_transfer_count - 1 - i) % g_transfers.size()];
-        char item[40];
-        std::snprintf(item, sizeof item, "%s%08x->%08x", out.empty() ? "" : ", ", from, to);
+        char item[64];
+        std::snprintf(item, sizeof item, "%s%08x->%08x (put %08x)", out.empty() ? "" : ", ", from, to, g_transfer_puts[(g_transfer_count - 1 - i) % g_transfers.size()]);
         out += item;
     }
     return out;
@@ -531,6 +536,7 @@ void serve() {
     uint32_t idle = 0;
     for (;;) {
         const uint32_t put = load32(control);
+        g_put = put;
         if (r.get == put) {
             if (idle == 0) renderer_flush();  // out of commands: what was drawn goes to guest memory
             if (g_survey && std::chrono::steady_clock::now() > g_survey_ends) end_survey();

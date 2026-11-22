@@ -18,6 +18,8 @@ uint64_t receive_event(uint32_t queue_id, Event& event);
 
 // A queue made by the runtime itself (the system's own queues, such as a SPURS event flag's), holding up to `capacity` events.
 uint32_t make_event_queue(size_t capacity);
+// Destroys a queue the runtime made: threads waiting on it are woken with "cancelled".
+void destroy_event_queue(uint32_t id);
 
 // The queue made with this key, or 0. (A key is how one part of a program names a queue to another.)
 uint32_t event_queue_by_key(uint64_t key);

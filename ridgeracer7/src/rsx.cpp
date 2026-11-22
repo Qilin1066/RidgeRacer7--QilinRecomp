@@ -214,6 +214,9 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         d.depth_test = true;
         d.depth_func = state(0x0a6c), d.depth_write = state(0x0a70) != 0;
         if (d.depth_func < 0x200 || d.depth_func > 0x207) fatal("a depth test with function %#x (at offset %08x)", d.depth_func, at);
+    }
+    if (d.depth_test || state(0x0328)) {
+        d.depth_surface = true;
         const uint32_t depth_format = (format >> 5) & 7;  // 1 Z16, 2 Z24S8
         if (depth_format != 2) fatal("a depth test on a depth surface of format %u, which the renderer doesn't take yet (at offset %08x)", depth_format, at);
         d.depth.format = depth_format, d.depth.pitch = state(0x022c);
@@ -224,7 +227,31 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
     // factor and the constant. *With D32S8 a unit of bias follows the depth's exponent rather than 2^-24: a stated difference.*
     if (state(0x0a60) || state(0x0a64)) fatal("a draw with polygon offset for points or lines, which the renderer doesn't take yet (at offset %08x)", at);
     if (state(0x0a68)) d.depth_bias = true, d.bias_factor = state_float(0x0a78), d.bias_units = state_float(0x0a7c);
-    if (state(0x032c)) fatal("a draw with the stencil test, which the renderer doesn't take yet (at offset %08x)", at);
+    // The stencil test (NV30/40's: Mesa's nv30-40_3d.xml.h): 0x328 on, 0x32c write mask, 0x330 function, 0x334 reference,
+    // 0x338 function mask, 0x33c/0x340/0x344 the operations on failing, the depth test failing, passing; the back faces' at
+    // 0x348 on (two-sided) to 0x364.
+    if (state(0x0328)) {
+        const auto side = [&](uint32_t base) {
+            Draw::Stencil st;
+            st.write_mask = state(base + 4) & 0xff, st.func = state(base + 8), st.ref = state(base + 12) & 0xff, st.func_mask = state(base + 16) & 0xff;
+            st.fail = state(base + 20), st.zfail = state(base + 24), st.zpass = state(base + 28);
+            if (st.func < 0x200 || st.func > 0x207) fatal("a stencil test with function %#x (at offset %08x)", st.func, at);
+            return st;
+        };
+        d.stencil_test = true;
+        d.stencil_front = side(0x0328);
+        d.stencil_back = state(0x0348) ? side(0x0348) : d.stencil_front;
+    }
+    // State this renderer doesn't take, refused by name rather than ignored: flat shading, logic operations, the depth bounds
+    // test, two-sided vertex colours, user clip planes, polygon stipple, and polygons drawn as points or lines.
+    if (state(0x0368) == 0x1d00) fatal("a draw with flat shading, which the renderer doesn't take yet (at offset %08x)", at);
+    if (state(0x0374)) fatal("a draw with a logic operation (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x0378), at);
+    if (state(0x0380)) fatal("a draw with the depth bounds test, which the renderer doesn't take yet (at offset %08x)", at);
+    if (state(0x142c)) fatal("a draw with two-sided vertex colours, which the renderer doesn't take yet (at offset %08x)", at);
+    if (state(0x1478)) fatal("a draw with user clip planes (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x1478), at);
+    if (state(0x147c)) fatal("a draw with polygon stipple, which the renderer doesn't take yet (at offset %08x)", at);
+    for (const uint32_t mode : {state(0x1828), state(0x182c)})
+        if (mode && mode != 0x1b02) fatal("a draw with polygons drawn as %s, which the renderer doesn't take yet (at offset %08x)", mode == 0x1b00 ? "points" : "lines", at);
     // The alpha test (SET_ALPHA_FUNC: OpenGL's NEVER 0x200 to ALWAYS 0x207, bit 0 less, bit 1 equal, bit 2 greater; SET_ALPHA_REF):
     // on 8-bit surfaces the reference's low byte against the alpha as stored. *Its reference on a float surface isn't known here.*
     if (state(0x0304)) {
@@ -632,11 +659,20 @@ void serve() {
     g_trace = std::getenv("RR7_RSX_TRACE") != nullptr;
     g_survey_ends = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     uint32_t idle = 0;
+    std::chrono::steady_clock::time_point idle_since{};
+    bool idle_flushed = false;
     for (;;) {
         const uint32_t put = load32(control);
         g_put = put;
         if (r.get == put) {
-            if (idle == 0) renderer_flush();  // out of commands: what was drawn goes to guest memory
+            // Out of commands for 2 ms: what was drawn goes to guest memory. (Not at once: the game often runs the RSX dry
+            // mid-frame while it writes the rest, and a flush writes every surface drawn back. A game can only rely on drawn
+            // results through a label, a wait or a flip, which flush at once; this is for one that watches get.)
+            if (idle == 0) idle_since = std::chrono::steady_clock::now(), idle_flushed = false;
+            if (!idle_flushed && std::chrono::steady_clock::now() - idle_since > std::chrono::milliseconds(2)) {
+                renderer_flush();
+                idle_flushed = true;
+            }
             if (g_survey && std::chrono::steady_clock::now() > g_survey_ends) end_survey();
             // Nothing to do. (The console's RSX is told when put moves; here the game's own code moves it
             // in memory, so it is watched: closely at first, then at a millisecond's remove.)

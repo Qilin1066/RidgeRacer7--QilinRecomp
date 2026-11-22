@@ -61,6 +61,15 @@ struct Draw {
     // The depth test: on or off, its function (OpenGL's NEVER 0x200 to ALWAYS 0x207), whether depth is written, and the
     // depth-stencil surface (format 2: Z24S8, a big-endian word of depth in the top 24 bits and stencil in the low 8).
     bool depth_test = false, depth_write = false;
+    bool depth_surface = false;  // the depth-stencil surface is attached (for the depth test, the stencil test, or both)
+    // The stencil test (OpenGL's functions and operations), the front faces' and the back faces' (the front's when it isn't
+    // two-sided): function, reference, function mask, write mask, and the operations on failing, on the depth test failing,
+    // on passing.
+    struct Stencil {
+        uint32_t func = 0x207, ref = 0, func_mask = 0xff, write_mask = 0xff, fail = 0x1e00, zfail = 0x1e00, zpass = 0x1e00;
+    };
+    bool stencil_test = false;
+    Stencil stencil_front, stencil_back;
     bool depth_bias = false;  // polygon offset
     float bias_factor = 0, bias_units = 0;
     uint32_t depth_func = 0;

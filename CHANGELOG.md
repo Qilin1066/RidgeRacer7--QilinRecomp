@@ -41,11 +41,14 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - `RR7_RSX_TRACE` logs every RSX method and its argument.
 - `RR7_ERRORS` and `RR7_FILES`: logs of the error codes handed to the game and of its file reads. `RR7_CALLS`, `RR7_DUMP` and `qilin lift --registers`, for finding a fault (`docs/runtime.md`).
 - The clock library (`cellRtc`).
+- The stencil test (both faces) in the renderer.
+- State the renderer doesn't take is refused by name instead of ignored: flat shading, logic operations, the depth bounds test, two-sided vertex colours, user clip planes, polygon stipple, polygons drawn as points or lines.
 
 ### Checked
 - On the owner's PC: the game starts its sound core (`bnusCoreSpu.elf`) as an SPU thread, which runs; it reads and unpacks its first packs of `RR7.DAT`, and runs on to its first drawing: it stops at the RSX method that loads a vertex program. 110 of its 248 imports and 54 of its 78 system calls are provided.
 
 ### Fixed
+- The renderer no longer writes every surface back each time the RSX briefly runs out of commands mid-frame: it waits 2 ms first (labels, waits and flips still flush at once).
 - `sys_memory_allocate` could give the same address twice when blocks of both page sizes were allocated: the game's packs then overwrote one another, and it faulted going over one's table.
 - The archive's directory: a record begins with its name, not ends with it. Every pack and file had its neighbour's name since v0.5.0 (`docs/data-files.md`).
 

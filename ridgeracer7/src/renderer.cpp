@@ -32,6 +32,7 @@ struct Pipeline {
 struct SurfaceEntry {
     Surface desc;
     host::Image image;
+    VkImageView attachment_view = VK_NULL_HANDLE;  // a depth surface's view of both its aspects, to attach for depth and stencil
     host::Buffer staging;  // colour: RGBA rows; depth: the depth aspect's words, then the stencil aspect's bytes
     bool depth = false;
     bool coherent = true;  // whether its memory needs invalidating before the CPU reads what the GPU wrote
@@ -343,11 +344,34 @@ VkSampler sampler_for(uint32_t unit, const SamplerFields& s, uint32_t levels) {
 
 VkCompareOp compare_op(uint32_t f) { return static_cast<VkCompareOp>(f - 0x200); }  // OpenGL's order is Vulkan's
 
+VkStencilOp stencil_op(uint32_t op) {
+    switch (op) {
+    case 0x0000: return VK_STENCIL_OP_ZERO;
+    case 0x1e00: return VK_STENCIL_OP_KEEP;
+    case 0x1e01: return VK_STENCIL_OP_REPLACE;
+    case 0x1e02: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+    case 0x1e03: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+    case 0x150a: return VK_STENCIL_OP_INVERT;
+    case 0x8507: return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+    case 0x8508: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+    default: fatal("a stencil operation %#x, which the renderer doesn't know", op);
+    }
+}
+VkStencilOpState stencil_state(const Draw::Stencil& s) {
+    VkStencilOpState v{};
+    v.failOp = stencil_op(s.fail), v.depthFailOp = stencil_op(s.zfail), v.passOp = stencil_op(s.zpass);
+    v.compareOp = compare_op(s.func), v.compareMask = s.func_mask, v.writeMask = s.write_mask, v.reference = s.ref;
+    return v;
+}
+
 VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, const qilin::rt::TranslatedShader& fs, VkFormat format, VkPrimitiveTopology topology) {
     std::vector<uint32_t> key{static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs) >> 32),
                               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs) >> 32),
                               static_cast<uint32_t>(format), static_cast<uint32_t>(topology), d.color_mask, d.blend, d.blend_src, d.blend_dst, d.blend_equation,
-                              d.depth_test, d.depth_write, d.depth_func, d.cull, d.cull_face, d.front_face, d.depth_bias,
+                              d.depth_test, d.depth_write, d.depth_func, d.cull, d.cull_face, d.front_face, d.depth_bias, d.depth_surface, d.stencil_test,
+                              d.stencil_front.func, d.stencil_front.ref, d.stencil_front.func_mask, d.stencil_front.write_mask, d.stencil_front.fail, d.stencil_front.zfail,
+                              d.stencil_front.zpass, d.stencil_back.func, d.stencil_back.ref, d.stencil_back.func_mask, d.stencil_back.write_mask, d.stencil_back.fail,
+                              d.stencil_back.zfail, d.stencil_back.zpass,
                               std::bit_cast<uint32_t>(d.bias_factor), std::bit_cast<uint32_t>(d.bias_units)};
     auto& p = g_renderer->pipelines[key];
     if (p) return p;
@@ -408,9 +432,13 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
         depth.depthWriteEnable = d.depth_write ? VK_TRUE : VK_FALSE;
         depth.depthCompareOp = compare_op(d.depth_func);
     }
+    if (d.stencil_test) {
+        depth.stencilTestEnable = VK_TRUE;
+        depth.front = stencil_state(d.stencil_front), depth.back = stencil_state(d.stencil_back);
+    }
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = 1, rendering.pColorAttachmentFormats = &format;
-    if (d.depth_test) rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat = g_renderer->depth_format;
+    if (d.depth_surface) rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat = g_renderer->depth_format;
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     info.pNext = &rendering;
     info.stageCount = 2, info.pStages = stages;
@@ -778,13 +806,17 @@ void renderer_draw(const Draw& d) {
     }
     if (target.desc.pitch != d.color.pitch) fatal("a surface at %08x drawn with pitch %u, and before with %u", d.color.address, d.color.pitch, target.desc.pitch);
     SurfaceEntry* depth = nullptr;
-    if (d.depth_test) {
+    if (d.depth_surface) {
         depth = &r.surfaces[{d.depth.address, 0x100 | d.depth.format, d.depth.width, d.depth.height}];
         if (!depth->image.image) {
             depth->desc = d.depth, depth->depth = true;
             depth->image = host::Image::create(gpu, d.depth.width, d.depth.height, r.depth_format,
                                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
             depth->staging = readback_buffer(gpu, VkDeviceSize{d.depth.width} * d.depth.height * 5, depth->coherent);
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.image = depth->image.image, vci.viewType = VK_IMAGE_VIEW_TYPE_2D, vci.format = r.depth_format;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+            host::check(vkCreateImageView(gpu.device, &vci, nullptr, &depth->attachment_view), "vkCreateImageView");
         }
         if (depth->desc.pitch != d.depth.pitch) fatal("a depth surface at %08x used with pitch %u, and before with %u", d.depth.address, d.depth.pitch, depth->desc.pitch);
         if (overlaps(d.depth.address, surface_bytes(d.depth), d.color.address, surface_bytes(d.color))) fatal("a draw's depth surface overlaps its colour surface");
@@ -982,7 +1014,7 @@ void renderer_draw(const Draw& d) {
             host::transition(cmd, depth->image.image, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, aspects(*depth));
         VkRenderingAttachmentInfo depth_attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         if (depth) {
-            depth_attachment.imageView = depth->image.view, depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depth_attachment.imageView = depth->attachment_view, depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         }
         VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -991,7 +1023,7 @@ void renderer_draw(const Draw& d) {
         VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
         rendering.renderArea = {{0, 0}, {d.color.width, d.color.height}};
         rendering.layerCount = 1, rendering.colorAttachmentCount = 1, rendering.pColorAttachments = &attachment;
-        if (depth) rendering.pDepthAttachment = &depth_attachment;
+        if (depth) rendering.pDepthAttachment = rendering.pStencilAttachment = &depth_attachment;
         vkCmdBeginRendering(cmd, &rendering);
         r.rendering = &target;
         r.rendering_depth = depth;
@@ -1042,7 +1074,9 @@ void renderer_draw(const Draw& d) {
         vkCmdDraw(cmd, d.count, 1, 0, 0);
     }
     target.written = true;
-    if (depth && d.depth_write) depth->written = true;
+    // (A depth-stencil surface is written by depth writes, and by a stencil test that may change it.)
+    const auto changes = [](const Draw::Stencil& st) { return st.write_mask && (st.fail != 0x1e00 || st.zfail != 0x1e00 || st.zpass != 0x1e00); };
+    if (depth && (d.depth_write || (d.stencil_test && (changes(d.stencil_front) || changes(d.stencil_back))))) depth->written = true;
     ++r.draws;
     ++g_stats.draws;
     g_stats.draw_ns += since(draw_start);

@@ -50,12 +50,13 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - On the owner's PC: the game starts its sound core (`bnusCoreSpu.elf`) as an SPU thread, which runs; it reads and unpacks its first packs of `RR7.DAT`, and runs on to its first drawing: it stops at the RSX method that loads a vertex program. 110 of its 248 imports and 54 of its 78 system calls are provided.
 
 ### Fixed
+- Building the game no longer needs 10 GB for one file: the SPU helpers that loop over sixteen bytes are left to MSVC's own inlining (`QILIN_SPU_BULKY`), which brings the heaviest file (`spu_p24`) to 4 GB and two minutes from six and a half. The build scripts count 5 GB per compiler.
 - The renderer no longer writes every surface back each time the RSX briefly runs out of commands mid-frame: it waits 2 ms first (labels, waits and flips still flush at once).
 - `sys_memory_allocate` could give the same address twice when blocks of both page sizes were allocated: the game's packs then overwrote one another, and it faulted going over one's table.
 - The archive's directory: a record begins with its name, not ends with it. Every pack and file had its neighbour's name since v0.5.0 (`docs/data-files.md`).
 
 ### Known
-- The lifted SPU code takes MSVC about fifteen minutes to compile, and one file over 9 GB of memory: the helpers are inlined into very large functions.
+- The heaviest lifted file (`spu_p24`) still takes MSVC 4 GB and about two minutes: its longest function is 2,500 lines.
 
 ## [0.13.0] - 2026-11-21
 

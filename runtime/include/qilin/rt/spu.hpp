@@ -18,10 +18,22 @@
 #include <cstdint>
 #include <cstring>
 
+// The helpers are forced inline: lifted code is one call of them per instruction. The bulky ones, which loop over the
+// sixteen bytes, are left to the compiler with MSVC: forced into the lifted programs' longest functions they took MSVC
+// 10 GB of memory and six and a half minutes for one file (spu_p24), against 0.6 GB and well under a minute when not.
+#if !defined(QILIN_SPU_INLINE)
 #if defined(_MSC_VER)
 #define QILIN_SPU_INLINE __forceinline
 #else
 #define QILIN_SPU_INLINE inline __attribute__((always_inline))
+#endif
+#endif
+#if !defined(QILIN_SPU_BULKY)
+#if defined(_MSC_VER)
+#define QILIN_SPU_BULKY inline
+#else
+#define QILIN_SPU_BULKY QILIN_SPU_INLINE
+#endif
 #endif
 
 namespace qilin::rt {
@@ -98,7 +110,7 @@ QILIN_SPU_INLINE SpuReg words(const SpuReg& a, const SpuReg& b, F f) {
     return {{f(a.w[0], b.w[0]), f(a.w[1], b.w[1]), f(a.w[2], b.w[2]), f(a.w[3], b.w[3])}};
 }
 template <typename F>
-QILIN_SPU_INLINE SpuReg bytes(const SpuReg& a, const SpuReg& b, F f) {
+QILIN_SPU_BULKY SpuReg bytes(const SpuReg& a, const SpuReg& b, F f) {
     SpuReg r;
     for (unsigned i = 0; i < 4; ++i) {
         uint32_t w = 0;
@@ -136,7 +148,7 @@ QILIN_SPU_INLINE void store(Spu& s, uint32_t address, const SpuReg& v) {
 
 // ---- constants ----
 // fsmbi: each of 16 bits makes a byte of ones or zeros, the top bit the first byte.
-QILIN_SPU_INLINE SpuReg fsmbi(uint32_t bits) {
+QILIN_SPU_BULKY SpuReg fsmbi(uint32_t bits) {
     SpuReg r{};
     for (unsigned i = 0; i < 16; ++i)
         if (bits & (0x8000u >> i)) set_byte(r, i, 0xff);
@@ -155,12 +167,12 @@ QILIN_SPU_INLINE SpuReg fsm(const SpuReg& a) {
     return r;
 }
 // gbb, gbh, gb: the lowest bit of each byte, halfword or word, gathered into the preferred word.
-QILIN_SPU_INLINE SpuReg gbb(const SpuReg& a) {
+QILIN_SPU_BULKY SpuReg gbb(const SpuReg& a) {
     uint32_t bits = 0;
     for (unsigned i = 0; i < 16; ++i) bits |= (byte(a, i) & 1u) << (15 - i);
     return {{bits, 0, 0, 0}};
 }
-QILIN_SPU_INLINE SpuReg gbh(const SpuReg& a) {
+QILIN_SPU_BULKY SpuReg gbh(const SpuReg& a) {
     uint32_t bits = 0;
     for (unsigned i = 0; i < 8; ++i) bits |= ((a.w[i >> 1] >> (16 - 16 * (i & 1))) & 1u) << (7 - i);
     return {{bits, 0, 0, 0}};
@@ -205,13 +217,13 @@ QILIN_SPU_INLINE SpuReg mpyhh(const SpuReg& x, const SpuReg& y) { return words(x
 QILIN_SPU_INLINE SpuReg mpyhhu(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return (p >> 16) * (q >> 16); }); }
 // clz per word, the ones in each byte, averages and differences of bytes, sums of bytes.
 QILIN_SPU_INLINE SpuReg clz(const SpuReg& x) { return words(x, [](uint32_t p) { return static_cast<uint32_t>(std::countl_zero(p)); }); }
-QILIN_SPU_INLINE SpuReg cntb(const SpuReg& x) {
+QILIN_SPU_BULKY SpuReg cntb(const SpuReg& x) {
     return bytes(x, x, [](uint32_t p, uint32_t) { return static_cast<uint32_t>(std::popcount(p)); });
 }
 QILIN_SPU_INLINE SpuReg avgb(const SpuReg& x, const SpuReg& y) { return bytes(x, y, [](uint32_t p, uint32_t q) { return (p + q + 1) >> 1; }); }
 QILIN_SPU_INLINE SpuReg absdb(const SpuReg& x, const SpuReg& y) { return bytes(x, y, [](uint32_t p, uint32_t q) { return p > q ? p - q : q - p; }); }
 // sumb: of each word, the sum of b's four bytes in the upper halfword and of a's in the lower.
-QILIN_SPU_INLINE SpuReg sumb(const SpuReg& x, const SpuReg& y) {
+QILIN_SPU_BULKY SpuReg sumb(const SpuReg& x, const SpuReg& y) {
     return words(x, y, [](uint32_t p, uint32_t q) {
         const auto sum = [](uint32_t v) { return (v >> 24) + ((v >> 16) & 0xffu) + ((v >> 8) & 0xffu) + (v & 0xffu); };
         return (sum(q) << 16) | sum(p);
@@ -243,7 +255,7 @@ QILIN_SPU_INLINE SpuReg selb(const SpuReg& x, const SpuReg& y, const SpuReg& c) 
     return r;
 }
 // shufb: each byte of c picks a byte of a (0-15) or b (16-31), or is a constant: 10xxxxxx 0x00, 110xxxxx 0xff, 111xxxxx 0x80.
-QILIN_SPU_INLINE SpuReg shufb(const SpuReg& x, const SpuReg& y, const SpuReg& c) {
+QILIN_SPU_BULKY SpuReg shufb(const SpuReg& x, const SpuReg& y, const SpuReg& c) {
     SpuReg r{};
     for (unsigned i = 0; i < 16; ++i) {
         const uint32_t pick = byte(c, i);
@@ -300,7 +312,7 @@ QILIN_SPU_INLINE SpuReg rotma(const SpuReg& x, const SpuReg& n) {
 
 // ---- shifts and rotates of the whole register ----
 // Left by bits (0 to 7), with what leaves the top lost (shift) or brought round (rotate).
-QILIN_SPU_INLINE SpuReg shift_left_bits(const SpuReg& x, unsigned bits, bool rotate) {
+QILIN_SPU_BULKY SpuReg shift_left_bits(const SpuReg& x, unsigned bits, bool rotate) {
     if (bits == 0) return x;
     SpuReg r;
     for (unsigned i = 0; i < 4; ++i) {
@@ -309,14 +321,14 @@ QILIN_SPU_INLINE SpuReg shift_left_bits(const SpuReg& x, unsigned bits, bool rot
     }
     return r;
 }
-QILIN_SPU_INLINE SpuReg shift_right_bits(const SpuReg& x, unsigned bits) {
+QILIN_SPU_BULKY SpuReg shift_right_bits(const SpuReg& x, unsigned bits) {
     if (bits == 0) return x;
     SpuReg r;
     for (unsigned i = 0; i < 4; ++i) r.w[i] = (x.w[i] >> bits) | (i > 0 ? x.w[i - 1] << (32 - bits) : 0u);
     return r;
 }
 // Left by bytes: 16 or more leaves nothing of a shift; a rotate's count is 0 to 15.
-QILIN_SPU_INLINE SpuReg shift_left_bytes(const SpuReg& x, unsigned count, bool rotate) {
+QILIN_SPU_BULKY SpuReg shift_left_bytes(const SpuReg& x, unsigned count, bool rotate) {
     SpuReg r{};
     for (unsigned i = 0; i < 16; ++i) {
         const unsigned from = i + count;
@@ -325,7 +337,7 @@ QILIN_SPU_INLINE SpuReg shift_left_bytes(const SpuReg& x, unsigned count, bool r
     }
     return r;
 }
-QILIN_SPU_INLINE SpuReg shift_right_bytes(const SpuReg& x, unsigned count) {
+QILIN_SPU_BULKY SpuReg shift_right_bytes(const SpuReg& x, unsigned count) {
     SpuReg r{};
     for (unsigned i = count; i < 16; ++i) set_byte(r, i, byte(x, i - count));
     return r;
@@ -359,7 +371,7 @@ QILIN_SPU_INLINE SpuReg clgtb(const SpuReg& x, const SpuReg& y) { return bytes(x
 
 // ---- masks for inserting one element with shufb (cbd, chd, cwd, cdd and their indexed forms) ----
 // The mask takes every byte from the second operand, but for the element at `address`'s place in a quadword, taken from the first's preferred slot.
-QILIN_SPU_INLINE SpuReg insertion_mask(uint32_t address, unsigned size) {
+QILIN_SPU_BULKY SpuReg insertion_mask(uint32_t address, unsigned size) {
     SpuReg r{{0x10111213u, 0x14151617u, 0x18191a1bu, 0x1c1d1e1fu}};
     const unsigned at = address & 0xfu & ~(size - 1);
     for (unsigned i = 0; i < size; ++i) set_byte(r, at + i, size == 8 ? i : 4 - size + i);

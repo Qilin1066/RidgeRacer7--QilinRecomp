@@ -3,14 +3,20 @@
 # to C++ and builds the game from it. Run it again after a `git pull`: only
 # what changed is rebuilt.
 #
-#   powershell -ExecutionPolicy Bypass -File tools\build-ridgeracer7.ps1 [-Game <path>] [-Run] [-ChooseGame]
+#   powershell -ExecutionPolicy Bypass -File tools\build-ridgeracer7.ps1 [-Game <path>] [-Run] [-Pull] [-Play] [-ChooseGame]
+#
+# On Windows, "Play Ridge Racer 7.bat" and "Update Ridge Racer 7.bat" in the
+# project folder run this for you: Play starts the game (building it first if
+# it isn't built), Update gets the latest code from GitHub (-Pull), rebuilds
+# what changed and starts the game.
 #
 # It needs Visual Studio 2022 17.10 or newer (with "Desktop development with
 # C++") and finds its CMake itself, from any window. -Game is your copy: the
 # disc's folder (the one holding PS3_GAME), with the decrypted EBOOT.elf
 # beside EBOOT.BIN in USRDIR (docs/elf-analysis.md says how to make it). With
 # no -Game it uses the one it used last (build-game\game-path.txt), else asks
-# with a folder picker. -Run starts the game after.
+# with a folder picker. -Run starts the game after; -Pull fetches the latest
+# code first; -Play starts it straight away if it's already built.
 #
 # The lifted code (build-game\gen) and the executable are derived from the
 # game: they stay on this PC. The first build compiles some 14,000 functions
@@ -20,6 +26,8 @@
 param(
     [string]$Game = "",
     [switch]$Run,
+    [switch]$Pull,     # get the latest code first (Update Ridge Racer 7.bat)
+    [switch]$Play,     # start the game if it's built (Play Ridge Racer 7.bat); else build it, then start it
     [switch]$ChooseGame
 )
 $ErrorActionPreference = "Stop"
@@ -33,6 +41,17 @@ $build = Join-Path $root "build-game"
 $gen = Join-Path $build "gen"
 $gameFile = Join-Path $build "game-path.txt"
 $onWindows = ($PSVersionTable.PSEdition -eq "Desktop") -or $IsWindows   # Windows PowerShell 5.1 has no $IsWindows
+
+if ($Play) {
+    $built = Join-Path $build "Release\ridgeracer7.exe"
+    if ((Test-Path $built) -and (Test-Path $gameFile)) {
+        $last = (Get-Content $gameFile -Raw).Trim()
+        Start-Process -FilePath $built -ArgumentList "`"$last`"" -WorkingDirectory (Split-Path -Parent $built)
+        exit 0
+    }
+    Write-Host "Ridge Racer 7 isn't built yet: building it now. The first build takes a long while."
+    $Run = $true
+}
 
 function Invoke-Step([string]$what, [string]$exe, [string[]]$arguments) {
     Write-Host "== $what" -ForegroundColor Cyan
@@ -61,6 +80,12 @@ if ($onWindows) {
     if (-not $haveCmake) { throw "CMake wasn't found. In the Visual Studio Installer, add 'C++ CMake tools for Windows'." }
 } elseif (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
     throw "CMake isn't installed."
+}
+
+if ($Pull) {
+    Write-Host "== Getting the latest code" -ForegroundColor Cyan
+    & git -C $root pull --ff-only
+    if ($LASTEXITCODE -ne 0) { throw "git pull failed (exit code $LASTEXITCODE). If you changed files in the project folder, that's why." }
 }
 
 # Your copy of the game: the one used last, else ask.
@@ -97,7 +122,21 @@ Invoke-Step "Translating your copy's shaders" $qilin @("shaders", $Game, "--out"
 
 # The game, from that.
 Invoke-Step "Configuring the game" "cmake" @("-S", $root, "-B", $build, "-DQILIN_GEN_DIR=$gen")
-Invoke-Step "Building the game (the first time takes a good while)" "cmake" @("--build", $build, "--config", "Release", "--target", "ridgeracer7", "--parallel")
+# How many of the game's files to compile at once: one per core, but no more
+# than the memory free now holds. The lifted SPU programs are the heavy ones:
+# Visual Studio's compiler has taken over 9 GB for one, so 12 GB are counted
+# for each, and 2 GB kept back. Given through _CL_ (which comes after the
+# project's own /MP) at build time, so a different count never rebuilds anything.
+if ($onWindows) {
+    $cores = [Environment]::ProcessorCount
+    $os = Get-CimInstance Win32_OperatingSystem
+    $memoryGB = [int][math]::Floor($os.TotalVisibleMemorySize / 1MB)
+    $freeGB = [int][math]::Floor($os.FreePhysicalMemory / 1MB)
+    $jobs = [int][math]::Max(1, [math]::Min([int]$cores, [int][math]::Floor(($freeGB - 2) / 12)))
+    Write-Host "Compiling $jobs file(s) at once ($cores cores; $freeGB of $memoryGB GB of memory free)"
+    $env:_CL_ = "/MP$jobs"
+}
+Invoke-Step "Building the game (the first time takes a long while)" "cmake" @("--build", $build, "--config", "Release", "--target", "ridgeracer7", "--parallel", "1")
 $ridgeracer7 = Find-Built "ridgeracer7"
 if (-not $ridgeracer7) { throw "built, but ridgeracer7$exe isn't where it should be" }
 

@@ -67,7 +67,7 @@ cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
 ```
 
-On Windows, double-click **`Analyse game.bat`**: it builds `qilin`, asks for your disc's folder, and writes what it reads to `analysis-out\` (never committed).
+On Windows, double-click **`Play Ridge Racer 7.bat`** to build the game from your own copy (the first time: a long while) and start it, and **`Update Ridge Racer 7.bat`** to get the latest code, rebuild what changed and start it. Both ask for your disc's folder the first time; what they build from your copy (`build-game\`) stays on your PC. They compile as many files at once as your free memory allows (12 GB counted for each). **`Analyse game.bat`** builds `qilin`, asks for your disc's folder, and writes what it reads to `analysis-out\` (never committed).
 
 ## Using it
 

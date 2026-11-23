@@ -338,6 +338,33 @@ bool step_fp(State& s, const Insn& in) {
     case Op::stfiwx: write(ea_x, 4, f[rt] & 0xffffffffu); return true;
 
     case Op::fmr: f[rt] = f[rb]; return true;
+
+    // Move From FPSCR: FPSCR into the low 32 bits of frD; the high 32 bits are undefined, taken as zero.
+    case Op::mffs: f[rt] = s.fpscr; return true;
+    // Move To FPSCR Fields: for each i in 0..7 with FM bit i set (FM's most significant bit is i = 0), FPSCR field i (bits
+    // 4i..4i+3, bit 0 the most significant) is set from the same bits of frB's low word. FEX and VX can't be set
+    // explicitly: FEX is the OR of each exception bit ANDed with its enable (VX/VE, OX/OE, UX/UE, ZX/ZE, XX/XE), VX the OR
+    // of the nine VX* bits (8-12, 21-23 and 7).
+    case Op::mtfsf: {
+        const uint32_t from = static_cast<uint32_t>(f[rb]);
+        uint32_t v = s.fpscr;
+        for (unsigned i = 0; i < 8; ++i) {
+            if (!((in.fm() >> (7 - i)) & 1)) continue;
+            for (unsigned bit = 4 * i; bit < 4 * i + 4; ++bit) {
+                const uint32_t m = 1u << (31 - bit);
+                v = (v & ~m) | (from & m);
+            }
+        }
+        const auto bit = [&](unsigned n) { return (v >> (31 - n)) & 1; };
+        unsigned vx = 0;
+        for (const unsigned n : {7u, 8u, 9u, 10u, 11u, 12u, 21u, 22u, 23u}) vx |= bit(n);
+        v = (v & ~(1u << 29)) | (vx << 29);  // VX is bit 2
+        // VX bit 2 with VE bit 24, OX 3 with OE 25, UX 4 with UE 26, ZX 5 with ZE 27, XX 6 with XE 28.
+        const unsigned fex = (bit(2) & bit(24)) | (bit(3) & bit(25)) | (bit(4) & bit(26)) | (bit(5) & bit(27)) | (bit(6) & bit(28));
+        v = (v & ~(1u << 30)) | (fex << 30);  // FEX is bit 1
+        s.fpscr = v;
+        return true;
+    }
     case Op::fneg: f[rt] = f[rb] ^ kSignBit; return true;
     case Op::fabs: f[rt] = f[rb] & ~kSignBit; return true;
     case Op::fnabs: f[rt] = f[rb] | kSignBit; return true;

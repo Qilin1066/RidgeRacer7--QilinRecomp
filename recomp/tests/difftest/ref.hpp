@@ -20,6 +20,7 @@ struct State {
     uint8_t vr[32][16] = {};  // vector registers, in the guest's byte order
     uint32_t cr = 0;
     uint64_t xer = 0, lr = 0, ctr = 0;
+    uint32_t fpscr = 0;
     uint8_t* mem = nullptr;  // guest address a is mem[a]
 };
 

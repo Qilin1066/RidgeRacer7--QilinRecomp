@@ -51,6 +51,9 @@ struct CpuHooks {
     void (*system_call)(Cpu&, uint32_t pc);            // sc: the call's number is in r11
     void (*trap)(Cpu&, uint32_t pc, const char* why);  // a trap instruction that fired; must not return
     uint64_t (*time_base)(Cpu&);                       // mftb: the time base, which counts 79,800,000 to the second on a PS3
+    // mtfsf left the FPSCR asking for what isn't provided: a rounding mode other than to nearest, non-IEEE mode, or an
+    // exception enabled (its low byte not zero). The game's must not return.
+    void (*fpscr_mode)(Cpu&, uint32_t pc);
 };
 
 // A vector register: four words, element 0 first (the guest's order), each a host integer.
@@ -78,6 +81,23 @@ struct Cpu {
         xer_bc = value & 0x7F;
     }
 };
+
+// mtfsf: the FPSCR's fields picked by the mask (bit 7 field 0, FPSCR bits 0-3) from the low word of frB's bits. FEX and VX
+// (bits 1 and 2) are summaries, not written: VX is the OR of the invalid-operation bits, FEX of the exceptions enabled.
+// (*The exception bits are only what was written: this runtime doesn't keep the flags, so a later mffs reads them back as
+// set, not as arithmetic since would have left them. A stated choice.*)
+inline uint32_t fpscr_fields(uint32_t old, unsigned fm, double b) {
+    uint32_t mask = 0;
+    for (unsigned k = 0; k < 8; ++k)
+        if ((fm >> (7 - k)) & 1) mask |= 0xF0000000u >> (4 * k);
+    uint32_t v = (old & ~mask) | (static_cast<uint32_t>(std::bit_cast<uint64_t>(b)) & mask);
+    v &= ~0x60000000u;
+    if (v & 0x01F80700u) v |= 0x20000000u;  // VX: VXSNAN, VXISI, VXIDI, VXZDZ, VXIMZ, VXVC, VXSOFT, VXSQRT, VXCVI
+    const bool fex = ((v & 0x20000000u) && (v & 0x80u)) || ((v & 0x10000000u) && (v & 0x40u)) || ((v & 0x08000000u) && (v & 0x20u)) ||
+                     ((v & 0x04000000u) && (v & 0x10u)) || ((v & 0x02000000u) && (v & 0x08u));
+    if (fex) v |= 0x40000000u;
+    return v;
+}
 
 // ---- memory: plain host memory at mem + address, in the guest's byte order ----
 QILIN_INLINE uint64_t read8(Cpu& c, uint32_t a) { return c.mem[a]; }

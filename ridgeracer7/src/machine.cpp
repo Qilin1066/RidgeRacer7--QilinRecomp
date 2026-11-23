@@ -117,7 +117,14 @@ uint64_t on_time_base(Cpu&) {
     return nanoseconds / 1000 * 798 / 10 + nanoseconds % 1000 * 798 / 10000;
 }
 
-const qilin::rt::CpuHooks kHooks{on_call, on_system_call, on_trap, on_time_base};
+// The game asked the FPSCR for a rounding mode other than to nearest, non-IEEE mode or an exception enabled: lifted
+// floating point rounds to nearest and raises nothing, so this stops rather than go on differently.
+void on_fpscr_mode(Cpu& c, uint32_t pc) {
+    fatal("at %08x: the FPSCR set to %08x (rounding mode %u, non-IEEE %u, enables %02x), which this runtime doesn't provide", pc, c.fpscr, c.fpscr & 3,
+          (c.fpscr >> 2) & 1, (c.fpscr >> 3) & 0x1f);
+}
+
+const qilin::rt::CpuHooks kHooks{on_call, on_system_call, on_trap, on_time_base, on_fpscr_mode};
 
 }  // namespace
 

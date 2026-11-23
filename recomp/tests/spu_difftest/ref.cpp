@@ -319,6 +319,23 @@ bool step(State& s, const Insn& in, uint32_t pc) {
     case Op::clgti: return each_k(4, static_cast<uint64_t>(i10), [&](uint64_t a, uint64_t b) { return all_ones(a > b, 4); });
     // The halts compare the preferred words; the immediate is sign-extended (and then, for hlgti, taken as unsigned).
     case Op::heq: s.halted = preferred(A) == preferred(B); return true;
+    // fscrwr: RA into the FPSCR; its unused bits are undefined (kept zero here). fscrrd: the FPSCR, the unused bits zero.
+    // The defined bits, by number from bit 0 (the most significant): 20-23, 29-31, 50-55, 61-63, 82-87, 93-95, 116-119,
+    // 125-127. Bits 20-23 are the rounding modes of the two double-precision slices: this runtime provides only 00 (to
+    // nearest), so another halts.
+    case Op::fscrwr:
+    case Op::fscrrd: {
+        static constexpr unsigned kDefined[][2] = {{20, 23}, {29, 31}, {50, 55}, {61, 63}, {82, 87}, {93, 95}, {116, 119}, {125, 127}};
+        uint8_t* const to = in.op == Op::fscrwr ? s.fpscr : T;
+        const uint8_t* const from = in.op == Op::fscrwr ? A : s.fpscr;
+        uint8_t v[16] = {};
+        for (const auto& range : kDefined)
+            for (unsigned bit = range[0]; bit <= range[1]; ++bit)
+                if ((from[bit / 8] >> (7 - bit % 8)) & 1) v[bit / 8] |= static_cast<uint8_t>(1u << (7 - bit % 8));
+        std::memcpy(to, v, 16);
+        if (in.op == Op::fscrwr) s.halted = (s.fpscr[2] & 0xF) != 0;  // bits 20-23: byte 2's low four
+        return true;
+    }
     case Op::hgt: s.halted = sign(preferred(A), 32) > sign(preferred(B), 32); return true;
     case Op::hlgt: s.halted = preferred(A) > preferred(B); return true;
     case Op::heqi: s.halted = sign(preferred(A), 32) == i10; return true;

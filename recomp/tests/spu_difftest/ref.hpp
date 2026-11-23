@@ -22,6 +22,7 @@ extern const size_t kCaseCount;
 // The reference's state: registers as sixteen bytes each, in the SPU's order.
 struct State {
     uint8_t r[128][16];
+    uint8_t fpscr[16] = {};  // the status and control register, bit 0 the most significant of byte 0
     uint8_t* ls = nullptr;
     bool stored = false;  // a quadword was written to the local store, at
     uint32_t stored_at = 0;

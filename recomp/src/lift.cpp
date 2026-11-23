@@ -76,7 +76,7 @@ bool in_slice(const Insn& in, std::string* why) {
     }
     if (s.flags & ppu::kFloat) {
         switch (in.op) {
-        case Op::mffs: case Op::mtfsf: case Op::mtfsfi: case Op::mtfsb0: case Op::mtfsb1: case Op::mcrfs:
+        case Op::mtfsfi: case Op::mtfsb0: case Op::mtfsb1: case Op::mcrfs:
             return no(std::format("FPSCR access ({})", s.name));
         case Op::fres: case Op::frsqrte: return no(std::format("an estimate ({})", s.name));
         default: break;
@@ -546,6 +546,14 @@ private:
         case Op::stfdux: fstore("write64", ea_x(), true, "fp::bits($)"); return true;
         case Op::stfiwx: fstore("write32", ea_x(), false, "fp::bits($)"); return true;  // the low word of the register's bits
         case Op::fmr: line(std::format("{} = {};", F(d), F(b))); return true;
+        // The FPSCR (the C library's fegetenv and fesetenv): mffs reads it into the low word, the high word 0 (*undefined in
+        // the architecture; a stated choice*); mtfsf writes fields of it (cpu.hpp), and calls the hook when that leaves a
+        // mode this runtime doesn't provide.
+        case Op::mffs: line(std::format("{} = std::bit_cast<double>(uint64_t{{c.fpscr}});", F(d))); return true;
+        case Op::mtfsf:
+            line(std::format("c.fpscr = fpscr_fields(c.fpscr, {}u, {}); if (c.fpscr & 0xFFu) {{ {} c.hooks->fpscr_mode(c, {}); {} }}", in.fm(), F(b), sync_out(),
+                             hex32(pc), sync_in()));
+            return true;
         case Op::fneg: fp1("fneg"); return true;
         case Op::fabs: fp1("fabs"); return true;
         case Op::fnabs: fp1("fnabs"); return true;

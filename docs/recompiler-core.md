@@ -241,7 +241,7 @@ The reference shares the lifter's author and the choices above for undefined res
 1. `verify_decoder.py --game`, where there is both the game and a PowerPC objdump.
 2. ✅ The control-flow pass (v0.4.0, above). Next for it: its output as JSON, and the lifter that reads it.
 3. ✅ The SPU decoder (v0.6.0) and control-flow pass (v0.7.0).
-4. 🔨 The PPU lifter: integers and control flow (v0.8.0), floating point and the time base (v0.9.0), VMX (v0.10.0). The VMX estimates (v0.13.0: the correctly rounded values, a stated choice). Left: the FPSCR, landing pads as entries. Then the SPU lifter.
+4. 🔨 The PPU lifter: integers and control flow (v0.8.0), floating point and the time base (v0.9.0), VMX (v0.10.0). The VMX estimates (v0.13.0: the correctly rounded values, a stated choice). The FPSCR's `mffs` and `mtfsf` (after v0.13.0): **all 14,294 functions lift**. Left: landing pads as entries.
 
 ## The SPU lifter (`recomp/src/spu_lift.*`, `runtime/include/qilin/rt/spu.hpp`)
 
@@ -262,6 +262,8 @@ Started after v0.13.0, when the game reached the first thing that needs an SPU p
 ### Slice 2: floating point (`runtime/include/qilin/rt/spu_fp.hpp`)
 
 **2,330 of the 2,332 functions now lift.** The two left read and write the floating-point status and control register (`fscrrd`, `fscrwr`: one program's library functions), which is not kept, as the PPU's is not.
+
+**After v0.13.0: all 2,332 lift, and all 14,294 of the PPU's.** The status registers are kept as written, not as arithmetic would set their flags (*a stated choice*: the runtime rounds to nearest and raises nothing). On the PPU, `mffs` reads the FPSCR into a register's low word (the high word, undefined, is 0) and `mtfsf` writes the fields its mask picks, with FEX and VX as their summaries; the game uses them in the C library's `fegetenv` (`0x3fc55c`) and `fesetenv` (`0x3fc184`). If `mtfsf` leaves a rounding mode other than to nearest, non-IEEE mode or an exception enabled (the low byte not 0), lifted code calls `CpuHooks::fpscr_mode`, which stops the game by name. On the SPU, `fscrwr` keeps the bits the instruction set defines (20-23, the two double-precision slices' rounding modes, and the sticky flags) and `fscrrd` reads them; a rounding mode other than to nearest halts. The other FPSCR instructions (`mtfsfi`, `mtfsb0`/`1`, `mcrfs`) and the record forms stay out: the game doesn't use them. Both differential tests start every case from a random status register and compare it after (5,498 cases, 1,404,384 runs on the PPU; 4,128 cases, 374,784 runs on the SPU; all agree), and each fails when a bit of the summaries or the defined mask is broken on purpose.
 
 The source is IBM's public *Synergistic Processor Unit Instruction Set Architecture* (version 1.2, January 2007), section 9, read from the Internet Archive's copy.
 

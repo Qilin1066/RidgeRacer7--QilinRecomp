@@ -37,9 +37,11 @@ void on_system_call(rt::Cpu&, uint32_t pc) {
     g_system_call_pc = pc;
 }
 void on_trap(rt::Cpu&, uint32_t, const char*) { throw Trapped{}; }
+bool g_did_fpscr_mode = false;
+void on_fpscr_mode(rt::Cpu&, uint32_t) { g_did_fpscr_mode = true; }
 constexpr uint64_t kTimeBase = 0x0123456789abcdefull;
 uint64_t on_time_base(rt::Cpu&) { return kTimeBase; }
-const rt::CpuHooks kHooks{on_call, on_system_call, on_trap, on_time_base};
+const rt::CpuHooks kHooks{on_call, on_system_call, on_trap, on_time_base, on_fpscr_mode};
 
 std::mt19937_64 rng(0x52523721);
 
@@ -133,6 +135,7 @@ void compare(const Case& c, const rt::Cpu& cpu, const ref::State& s, const std::
     if (cpu.xer() != s.xer) fail(c, std::format("XER: lifted {:#x}, reference {:#x}", cpu.xer(), s.xer));
     if (cpu.lr != s.lr) fail(c, std::format("LR: lifted {:#x}, reference {:#x}", cpu.lr, s.lr));
     if (cpu.ctr != s.ctr) fail(c, std::format("CTR: lifted {:#x}, reference {:#x}", cpu.ctr, s.ctr));
+    if (cpu.fpscr != s.fpscr) fail(c, std::format("FPSCR: lifted {:#x}, reference {:#x}{}", cpu.fpscr, s.fpscr, operands));
     if (std::memcmp(lifted_memory.data(), reference_memory, kWinSize) != 0) fail(c, "memory differs");
 }
 
@@ -176,6 +179,8 @@ int main() {
             cpu.xer_ov = rng() & 1;
             cpu.xer_ca = rng() & 1;
             cpu.xer_bc = rng() & 0x7f;
+            // The FPSCR: mostly a mode this runtime provides (low byte zero), sometimes not.
+            cpu.fpscr = static_cast<uint32_t>(rng()) & (rng() % 4 == 0 ? ~0u : ~0xFFu);
             for (uint8_t& b : before) b = static_cast<uint8_t>(rng());
 
             // A load or store: steer its address into the window, keeping noise above bit 31 (which the address drops).
@@ -213,11 +218,12 @@ int main() {
             s.xer = cpu.xer();
             s.lr = cpu.lr;
             s.ctr = cpu.ctr;
+            s.fpscr = cpu.fpscr;
             s.mem = space.base();
 
             // ---- lifted ----
             std::memcpy(window, before.data(), kWinSize);
-            g_did_call = g_did_system_call = false;
+            g_did_call = g_did_system_call = g_did_fpscr_mode = false;
             bool trapped = false;
             try {
                 c.fn(cpu);
@@ -275,6 +281,8 @@ int main() {
             if (g_did_call != expect_call) fail(c, std::format("jump through a register: lifted {}, reference {}", g_did_call, expect_call));
             else if (expect_call && g_called != expect_target) fail(c, std::format("jump target: lifted {:#x}, reference {:#x}", g_called, expect_target));
             if (g_did_system_call != expect_system_call) fail(c, "system call hook");
+            const bool expect_fpscr_mode = in.op == ppu::Op::mtfsf && (s.fpscr & 0xFF) != 0;
+            if (g_did_fpscr_mode != expect_fpscr_mode) fail(c, std::format("FPSCR mode hook: lifted {}, reference {}", g_did_fpscr_mode, expect_fpscr_mode));
             else if (expect_system_call && g_system_call_pc != c.pc) fail(c, "system call's address");
             compare(c, cpu, s, lifted_memory, window, operands);
         }

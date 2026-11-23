@@ -155,6 +155,11 @@ int main(int argc, char** argv) {
                     spu.r[r].w[w] = v;
                     for (unsigned b = 0; b < 4; ++b) ref.r[r][4 * w + b] = static_cast<uint8_t>(v >> (24 - 8 * b));
                 }
+            for (unsigned w = 0; w < 4; ++w) {  // the status register: any bits, mostly round to nearest
+                const uint32_t v = static_cast<uint32_t>(rng()) & (rng() % 4 == 0 ? ~0u : ~0xF00u);
+                spu.fpscr[w] = v;
+                for (unsigned b = 0; b < 4; ++b) ref.fpscr[4 * w + b] = static_cast<uint8_t>(v >> (24 - 8 * b));
+            }
             g_seen = Seen{};
             c.fn(spu);
             if (!step(ref, in, c.pc)) {
@@ -177,6 +182,10 @@ int main(int argc, char** argv) {
                 }
             if (g_seen.wrote_channel != ref.wrote_channel || g_seen.channel != ref.channel || g_seen.channel_data != ref.channel_data)
                 fail("a channel's write", (static_cast<unsigned long long>(g_seen.channel) << 32) | g_seen.channel_data, (static_cast<unsigned long long>(ref.channel) << 32) | ref.channel_data);
+            for (unsigned w = 0; w < 4; ++w) {
+                const uint32_t reference = (uint32_t{ref.fpscr[4 * w]} << 24) | (uint32_t{ref.fpscr[4 * w + 1]} << 16) | (uint32_t{ref.fpscr[4 * w + 2]} << 8) | ref.fpscr[4 * w + 3];
+                if (spu.fpscr[w] != reference) fail("the FPSCR", spu.fpscr[w], reference);
+            }
             if (g_seen.stopped != ref.stopped || g_seen.stop_code != ref.stop_code) fail("a stop", g_seen.stop_code, ref.stop_code);
             if (g_seen.halted != ref.halted) fail("a halt", g_seen.halted, ref.halted);
             halts += ref.halted;

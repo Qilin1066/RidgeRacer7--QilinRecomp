@@ -28,7 +28,7 @@ bool spu_in_slice(const Insn& in, std::string* why) {
     case Op::cflts: case Op::cfltu:
         if (in.u8() < 46 || in.u8() > 173) return no(std::format("an {} whose scale the instruction set leaves undefined", s.name));
         return true;
-    case Op::fscrrd: case Op::fscrwr: return no(std::format("the SPU's floating-point status and control register ({})", s.name));
+    case Op::fscrrd: case Op::fscrwr: return true;
     default:
         if (s.flags & spu::kFloat) return no(std::format("SPU floating point the game doesn't use ({})", s.name));
         break;
@@ -326,6 +326,13 @@ private:
         case Op::frsqest: r1("frsqest"); return true;
         case Op::fesd: r1("fesd"); return true;
         case Op::frds: r1("frds"); return true;
+        // The status and control register (spu.hpp). Double precision rounds to nearest here: another mode halts.
+        case Op::fscrrd: line(std::format("{} = spu::fscrrd(s);", R(t))); return true;
+        case Op::fscrwr:
+            line(std::format("spu::fscrwr(s, {}); if (s.fpscr[0] & 0xF00u) s.hooks->halt(s, {}, \"a double-precision rounding mode other than to nearest, "
+                             "which this runtime doesn't provide\");",
+                             R(a), hex(pc)));
+            return true;
         case Op::fma: line(std::format("{} = spu::fma({}, {}, {});", R(in.rt4()), R(a), R(b), R(t))); return true;
         case Op::fms: line(std::format("{} = spu::fms({}, {}, {});", R(in.rt4()), R(a), R(b), R(t))); return true;
         case Op::fnms: line(std::format("{} = spu::fnms({}, {}, {});", R(in.rt4()), R(a), R(b), R(t))); return true;

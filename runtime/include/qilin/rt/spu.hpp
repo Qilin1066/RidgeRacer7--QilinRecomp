@@ -57,6 +57,20 @@ struct Spu {
 namespace spu {
 
 // ---- elements ----
+// The floating-point status and control register: the bits the instruction set defines, word by word (bits 20-23 the
+// double-precision rounding modes, 29-31, 50-55, 61-63, 82-87, 93-95, 116-119 and 125-127 sticky flags). fscrwr keeps
+// only those (the others are undefined: zero, *a stated choice*), fscrrd reads them. *The flags are only what was
+// written: the runtime doesn't keep them as arithmetic would set them, a stated choice.*
+inline constexpr uint32_t kFpscrDefined[4] = {0x00000F07u, 0x00003F07u, 0x00003F07u, 0x00000F07u};
+QILIN_SPU_INLINE void fscrwr(Spu& s, const SpuReg& a) {
+    for (unsigned i = 0; i < 4; ++i) s.fpscr[i] = a.w[i] & kFpscrDefined[i];
+}
+QILIN_SPU_INLINE SpuReg fscrrd(const Spu& s) {
+    SpuReg v;
+    for (unsigned i = 0; i < 4; ++i) v.w[i] = s.fpscr[i] & kFpscrDefined[i];
+    return v;
+}
+
 QILIN_SPU_INLINE uint32_t byte(const SpuReg& v, unsigned i) { return (v.w[i >> 2] >> (24 - 8 * (i & 3))) & 0xffu; }
 QILIN_SPU_INLINE void set_byte(SpuReg& v, unsigned i, uint32_t b) {
     const unsigned shift = 24 - 8 * (i & 3);

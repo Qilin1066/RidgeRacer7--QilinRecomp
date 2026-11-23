@@ -42,6 +42,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - `RR7_ERRORS` and `RR7_FILES`: logs of the error codes handed to the game and of its file reads. `RR7_CALLS`, `RR7_DUMP` and `qilin lift --registers`, for finding a fault (`docs/runtime.md`).
 - The clock library (`cellRtc`).
 - The stencil test (both faces) in the renderer.
+- The FPSCR on the PPU (`mffs`, `mtfsf`) and the SPU (`fscrrd`, `fscrwr`), with their differential test cases: every function of the game lifts, 14,294 on the PPU and 2,332 on the SPU. A rounding mode other than to nearest, or an exception enabled, stops the game by name (`CpuHooks::fpscr_mode`, the SPU's halt).
 - State the renderer doesn't take is refused by name instead of ignored: flat shading, logic operations, the depth bounds test, two-sided vertex colours, user clip planes, polygon stipple, polygons drawn as points or lines, a window offset.
 
 ### Checked

@@ -390,9 +390,26 @@ bool Cfg::read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out
     if (!table_load || table % 4 || table < start || table >= bound) return false;
 
     // The bound: `cmplwi crN, rI, n`, and a branch on crN's "greater" bit.
-    // The nearest compare into that CR field above a branch, on its straight line.
+    // The nearest compare into that CR field above a branch, anywhere on its
+    // straight line (the compiler hoists it into the prologue, past the
+    // register saves). Anything else that writes that CR field on the way
+    // (a record form, a CR move or logical operation, a vector compare, a
+    // store conditional) ends the search.
+    const auto may_write_cr = [](const Insn& in, unsigned cr_field) {
+        switch (in.op) {
+        case Op::crand: case Op::crandc: case Op::creqv: case Op::crnand: case Op::crnor: case Op::cror: case Op::crorc: case Op::crxor:
+            return in.rd() / 4 == cr_field;  // the target bit's field
+        case Op::mcrf: case Op::mcrfs: case Op::mcrxr: case Op::fcmpu: case Op::fcmpo: return in.crfd() == cr_field;
+        case Op::mtcrf: case Op::mtocrf: return ((in.word >> 12) & 0xFFu & (0x80u >> cr_field)) != 0;  // FXM
+        case Op::stwcx_rc: case Op::stdcx_rc: return cr_field == 0;
+        default: break;
+        }
+        if (ppu::spec(in.op).name.starts_with("vcmp")) return cr_field == 6;
+        if ((ppu::spec(in.op).flags & ppu::kRc) && in.rc()) return cr_field == ((ppu::spec(in.op).flags & ppu::kFloat) ? 1u : 0u);
+        return false;
+    };
     const auto bound_above = [&](uint32_t branch, unsigned field) -> std::optional<uint32_t> {
-        for (uint32_t above = branch - 4; above >= start && above + 32 >= branch; above -= 4) {
+        for (uint32_t above = branch - 4; above >= start; above -= 4) {
             const Insn compare = insn(above);
             if (!compare.valid() || (ppu::spec(compare.op).flags & ppu::kBranch)) break;
             const bool compares = compare.op == Op::cmpli || compare.op == Op::cmpi || compare.op == Op::cmpl || compare.op == Op::cmp;
@@ -400,6 +417,7 @@ bool Cfg::read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out
                 if (compare.op == Op::cmpli && !compare.l()) return compare.uimm() + 1;
                 break;
             }
+            if (may_write_cr(compare, field)) break;
             if (above == start) break;
         }
         return std::nullopt;
@@ -415,9 +433,26 @@ bool Cfg::read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out
         head = back;
         if (back == start) break;
     }
-    // ... or the switch is a block of its own, entered only by `ble crN` after the compare.
+    // ... or the switch is a block of its own, entered only by `ble crN` after the compare (or a `b` straight after `bgt crN`).
     const Insn before = insn(head - 4);
-    const bool own_block = head > start && !before.lk() && (before.op == Op::b || ((before.op == Op::bclr || before.op == Op::bcctr || before.op == Op::bc) && (before.rd() & 0x14) == 0x14));
+    // Nothing falls into `head` from above: an unconditional jump, or another switch's table (each word up to `head` an
+    // offset to a target in this function, straight after an unconditional bctr).
+    const auto after_table = [&]() {
+        for (uint32_t x = head - 4; x > start && x + 4 * 512 >= head; x -= 4) {
+            const Insn in = insn(x);
+            if (in.op != Op::bcctr || in.lk() || (in.rd() & 0x14) != 0x14) continue;
+            if (x + 4 == head) return false;
+            for (uint32_t entry = x + 4; entry < head; entry += 4) {
+                const auto offset = elf_->read32(entry);
+                const uint32_t to = x + 4 + (offset ? *offset : 1u);
+                if (!offset || to % 4 || to < start || to >= bound) return false;
+            }
+            return true;
+        }
+        return false;
+    };
+    const bool own_block = head > start && ((!before.lk() && (before.op == Op::b || ((before.op == Op::bclr || before.op == Op::bcctr || before.op == Op::bc) && (before.rd() & 0x14) == 0x14))) ||
+                                            after_table());
     if (!checked && own_block) {
         bool agreed = true;
         for (uint32_t from = start; from < bound && agreed; from += 4) {
@@ -425,7 +460,10 @@ bool Cfg::read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out
             if ((in.op != Op::b && in.op != Op::bc) || in.lk()) continue;
             const uint32_t to = in.branch_target(from);
             if (to < head || to > table_load) continue;
-            const auto n = on_greater(in, 4) ? bound_above(from, in.ra() / 4) : std::nullopt;
+            // `ble crN` after the compare, or `bgt crN, default` and then `b` here (reached only when not greater).
+            std::optional<uint32_t> n;
+            if (on_greater(in, 4)) n = bound_above(from, in.ra() / 4);
+            else if (in.op == Op::b && !in.aa() && from >= start + 4 && on_greater(insn(from - 4), 12)) n = bound_above(from - 4, insn(from - 4).ra() / 4);
             if (!n || (checked && checked != *n)) agreed = false;
             checked = n.value_or(0);
         }

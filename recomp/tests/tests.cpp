@@ -495,6 +495,45 @@ void test_cfg() {
     }
     CHECK(cfg2->functions().at(kText).tails.contains(f));
     CHECK(cfg2->coverage().tables == 3);
+
+    // The bound's compare can be well above its branch (the compiler hoists it past the register saves), and the proof
+    // must stop at anything else that writes the same CR field. `extra` goes between `cmplwi cr7,r3,2` and `bgt cr7`.
+    const auto bound_proven = [&](const std::vector<uint32_t>& extra) -> std::optional<bool> {
+        std::vector<uint32_t> words = {0x2b830002};  // cmpli cr7,0,r3,2
+        words.insert(words.end(), extra.begin(), extra.end());
+        const size_t branch = words.size(), table = branch + 8, targets = table + 3;
+        words.push_back(0x419d0000u | static_cast<uint32_t>(4 * (targets - branch)));  // bc 12,4*cr7+gt to the first target
+        for (const uint32_t w : {0x81628010u, 0x78691788u, 0x7c09582eu, 0x7c0007b4u, 0x7c005a14u, 0x7c0903a6u, 0x4e800420u}) words.push_back(w);
+        for (uint32_t k = 0; k < 3; ++k) words.push_back(4 * (3 + k));  // offsets from the table to the three targets
+        for (int k = 0; k < 3; ++k) words.push_back(0x4e800020);  // blr, blr, blr
+        Bytes p3 = make_elf();
+        put_segment(p3, 0, 1, 5, kTextAt, kText, 0x200, 0x200, 0x10000);
+        put_section(p3, 1, 1, 1, 6, kText, kTextAt, 0x200);
+        put_be32(p3, kTextAt, 0x48000120);  // b f
+        for (size_t i = 0; i < words.size(); ++i) put_be32(p3, at + 4 * i, words[i]);
+        put_be32(p3, kDataAt + 16, f + static_cast<uint32_t>(4 * table));
+        const auto elf3 = Elf::parse(std::move(p3));
+        if (!elf3) return std::nullopt;
+        const auto cfg3 = Cfg::build(*elf3);
+        if (!cfg3 || !cfg3->functions().contains(f) || cfg3->functions().at(f).tables.size() != 1) return std::nullopt;
+        const JumpTable& t = cfg3->functions().at(f).tables[0];
+        if (t.targets.size() != 3) return std::nullopt;
+        return t.proven;
+    };
+    const std::vector<uint32_t> nops(10, 0x60000000);  // ori r0,r0,0
+    CHECK(bound_proven({}) == true);
+    CHECK(bound_proven(nops) == true);  // ten instructions up: found
+    std::vector<uint32_t> other = nops, same = nops;
+    other[4] = 0x4f5ac042;  // crnor 26,26,24: writes cr6
+    same[4] = 0x4fdee042;   // crnor 30,30,28: writes cr7, so the compare above no longer bounds the branch
+    CHECK(bound_proven(other) == true);
+    CHECK(bound_proven(same) == false);
+    std::vector<uint32_t> fcmp = nops;
+    fcmp[2] = 0xff8d0000;  // fcmpu cr7,f13,f0
+    CHECK(bound_proven(fcmp) == false);
+    std::vector<uint32_t> record = nops;
+    record[3] = 0x7c632379;  // or. r3,r3,r4: writes cr0, not cr7
+    CHECK(bound_proven(record) == true);
 }
 
 // ---------------------------------------------------------------- import names

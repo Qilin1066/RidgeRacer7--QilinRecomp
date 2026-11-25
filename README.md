@@ -2,7 +2,7 @@
 
 A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 2006) into portable C++23 with a Vulkan 1.3 renderer, for 64-bit Windows, Linux and macOS on x86-64 or ARM64. Any GPU with a Vulkan 1.3 driver is in scope, down to the Raspberry Pi 4 (Mesa 24.3+). Macs run it through MoltenVK (macOS 10.15 or later).
 
-> **No game data is included, and none ever will be; nor is any PS3 key.** You need your own copy of the game: the USA disc, `BLUS30001`, version 01.02. The tools read it from a path you give them. `.gitignore` keeps game files, and anything generated from them, out of the repository.
+> **No game data is included, and none ever will be; nor is any PS3 key.** You need your own copy of the game: the USA disc, `BLUS30001`, version 01.02. The tools read it from a path you give them.
 >
 > This is an independent project, not affiliated with or endorsed by Bandai Namco or Sony. *Ridge Racer* is Bandai Namco's trademark and *PlayStation* is Sony's.
 

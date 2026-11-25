@@ -27,6 +27,10 @@ namespace {
 constexpr int32_t kLowestPriority = 3071;
 constexpr uint64_t kJoinable = 1;  // sys_ppu_thread_create's flag
 constexpr uint32_t kStacks = 0xD0200000u, kStacksEnd = 0xE0000000u;  // other threads' stacks, each followed by a gap that is not memory
+// A stack is whole 64 KiB pages, however little is asked for: the console maps stacks in pages of that size (*a stated
+// reading*), and the game relies on it. One of its threads asks for 16 KiB and uses some 50 KB (formatting a log line),
+// which a stack of the 16 KiB asked for ran out of.
+constexpr uint32_t kStackPage = 0x10000;
 
 struct Thread {
     int32_t priority = 0;
@@ -101,7 +105,7 @@ void sys_ppu_thread_create(Cpu& c) {
     std::memcpy(guest_memory() + start.tls, guest_memory() + image.address, image.file_size);
     const std::lock_guard lock(g_mutex);
     // Its stack: whole pages, at least one.
-    const uint32_t size = static_cast<uint32_t>(std::max<uint64_t>((stack_size + 0xfff) & ~uint64_t{0xfff}, 0x1000));
+    const uint32_t size = static_cast<uint32_t>(std::max<uint64_t>((stack_size + kStackPage - 1) & ~uint64_t{kStackPage - 1}, kStackPage));
     if (size > kStacksEnd - g_next_stack) {
         c.r[3] = kEnomem;
         return;
@@ -110,6 +114,9 @@ void sys_ppu_thread_create(Cpu& c) {
     start.stack_top = g_next_stack + size;
     g_next_stack += size + 0x10000;
     start.id = g_next_id++;
+    // (A development aid, as cheap as the threads are few: where each thread's stack is, for reading a fault in one.)
+    qilin::rt::log("(thread) %08x starts at %08x: a stack of %llu bytes asked, %08x to %08x", start.id, start.code, static_cast<unsigned long long>(stack_size),
+                   start.stack_top - size, start.stack_top);
     Thread& thread = g_threads[start.id];
     thread.priority = priority;
     thread.joinable = (flags & kJoinable) != 0;
@@ -225,7 +232,7 @@ void become_guest_thread(Cpu& c, uint32_t stack_size, int32_t priority) {
     uint32_t id, stack_top;
     {
         const std::lock_guard lock(g_mutex);
-        const uint32_t size = (stack_size + 0xfff) & ~0xfffu;
+        const uint32_t size = std::max((stack_size + kStackPage - 1) & ~(kStackPage - 1), kStackPage);
         if (size > kStacksEnd - g_next_stack) qilin::rt::fatal("no room for another thread's stack (%u bytes)", size);
         commit(g_next_stack, size);
         stack_top = g_next_stack + size;

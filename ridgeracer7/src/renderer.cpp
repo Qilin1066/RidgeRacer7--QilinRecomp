@@ -197,7 +197,10 @@ struct Renderer {
     std::array<ShaderMemo, 8> recent_shaders[2];  // [0] fragment, [1] vertex
     std::map<const qilin::rt::TranslatedShader*, VkShaderModule> modules;
     std::unordered_map<PipelineKey, VkPipeline, WordsHash> pipelines;
-    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, SurfaceEntry> surfaces;  // by address, format, width, height
+    // By address, format (a depth surface's with 0x100) and pitch, the last 0: one image for a piece of memory drawn as
+    // surfaces of several sizes (a small pass drawn in the corner of a large buffer: the game sets a smaller clip), as
+    // large as the largest drawn.
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, SurfaceEntry> surfaces;
     // What each batch in flight has of its own; batch n (a count of flushes) uses batches[n % kBatchesInFlight], and is
     // waited for only when that comes round again (begin_batch).
     struct Batch {
@@ -935,36 +938,71 @@ void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s, bool discard) {
                      s.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, aspects(s));
 }
 
-// The surface entry kept for a colour surface, its image made the first time.
+void finish_batch(Renderer& r, Renderer::Batch& b);
+
+// A surface drawn larger than its image so far: the batch flushed, everything on the GPU finished (the image may be in
+// use), what the image holds written back, and the image dropped, to be made again at the larger size (from guest
+// memory, at its next use).
+void grow_surface(Renderer& r, SurfaceEntry& e, uint32_t width, uint32_t height) {
+    const host::Gpu& gpu = *r.gpu;
+    renderer_flush("a surface grown");
+    for (Renderer::Batch& b : r.batches) finish_batch(r, b);
+    if (lazy_writeback()) {
+        const std::lock_guard lock(g_pending_mutex);
+        if (e.pending) write_back_pages(e.page_from, e.page_to);
+    }
+    {
+        const std::lock_guard lock(*r.queue);
+        host::check(vkQueueWaitIdle(gpu.queue), "vkQueueWaitIdle");
+    }
+    if (e.attachment_view) vkDestroyImageView(gpu.device, e.attachment_view, nullptr), e.attachment_view = VK_NULL_HANDLE;
+    e.image.destroy(gpu);
+    e.image = {};
+    e.staging.destroy(gpu);
+    e.staging = {};
+    e.desc.width = std::max(e.desc.width, width), e.desc.height = std::max(e.desc.height, height);
+    e.resident = false, e.written_hash = 0, e.staging_batch = UINT64_MAX;
+    e.clean();
+    e.drawn_x0 = e.drawn_y0 = UINT32_MAX, e.drawn_x1 = e.drawn_y1 = 0;
+}
+
+// The surface entry kept for a colour surface (its memory, whatever part of it is drawn now), its image made the first
+// time, or again larger.
 SurfaceEntry& colour_entry(Renderer& r, const Surface& c) {
     uint32_t pixel_bytes = 0;
     const VkFormat format = surface_format(c.format, pixel_bytes);
-    SurfaceEntry& e = r.surfaces[{c.address, c.format, c.width, c.height}];
+    SurfaceEntry& e = r.surfaces[{c.address, c.format, c.pitch, 0}];
+    if (e.image.image && (c.width > e.desc.width || c.height > e.desc.height)) grow_surface(r, e, c.width, c.height);
     if (!e.image.image) {
-        e.desc = c;
-        e.image = host::Image::create(*r.gpu, c.width, c.height, format,
+        const uint32_t width = std::max(e.desc.width, c.width), height = std::max(e.desc.height, c.height);
+        e.desc = c, e.desc.width = width, e.desc.height = height;
+        // (A development aid: surfaces in main memory, where the game's commands also are, as each is first drawn.)
+        if (c.address < 0xC0000000u)
+            qilin::rt::log("(surface) colour at %08x %ux%u pitch %u format %u, in main memory", c.address, width, height, c.pitch, c.format);
+        e.image = host::Image::create(*r.gpu, width, height, format,
                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-        e.staging = readback_buffer(*r.gpu, VkDeviceSize{c.width} * c.height * 4, e.coherent);
+        e.staging = readback_buffer(*r.gpu, VkDeviceSize{width} * height * 4, e.coherent);
     }
-    if (e.desc.pitch != c.pitch) fatal("a surface at %08x drawn with pitch %u, and before with %u", c.address, c.pitch, e.desc.pitch);
     return e;
 }
 
 // And for a depth-stencil surface (Z24S8), with its view of both aspects.
 SurfaceEntry& depth_entry(Renderer& r, const Surface& z) {
-    SurfaceEntry& e = r.surfaces[{z.address, 0x100 | z.format, z.width, z.height}];
+    SurfaceEntry& e = r.surfaces[{z.address, 0x100 | z.format, z.pitch, 0}];
+    if (e.image.image && (z.width > e.desc.width || z.height > e.desc.height)) grow_surface(r, e, z.width, z.height);
     if (!e.image.image) {
         const host::Gpu& gpu = *r.gpu;
-        e.desc = z, e.depth = true;
-        e.image = host::Image::create(gpu, z.width, z.height, r.depth_format,
+        const uint32_t width = std::max(e.desc.width, z.width), height = std::max(e.desc.height, z.height);
+        e.desc = z, e.desc.width = width, e.desc.height = height, e.depth = true;
+        if (z.address < 0xC0000000u) qilin::rt::log("(surface) depth at %08x %ux%u pitch %u, in main memory", z.address, width, height, z.pitch);
+        e.image = host::Image::create(gpu, width, height, r.depth_format,
                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-        e.staging = readback_buffer(gpu, VkDeviceSize{z.width} * z.height * 5, e.coherent);
+        e.staging = readback_buffer(gpu, VkDeviceSize{width} * height * 5, e.coherent);
         VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vci.image = e.image.image, vci.viewType = VK_IMAGE_VIEW_TYPE_2D, vci.format = r.depth_format;
         vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
         host::check(vkCreateImageView(gpu.device, &vci, nullptr, &e.attachment_view), "vkCreateImageView");
     }
-    if (e.desc.pitch != z.pitch) fatal("a depth surface at %08x used with pitch %u, and before with %u", z.address, z.pitch, e.desc.pitch);
     return e;
 }
 
@@ -998,8 +1036,12 @@ void open_rendering(Renderer& r, SurfaceEntry* target, SurfaceEntry* depth, bool
     }
     VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    const Surface& area = target ? target->desc : depth->desc;
-    rendering.renderArea = {{0, 0}, {area.width, area.height}};
+    // (Both images hold at least the clip drawn; either may be larger, from a larger clip drawn before: the area is what
+    // both have.)
+    uint32_t area_width = UINT32_MAX, area_height = UINT32_MAX;
+    for (const SurfaceEntry* e : {target, depth})
+        if (e) area_width = std::min(area_width, e->desc.width), area_height = std::min(area_height, e->desc.height);
+    rendering.renderArea = {{0, 0}, {area_width, area_height}};
     rendering.layerCount = 1;
     if (target) {
         attachment.imageView = target->image.view, attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1359,8 +1401,9 @@ void renderer_draw(const Draw& d) {
             // A picture the renderer drew and holds (in this batch, or not yet written back): copied on the GPU.
             SurfaceEntry* surface = nullptr;
             if (texture_is_plain_argb(t)) {
-                const auto found = r.surfaces.find({t.address, 8u, t.rect >> 16, t.rect & 0xffff});
-                if (found != r.surfaces.end() && found->second.desc.pitch == (t.control3 & 0xfffff)) {
+                const auto found = r.surfaces.find({t.address, 8u, t.control3 & 0xfffff, 0u});
+                if (found != r.surfaces.end() && found->second.image.image && (t.rect >> 16) <= found->second.desc.width &&
+                    (t.rect & 0xffff) <= found->second.desc.height) {
                     SurfaceEntry& held = found->second;
                     bool pending = false;
                     if (lazy_writeback()) {
@@ -1454,9 +1497,16 @@ void renderer_draw(const Draw& d) {
     for (uint32_t a = 0, slot = 0; a < 16; ++a) {
         if (!(vs.inputs & (1u << a))) continue;
         const uint32_t format_word = d.attribute_format[a], stride = (format_word >> 8) & 0xff;
-        if (((format_word >> 4) & 0xf) == 0) fatal("the vertex program at %08x reads attribute %u, which the draw gives no array", vs.address, a);
         const VkDeviceSize at = vertex_at + VkDeviceSize{slot} * 16 * d.count;
         float* out = reinterpret_cast<float*>(arena_at(r, at));
+        if (((format_word >> 4) & 0xf) == 0) {
+            // No array: every vertex reads the attribute's current value, which the RSX's immediate methods set
+            // (SET_VERTEX_DATA*: none of them is sent by the game, and one would stop it as a method not provided), so
+            // the value it starts with: 0, 0, 0, 1 (*a stated choice, to be checked against the console*).
+            for (uint32_t v = 0; v < d.count; ++v) out[4 * v] = out[4 * v + 1] = out[4 * v + 2] = 0.0f, out[4 * v + 3] = 1.0f;
+            offsets[slot++] = at;
+            continue;
+        }
         decode_attributes(format_word, guest_memory() + d.attribute_address[a] + size_t{d.first} * stride, stride, d.count, out);
         if (d.logged && d.count) {
             const uint8_t* raw = guest_memory() + d.attribute_address[a] + d.first * stride;
@@ -1634,8 +1684,9 @@ void renderer_clear(const Clear& c) {
         renderer_flush("a surface overlapping one drawn");
     begin_batch(r);
     // A clear of every pixel of a surface (and, for a depth surface, of both depth and stencil) needn't read it first.
-    const auto whole = [&](const Surface& sf) { return c.x0 == 0 && c.y0 == 0 && c.x1 >= sf.width && c.y1 >= sf.height; };
-    open_rendering(r, target, depth, target && whole(c.color_surface), depth && c.depth && c.stencil && whole(c.depth_surface));
+    // (Judged by the image's size: a clear of a small clip in the corner of a larger image keeps the rest.)
+    const auto whole = [&](const SurfaceEntry& e) { return c.x0 == 0 && c.y0 == 0 && c.x1 >= e.desc.width && c.y1 >= e.desc.height; };
+    open_rendering(r, target, depth, target && whole(*target), depth && c.depth && c.stencil && whole(*depth));
     VkClearAttachment clears[2] = {};
     uint32_t n = 0;
     if (target) {
@@ -1686,8 +1737,8 @@ bool renderer_flip(uint32_t address, uint32_t pitch, uint32_t width, uint32_t he
     if (!g_renderer || !lazy_writeback()) return false;
     Renderer& r = *g_renderer;
     const host::Gpu& gpu = *r.gpu;
-    const auto found = r.surfaces.find({address, 8u, width, height});
-    if (found == r.surfaces.end() || found->second.desc.pitch != pitch) return false;
+    const auto found = r.surfaces.find({address, 8u, pitch, 0u});
+    if (found == r.surfaces.end() || !found->second.image.image || width > found->second.desc.width || height > found->second.desc.height) return false;
     const SurfaceEntry& surface = found->second;
     int index = -1;
     {

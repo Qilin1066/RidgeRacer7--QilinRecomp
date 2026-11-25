@@ -7,13 +7,17 @@
 // function is host code, so the table of lifted functions, sorted by host
 // address, names the function each return address is in.
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 #include <iterator>
+#include <thread>
 #include <vector>
 
+#include "gcm.hpp"
 #include "kernel.hpp"
 #include "qilin/rt/report.hpp"
 #include "renderer.hpp"
@@ -43,6 +47,59 @@ struct HostFunction {
 std::vector<HostFunction> g_by_host;  // sorted by host address
 uintptr_t g_guest_base = 0;
 bool g_installed = false;
+
+// RR7_WATCH_WRITES=<guest address, hex> (a development aid): the page holding it is made read-only; each write there
+// faults, is remembered (the guest thread, and the last of its instructions to touch memory) and let through, and a
+// watcher thread makes the page read-only again each millisecond, logging who wrote last whenever the word at the
+// address goes from non-zero to zero.
+std::atomic<bool> g_watching{false};
+uint32_t g_watch_address = 0;
+std::atomic<uint64_t> g_last_writer{0};  // thread << 32 | instruction
+
+// Guest pages [from, to) made read-only (true) or readable and writable; false if the host refused (not committed).
+bool protect_read_only(uint64_t from, uint64_t to, bool read_only);
+
+bool watch_fault(uint32_t guest) {
+    if (!g_watching.load(std::memory_order_relaxed)) return false;
+    const uint32_t page = guest_page_size();
+    if (guest / page != g_watch_address / page) return false;
+    const Cpu* cpu = current_cpu();
+    g_last_writer = uint64_t{current_thread()} << 32 | (cpu ? cpu->pc : 0u);
+    const uint64_t from = uint64_t{guest} / page * page;
+    protect_read_only(from, from + page, false);
+    return true;
+}
+
+void start_write_watch() {
+    const char* text = std::getenv("RR7_WATCH_WRITES");
+    if (!text) return;
+    g_watch_address = static_cast<uint32_t>(std::strtoul(text, nullptr, 16));
+    g_watching = true;
+    std::thread([] {
+        const uint32_t page = guest_page_size();
+        const uint64_t from = uint64_t{g_watch_address} / page * page;
+        // (Not before the RSX's memory is set up: the page isn't the game's until then.)
+        while (rsx_setup().io_size == 0) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        uint32_t last = 0, writes_seen = 0;
+        uint64_t last_writer = 0;
+        for (;;) {
+            protect_read_only(from, from + page, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const uint32_t now = load32(g_watch_address);
+            const uint64_t writer = g_last_writer.load();
+            if (writer != last_writer && writes_seen < 40) {
+                ++writes_seen;
+                qilin::rt::log("(watch) %08x is %08x; written last by thread %08x, its instruction at %08x", g_watch_address, now, static_cast<uint32_t>(writer >> 32),
+                               static_cast<uint32_t>(writer));
+            }
+            last_writer = writer;
+            if (last != 0 && now == 0)
+                qilin::rt::log("(watch) %08x became zero (was %08x); written last by thread %08x, its instruction at %08x", g_watch_address, last,
+                               static_cast<uint32_t>(writer >> 32), static_cast<uint32_t>(writer));
+            last = now;
+        }
+    }).detach();
+}
 
 // The guest address a host address is, if it is in the guest's memory.
 bool to_guest(uintptr_t address, uint32_t& guest) {
@@ -111,6 +168,7 @@ LONG WINAPI on_first_chance(EXCEPTION_POINTERS* info) {
     uint32_t guest = 0;
     if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 || !to_guest(static_cast<uintptr_t>(record.ExceptionInformation[1]), guest))
         return EXCEPTION_CONTINUE_SEARCH;
+    if (record.ExceptionInformation[0] == 1 && watch_fault(guest)) return EXCEPTION_CONTINUE_EXECUTION;
     return renderer_fault(guest) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -162,7 +220,8 @@ void install() {
 
 void on_signal(int signal, siginfo_t* info, void*) {
     // (A page the renderer made unreadable: its to resolve, and the access is made again when this returns.)
-    if (uint32_t guest = 0; (signal == SIGSEGV || signal == SIGBUS) && to_guest(reinterpret_cast<uintptr_t>(info->si_addr), guest) && renderer_fault(guest)) return;
+    if (uint32_t guest = 0; (signal == SIGSEGV || signal == SIGBUS) && to_guest(reinterpret_cast<uintptr_t>(info->si_addr), guest) && (watch_fault(guest) || renderer_fault(guest)))
+        return;
     describe(signal == SIGSEGV || signal == SIGBUS ? "an access" : signal == SIGILL ? "the host met an instruction it can't run" : "an arithmetic fault in host code",
              reinterpret_cast<uintptr_t>(info->si_addr), signal == SIGSEGV || signal == SIGBUS);
 #if defined(QILIN_HAS_BACKTRACE)
@@ -195,6 +254,7 @@ void report_faults(std::span<const qilin::rt::LiftedFunction> functions) {
     std::ranges::sort(g_by_host, {}, &HostFunction::host);
     install();
     g_installed = true;
+    start_write_watch();
 }
 
 bool faults_handled() { return g_installed; }
@@ -211,6 +271,18 @@ uint32_t guest_page_size() {
     }();
     return size;
 }
+
+namespace {
+bool protect_read_only(uint64_t from, uint64_t to, bool read_only) {
+    void* const at = guest_memory() + from;
+#if defined(_WIN32)
+    DWORD old = 0;
+    return VirtualProtect(at, static_cast<SIZE_T>(to - from), read_only ? PAGE_READONLY : PAGE_READWRITE, &old) != 0;
+#else
+    return mprotect(at, static_cast<size_t>(to - from), read_only ? PROT_READ : PROT_READ | PROT_WRITE) == 0;
+#endif
+}
+}  // namespace
 
 void guest_protect(uint64_t from, uint64_t to, bool access) {
     void* const at = guest_memory() + from;

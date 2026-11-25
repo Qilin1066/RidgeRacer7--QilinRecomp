@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 
+#include "gcm.hpp"
 #include "kernel.hpp"
 #include "qilin/rt/report.hpp"
 
@@ -29,6 +30,15 @@ constexpr uint64_t kEalign = 0x80010010u;
 
 std::mutex g_mutex;
 std::map<uint32_t, uint32_t> g_blocks;  // address -> size, of what is allocated
+
+// A development aid: a block given or freed over the memory the RSX reads its commands from is logged (its commands
+// were once found zeroed).
+void note_io_overlap(const char* what, uint32_t at, uint64_t size) {
+    const RsxSetup& io = rsx_setup();
+    if (io.io_size && at < uint64_t{io.io_address} + io.io_size && io.io_address < at + size)
+        qilin::rt::log("(memory) thread %08x %s %llu bytes at %08x, over the RSX's memory at %08x (%u bytes)", current_thread(), what,
+                       static_cast<unsigned long long>(size), at, io.io_address, io.io_size);
+}
 uint32_t g_used = 0;
 
 // sys_memory_allocate(size, flags, uint32_t* address)
@@ -61,6 +71,7 @@ void sys_memory_allocate(Cpu& c) {
         c.r[3] = kEnomem;
         return;
     }
+    note_io_overlap("is given", at, size);
     commit(at, static_cast<uint32_t>(size));
     std::memset(guest_memory() + at, 0, size);  // (a block given again was used before)
     g_blocks.emplace(at, static_cast<uint32_t>(size));
@@ -77,6 +88,7 @@ void sys_memory_free(Cpu& c) {
         c.r[3] = kEinval;
         return;
     }
+    note_io_overlap("frees", it->first, it->second);
     g_used -= it->second;
     g_blocks.erase(it);
     c.r[3] = kOk;

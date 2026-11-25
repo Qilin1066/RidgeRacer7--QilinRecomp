@@ -144,6 +144,7 @@ bool is_state(uint32_t method) {
 // provided are counted, not run, and at the first flip (or after ten seconds) the list is printed and
 // the process stops. It shows the work ahead at once and not one stop at a time.
 bool g_survey = false;
+uint64_t g_flip_shown_at = 0;  // the vertical blank the last flip is shown at (modes 2 and 3): the RSX's thread only
 bool g_trace = false;  // RR7_RSX_TRACE: every method and its argument, logged
 struct Surveyed {
     uint64_t count = 0;
@@ -636,12 +637,21 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
         renderer_flush("a texture-read semaphore");
         store32(label_address(r.state[0x1d6c / 4], at), argument);
         return;
-    case kMethodWaitFlip:  // (the runtime's own) wait until the last flip has been shown: a flip is shown at once here
+    case kMethodWaitFlip:  // (the runtime's own) wait until the last flip has been shown
+        if (g_flip_shown_at) wait_for_vertical_blank(g_flip_shown_at);
         return;
     case 0x1d94:  // CLEAR_SURFACE
         clear(argument, at);
         return;
     case kMethodFlip:  // (the runtime's own) show a display buffer
+        // In flip modes 2 and 3 a flip is shown at the next vertical blank. One may be waiting to be shown: the RSX goes
+        // on past a flip, and waits at the next one until the last has been shown, so it is never more than a frame
+        // ahead of the display. (Flips shown at once let the RSX's thread run ahead of the game: it reached the jump the
+        // game ends each frame's commands with before the game had written where it leads, and ran on through zeroes.)
+        if (flip_mode() != 1) {
+            if (g_flip_shown_at) wait_for_vertical_blank(g_flip_shown_at);
+            g_flip_shown_at = next_vertical_blank();
+        }
         flip(argument, at);
         return;
     // Vertex programs and their constants: uploaded a word at a time from where the load methods point.
@@ -708,6 +718,7 @@ void serve() {
     g_trace = std::getenv("RR7_RSX_TRACE") != nullptr;
     g_survey_ends = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     uint32_t idle = 0;
+    bool after_transfer = false;  // the last command was a jump, call or return
     std::chrono::steady_clock::time_point idle_since{};
     bool idle_flushed = false;
     for (;;) {
@@ -736,6 +747,23 @@ void serve() {
         const uint32_t address = rsx_io_address(r.get);
         if (!address) fatal("the RSX's get is at offset %08x, where nothing is mapped (put %08x)", r.get, put);
         const uint32_t header = load32(address);
+        // A zero word where a jump lands: the game's trampoline (it ends each frame's commands with a jump to 0x1b00,
+        // and writes there a jump on to the next frame's) not yet visible to this thread, though put has moved past it.
+        // Executed, its zeroes run on as no-ops through whatever memory follows. It is waited for, a while: what it
+        // becomes, and after how long, are logged (the first 20), and if it stays zero it is run as it is.
+        if (header == 0 && after_transfer) {
+            const auto from = std::chrono::steady_clock::now();
+            uint32_t now = 0;
+            while ((now = load32(address)) == 0 && std::chrono::steady_clock::now() - from < std::chrono::milliseconds(250)) std::this_thread::yield();
+            static int logged = 0;
+            if (logged < 20) {
+                ++logged;
+                qilin::rt::log("(rsx) a zero word where a jump landed, at offset %08x (put %08x): %08x after %lld us", r.get, put, now,
+                               static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - from).count()));
+            }
+            if (now != 0) continue;
+        }
+        bool transferred = true;  // a jump, call or return: cleared for a command
         uint32_t next;
         if ((header & 0xe0000003u) == 0x20000000u) {  // a jump, as first made
             next = header & 0x1ffffffcu;
@@ -762,6 +790,7 @@ void serve() {
             note_transfer(r.get, next);
         } else {
             if (header & 0xa0030003u) fatal("the RSX is given a command it can't read: %08x at offset %08x", header, r.get);
+            transferred = false;
             const uint32_t count = (header >> 18) & 0x7ff, method = header & 0xfffc;
             const bool same = (header & 0x40000000u) != 0;  // every argument to the one method
             for (uint32_t i = 0; i < count; ++i) {
@@ -771,6 +800,7 @@ void serve() {
             next = r.get + 4 + 4 * count;
             ++r.commands;
         }
+        after_transfer = transferred;
         r.get = next;
         store32(control + 4, next);
     }

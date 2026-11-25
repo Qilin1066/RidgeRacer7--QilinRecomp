@@ -285,14 +285,17 @@ void cellGcmSetWaitFlip(Cpu& c) { put_command(c, static_cast<uint32_t>(c.r[3]), 
 std::atomic<uint32_t> g_vblank_handler{0};
 std::atomic<uint64_t> g_vblanks{0};
 std::once_flag g_vblank_started;
+// The vertical blanks' clock: the nth at origin + n * 1001/60000 s.
+const std::chrono::steady_clock::time_point g_vblank_origin = std::chrono::steady_clock::now();
+std::chrono::steady_clock::time_point vblank_time(uint64_t n) { return g_vblank_origin + std::chrono::nanoseconds(n * 1001000000ull / 60); }
 
 void vblank_thread() {
     Cpu cpu;
     become_guest_thread(cpu, 0x10000, 0);
-    using Clock = std::chrono::steady_clock;
-    const Clock::time_point start = Clock::now();
-    for (uint64_t n = 1;; ++n) {
-        std::this_thread::sleep_until(start + std::chrono::nanoseconds(n * 1001000000ull / 60));
+    // (From the next blank on the shared clock.)
+    const auto since = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - g_vblank_origin).count();
+    for (uint64_t n = static_cast<uint64_t>(since) * 60 / 1001000000ull + 1;; ++n) {
+        std::this_thread::sleep_until(vblank_time(n));
         g_vblanks.store(n, std::memory_order_relaxed);
         if (const uint32_t handler = g_vblank_handler.load()) {
             cpu.r[3] = 1;
@@ -327,6 +330,18 @@ constexpr NativeImport kImports[] = {
 }  // namespace
 
 const RsxSetup& rsx_setup() { return g.setup; }
+
+uint32_t flip_mode() {
+    const std::lock_guard lock(g.mutex);
+    return g.flip_mode;
+}
+
+uint64_t next_vertical_blank() {
+    const auto since = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - g_vblank_origin).count();
+    return static_cast<uint64_t>(since) * 60 / 1001000000ull + 1;
+}
+
+void wait_for_vertical_blank(uint64_t n) { std::this_thread::sleep_until(vblank_time(n)); }
 
 uint32_t rsx_io_address(uint32_t offset) { return offset < g.setup.io_size ? g.setup.io_address + offset : 0; }
 

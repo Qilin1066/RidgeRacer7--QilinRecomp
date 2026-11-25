@@ -39,5 +39,11 @@ struct DisplayBuffer {
 };
 inline constexpr uint32_t kDisplayBuffers = 8;
 DisplayBuffer display_buffer(uint32_t id);
+// The flip mode the game set (cellGcmSetFlipMode): 1 shows a flip at once, 2 and 3 at the next vertical blank.
+uint32_t flip_mode();
+// The vertical blanks (59.94 a second, on the clock the vertical blank handler's thread keeps): the number of the next
+// one to come, and a wait until the nth has come.
+uint64_t next_vertical_blank();
+void wait_for_vertical_blank(uint64_t n);
 
 }  // namespace rr7

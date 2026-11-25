@@ -197,7 +197,8 @@ float state_float(uint32_t method) { return std::bit_cast<float>(r.state[method 
 
 // One draw of vertices [first, first + count), with the state the methods have left.
 void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
-    Draw d;
+    static Draw d;  // (one, reused: only the RSX's thread draws)
+    d.reset();
     // The colour surface: only surface A, linear, not antialiased, in this first renderer.
     const uint32_t format = state(0x0208);
     if (((format >> 8) & 0xf) != 1) fatal("a draw to a surface of type %u (not linear), which the renderer doesn't take yet (at offset %08x)", (format >> 8) & 0xf, at);

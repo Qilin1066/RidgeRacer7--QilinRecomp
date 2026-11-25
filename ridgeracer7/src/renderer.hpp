@@ -78,6 +78,16 @@ struct Draw {
     uint32_t depth_func = 0;
     Surface depth;
     bool logged = false;  // RR7_DRAWLOG: the renderer logs the fragment program's inline constants too
+
+    // Back to a new draw's state, its vectors emptied but keeping their storage: the RSX's thread reuses one Draw for
+    // every draw rather than allocate three vectors a draw.
+    void reset() {
+        std::vector<uint32_t> kept_indices = std::move(indices);
+        std::vector<uint8_t> kept_vertex = std::move(vertex_program), kept_fragment = std::move(fragment_program);
+        *this = Draw{};
+        kept_indices.clear(), kept_vertex.clear(), kept_fragment.clear();
+        indices = std::move(kept_indices), vertex_program = std::move(kept_vertex), fragment_program = std::move(kept_fragment);
+    }
 };
 
 // The device to draw with, and the lock every use of its queue takes (the window's presentation uses the queue too).

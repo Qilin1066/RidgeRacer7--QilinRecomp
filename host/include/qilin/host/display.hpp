@@ -51,6 +51,8 @@ public:
     // The sticks, -1 to 1 each way (y up), dead zone removed.
     void right_stick(float& x, float& y) const;
     void left_stick(float& x, float& y) const;
+    // The triggers, 0 (let go) to 1 (pulled all the way), as of the last poll.
+    void triggers(float& left, float& right) const;
     // If the mouse moved over the window since the last poll: where, over the
     // picture last presented, -1 to 1 each way (y up; beyond 1 off the picture).
     bool mouse_moved(float& x, float& y) const;

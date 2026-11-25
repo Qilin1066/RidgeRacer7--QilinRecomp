@@ -14,6 +14,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <algorithm>
+#include <cmath>
+#include <tuple>
 #include <atomic>
 #include <string>
 #include <utility>
@@ -63,7 +65,9 @@ void write_bmp(uint64_t n, const uint8_t* rgba, uint32_t width, uint32_t height)
 
 // The controller from the window's gamepad, and from the keyboard until the settings menu holds a layout (*the default
 // layout is a stated choice*: arrows the d-pad, Z cross, X circle, A square, S triangle, Q L1, W R1, 1 L2, 2 R2, Return
-// start, Backspace select). `pressed` adds buttons a test asks for (RR7_PRESS).
+// start, Backspace select). The gamepad's triggers are L2 and R2 with their pressure, so that a race's throttle and brake
+// can be held part way (down past a sixteenth; a key or a test's press is all the way). `pressed` adds buttons a test asks
+// for (RR7_PRESS).
 rr7::PadState read_pad(const qilin::host::Display& display, uint16_t pressed1, uint16_t pressed2) {
     namespace host = qilin::host;
     rr7::PadState pad;
@@ -79,8 +83,8 @@ rr7::PadState read_pad(const qilin::host::Display& display, uint16_t pressed1, u
     static constexpr Map kMap[] = {
         {host::kPadBack, "Backspace", false, 0x01, -1}, {host::kPadL3, nullptr, false, 0x02, -1},   {host::kPadR3, nullptr, false, 0x04, -1},
         {host::kPadStart, "Return", false, 0x08, -1},   {host::kPadUp, "Up", false, 0x10, 2},        {host::kPadRight, "Right", false, 0x20, 0},
-        {host::kPadDown, "Down", false, 0x40, 3},       {host::kPadLeft, "Left", false, 0x80, 1},    {host::kPadLT, "1", true, 0x01, 10},
-        {host::kPadRT, "2", true, 0x02, 11},            {host::kPadLB, "Q", true, 0x04, 8},          {host::kPadRB, "W", true, 0x08, 9},
+        {host::kPadDown, "Down", false, 0x40, 3},       {host::kPadLeft, "Left", false, 0x80, 1},    {0, "1", true, 0x01, 10},
+        {0, "2", true, 0x02, 11},                       {host::kPadLB, "Q", true, 0x04, 8},          {host::kPadRB, "W", true, 0x08, 9},
         {host::kPadY, "S", true, 0x10, 4},              {host::kPadB, "X", true, 0x20, 5},           {host::kPadA, "Z", true, 0x40, 6},
         {host::kPadX, "A", true, 0x80, 7},
     };
@@ -89,6 +93,13 @@ rr7::PadState read_pad(const qilin::host::Display& display, uint16_t pressed1, u
         if (!down) continue;
         (m.second ? pad.digital2 : pad.digital1) |= m.bit;
         if (m.pressure >= 0) pad.pressure[m.pressure] = 255;
+    }
+    float left = 0, right = 0;
+    display.triggers(left, right);
+    for (const auto& [pull, bit, place] : {std::tuple{left, uint16_t{0x01}, 10}, std::tuple{right, uint16_t{0x02}, 11}}) {
+        if (pull <= 1.0f / 16) continue;
+        pad.digital2 |= bit;
+        pad.pressure[place] = std::max(pad.pressure[place], static_cast<uint16_t>(std::lround(pull * 255.0f)));
     }
     const auto axis = [](float v) { return static_cast<uint16_t>(std::clamp(128.0f + v * 127.5f, 0.0f, 255.0f)); };
     float x = 0, y = 0;

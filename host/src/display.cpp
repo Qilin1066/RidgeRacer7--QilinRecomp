@@ -162,6 +162,7 @@ struct Display::Impl {
         }
     }
     float stick_x = 0, stick_y = 0, left_x = 0, left_y = 0;
+    float left_trigger = 0, right_trigger = 0;
     bool stick_as_dpad = true;
     bool moved = false;
     float mouse_x = 0, mouse_y = 0;  // window pixels
@@ -633,9 +634,12 @@ bool Display::poll() {
         d.stick_y = -axis(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHTY));
         d.left_x = axis(x);
         d.left_y = -axis(y);
+        d.left_trigger = std::clamp(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) / 32767.0f, 0.0f, 1.0f);
+        d.right_trigger = std::clamp(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) / 32767.0f, 0.0f, 1.0f);
         if (!d.has_gyro || !SDL_GetGamepadSensorData(p, SDL_SENSOR_GYRO, d.gyro, 3)) d.gyro[0] = d.gyro[1] = d.gyro[2] = 0;
     } else {
         d.stick_x = d.stick_y = d.left_x = d.left_y = 0;
+        d.left_trigger = d.right_trigger = 0;
         d.gyro[0] = d.gyro[1] = d.gyro[2] = 0;
     }
     if (d.pad && !d.pad_pressed && (b & ~uint32_t(kPadClick))) {
@@ -669,6 +673,10 @@ void Display::right_stick(float& x, float& y) const {
 void Display::left_stick(float& x, float& y) const {
     x = impl_->left_x;
     y = impl_->left_y;
+}
+void Display::triggers(float& left, float& right) const {
+    left = impl_->left_trigger;
+    right = impl_->right_trigger;
 }
 bool Display::mouse_moved(float& x, float& y) const {
     const Impl& d = *impl_;

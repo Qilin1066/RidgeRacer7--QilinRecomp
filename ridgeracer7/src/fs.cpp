@@ -27,6 +27,7 @@
 
 #include "kernel.hpp"
 #include "qilin/rt/report.hpp"
+#include "renderer.hpp"
 
 namespace rr7 {
 
@@ -271,6 +272,7 @@ void cellFsRead(Cpu& c) {
         return;
     }
     const int64_t from = g_trace ? tell_host(file) : 0;
+    renderer_guest_access(buffer, bytes);
     const size_t got = std::fread(guest_memory() + buffer, 1, static_cast<size_t>(bytes), file);
     if (g_trace) qilin::rt::log("(files) thread %08x read %u: %llu bytes at %lld to %08x, got %zu", current_thread(), static_cast<uint32_t>(c.r[3]), static_cast<unsigned long long>(bytes), static_cast<long long>(from), buffer, got);
     if (out) store64(out, got);
@@ -292,6 +294,7 @@ void cellFsWrite(Cpu& c) {
         return;
     }
     if (h->append) seek_host(h->file, 0, SEEK_END);
+    renderer_guest_access(buffer, bytes);
     const size_t put = std::fwrite(guest_memory() + buffer, 1, static_cast<size_t>(bytes), h->file);
     std::fflush(h->file);
     if (put != bytes) fatal("the host wrote %zu of %llu bytes to %s", put, static_cast<unsigned long long>(bytes), h->path.string().c_str());

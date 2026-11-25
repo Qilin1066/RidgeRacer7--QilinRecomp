@@ -16,6 +16,7 @@
 
 #include "kernel.hpp"
 #include "qilin/rt/report.hpp"
+#include "renderer.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -23,6 +24,8 @@
 #include <windows.h>
 #else
 #include <csignal>
+#include <sys/mman.h>
+#include <unistd.h>
 #if __has_include(<execinfo.h>)
 #include <execinfo.h>
 #define QILIN_HAS_BACKTRACE 1
@@ -39,6 +42,14 @@ struct HostFunction {
 };
 std::vector<HostFunction> g_by_host;  // sorted by host address
 uintptr_t g_guest_base = 0;
+bool g_installed = false;
+
+// The guest address a host address is, if it is in the guest's memory.
+bool to_guest(uintptr_t address, uint32_t& guest) {
+    if (!g_guest_base || address < g_guest_base || address - g_guest_base >= (uint64_t{1} << 32)) return false;
+    guest = static_cast<uint32_t>(address - g_guest_base);
+    return true;
+}
 
 // Prints the lifted functions these host addresses are in, innermost first.
 void print_guest_stack(const uintptr_t* frames, size_t count) {
@@ -93,6 +104,16 @@ void describe(const char* what, uintptr_t address, bool has_address) {
 
 #if defined(_WIN32)
 
+// Before anything else sees an access violation: one on a page the renderer made unreadable (a surface still to be
+// written back) is the renderer's to resolve, and the access is made again.
+LONG WINAPI on_first_chance(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD& record = *info->ExceptionRecord;
+    uint32_t guest = 0;
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 || !to_guest(static_cast<uintptr_t>(record.ExceptionInformation[1]), guest))
+        return EXCEPTION_CONTINUE_SEARCH;
+    return renderer_fault(guest) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
 LONG WINAPI on_exception(EXCEPTION_POINTERS* info) {
     const EXCEPTION_RECORD& record = *info->ExceptionRecord;
     switch (record.ExceptionCode) {
@@ -131,6 +152,7 @@ LONG WINAPI on_exception(EXCEPTION_POINTERS* info) {
 }
 
 void install() {
+    if (!AddVectoredExceptionHandler(1, on_first_chance)) qilin::rt::fatal("the host refused an exception handler");
     SetUnhandledExceptionFilter(on_exception);
     ULONG guarantee = 0x10000;  // room to report a used-up stack
     SetThreadStackGuarantee(&guarantee);
@@ -139,6 +161,8 @@ void install() {
 #else
 
 void on_signal(int signal, siginfo_t* info, void*) {
+    // (A page the renderer made unreadable: its to resolve, and the access is made again when this returns.)
+    if (uint32_t guest = 0; (signal == SIGSEGV || signal == SIGBUS) && to_guest(reinterpret_cast<uintptr_t>(info->si_addr), guest) && renderer_fault(guest)) return;
     describe(signal == SIGSEGV || signal == SIGBUS ? "an access" : signal == SIGILL ? "the host met an instruction it can't run" : "an arithmetic fault in host code",
              reinterpret_cast<uintptr_t>(info->si_addr), signal == SIGSEGV || signal == SIGBUS);
 #if defined(QILIN_HAS_BACKTRACE)
@@ -170,6 +194,36 @@ void report_faults(std::span<const qilin::rt::LiftedFunction> functions) {
     for (const qilin::rt::LiftedFunction& f : functions) g_by_host.push_back({reinterpret_cast<uintptr_t>(f.fn), f.address});
     std::ranges::sort(g_by_host, {}, &HostFunction::host);
     install();
+    g_installed = true;
+}
+
+bool faults_handled() { return g_installed; }
+
+uint32_t guest_page_size() {
+    static const uint32_t size = [] {
+#if defined(_WIN32)
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        return static_cast<uint32_t>(info.dwPageSize);
+#else
+        return static_cast<uint32_t>(sysconf(_SC_PAGESIZE));
+#endif
+    }();
+    return size;
+}
+
+void guest_protect(uint64_t from, uint64_t to, bool access) {
+    void* const at = guest_memory() + from;
+#if defined(_WIN32)
+    DWORD old = 0;
+    if (!VirtualProtect(at, static_cast<SIZE_T>(to - from), access ? PAGE_READWRITE : PAGE_NOACCESS, &old))
+        qilin::rt::fatal("the host refused to make guest pages %08llx to %08llx %s (error %lu)", static_cast<unsigned long long>(from), static_cast<unsigned long long>(to),
+                         access ? "readable" : "unreadable", static_cast<unsigned long>(GetLastError()));
+#else
+    if (mprotect(at, static_cast<size_t>(to - from), access ? PROT_READ | PROT_WRITE : PROT_NONE) != 0)
+        qilin::rt::fatal("the host refused to make guest pages %08llx to %08llx %s", static_cast<unsigned long long>(from), static_cast<unsigned long long>(to),
+                         access ? "readable" : "unreadable");
+#endif
 }
 
 }  // namespace rr7

@@ -26,6 +26,7 @@
 
 #include "kernel.hpp"
 #include "qilin/rt/report.hpp"
+#include "renderer.hpp"
 #include "sfo.hpp"
 
 namespace rr7 {
@@ -193,6 +194,7 @@ void auto_load_or_save(Cpu& c, bool saving) {
             std::FILE* f = std::fopen(path.string().c_str(), "rb");
             if (!f) fatal("save data %s: %s isn't there to read", name.c_str(), file.c_str());
             std::fseek(f, static_cast<long>(offset), SEEK_SET);
+            renderer_guest_access(data, size);
             done = static_cast<uint32_t>(std::fread(guest_memory() + data, 1, size, f));
             std::fclose(f);
             break;
@@ -205,6 +207,7 @@ void auto_load_or_save(Cpu& c, bool saving) {
                 return;
             }
             std::fseek(f, static_cast<long>(offset), SEEK_SET);
+            renderer_guest_access(data, size);
             done = static_cast<uint32_t>(std::fwrite(guest_memory() + data, 1, size, f));
             if (std::fclose(f) != 0 || done != size) {
                 c.r[3] = kErrorAccess;

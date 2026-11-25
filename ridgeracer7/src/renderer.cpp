@@ -5,6 +5,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -16,6 +17,7 @@
 #include <tuple>
 
 #include "kernel.hpp"
+#include "machine.hpp"
 #include "qilin/host/vulkan.hpp"
 #include "qilin/rt/report.hpp"
 #include "qilin/rt/shaders.hpp"
@@ -47,6 +49,10 @@ struct SurfaceEntry {
     uint64_t written_hash = 0;
     bool touched = false;  // drawn in the batch being recorded
     bool written = false;  // and written by a draw in it (a depth surface only tested isn't): only then copied back
+    // Its staging buffer holds what guest memory should, and its guest pages [page_from, page_to) are unreadable until
+    // it is written back there (renderer_fault). Changed only with g_pending_mutex held.
+    bool pending = false;
+    uint64_t page_from = 0, page_to = 0;
 };
 
 // A buffer the CPU reads back from: in host-cached memory where there is some (uncached memory is read a word at a time
@@ -170,12 +176,25 @@ struct Stats {
     std::atomic<uint64_t> draws{0}, flushes{0}, textures{0}, texture_bytes{0}, uploads{0};
     std::atomic<uint64_t> draw_ns{0}, texture_ns{0}, upload_ns{0}, flush_ns{0}, wait_ns{0}, writeback_ns{0};
     std::atomic<uint64_t> gpu_draw_ns{0}, gpu_copy_ns{0};  // the GPU's own time: the batch's commands, and its copies back
+    std::atomic<uint64_t> on_demand{0}, on_demand_ns{0};  // surfaces written back when touched
 };
 Stats g_stats;
 std::mutex g_flush_reasons_mutex;
 std::map<std::string, uint64_t> g_flush_reasons;  // flushes with work in them, by what asked for them
 using Clock = std::chrono::steady_clock;
 uint64_t since(Clock::time_point t) { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
+
+// The surfaces drawn and not yet written back (SurfaceEntry::pending). The lock is held while the GPU may write their
+// staging buffers (a flush's submission to its fence) and while one is written back, on whichever thread touched it.
+std::mutex g_pending_mutex;
+std::vector<SurfaceEntry*> g_pending;
+thread_local bool t_holding_pending = false;  // (a fault on a pending page with the lock held would never be resolved)
+// Whether write-back waits to be touched: decided at the first flush, by when the game runs and faults reach
+// renderer_fault.
+bool lazy_writeback() {
+    static const bool lazy = faults_handled() && !std::getenv("RR7_EAGER_WRITEBACK");
+    return lazy;
+}
 std::mutex g_present_mutex;
 std::function<void(const uint8_t*, uint32_t, uint32_t)> g_present;
 
@@ -724,11 +743,47 @@ uint64_t surface_to_guest(const SurfaceEntry& s) {
     return h;
 }
 
+// Writes back the pending surfaces on guest pages [from, to), and every pending surface sharing a page with one of those
+// (making a page readable makes it readable for all of them). g_pending_mutex held.
+void write_back_pages(uint64_t from, uint64_t to) {
+    static std::vector<SurfaceEntry*> due;  // (used only with the lock held)
+    due.clear();
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (auto it = g_pending.begin(); it != g_pending.end();) {
+            SurfaceEntry* s = *it;
+            if (s->page_from < to && from < s->page_to) {
+                from = std::min(from, s->page_from), to = std::max(to, s->page_to);
+                due.push_back(s);
+                it = g_pending.erase(it);
+                grew = true;
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (due.empty()) return;
+    const Clock::time_point start = Clock::now();
+    for (SurfaceEntry* s : due) {
+        s->pending = false;
+        guest_protect(s->page_from, s->page_to, true);
+    }
+    for (SurfaceEntry* s : due) s->written_hash = surface_to_guest(*s);
+    g_stats.on_demand += due.size();
+    g_stats.on_demand_ns += since(start);
+}
+
 // The surface from guest memory into its image, as a batch first draws to it, ready to draw to.
 void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s) {
     // (Not copied when the image already holds what guest memory does.)
     const VkImageLayout ready = s.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    if (s.resident && surface_hash(s.desc) == s.written_hash) {
+    // (Still to be written back, it can't have changed in guest memory: nothing can write there unseen.)
+    bool pending = false;
+    if (lazy_writeback()) {
+        const std::lock_guard lock(g_pending_mutex);
+        pending = s.pending;
+    }
+    if (pending || (s.resident && surface_hash(s.desc) == s.written_hash)) {
         host::transition(cmd, s.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ready, aspects(s));
         return;
     }
@@ -784,6 +839,10 @@ void renderer_flush(const char* why) {
     host::check(vkEndCommandBuffer(r.cmd), "vkEndCommandBuffer");
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1, submit.pCommandBuffers = &r.cmd;
+    // (Nothing writes a pending surface back while the GPU may be writing its staging buffer.)
+    const bool lazy = lazy_writeback();
+    std::unique_lock pending_lock(g_pending_mutex, std::defer_lock);
+    if (lazy) pending_lock.lock(), t_holding_pending = true;
     {
         const std::lock_guard lock(*r.queue);
         host::check(vkQueueSubmit(gpu.queue, 1, &submit, r.fence), "vkQueueSubmit");
@@ -800,21 +859,32 @@ void renderer_flush(const char* why) {
         g_stats.gpu_copy_ns += static_cast<uint64_t>(static_cast<double>(t[2] - t[1]) * period);
     }
     const Clock::time_point writeback_start = Clock::now();
-    // The surfaces back to guest memory: drawn, as the game expects to find them.
+    // The surfaces drawn: back to guest memory, as the game expects to find them; or pending, their pages unreadable until
+    // something touches them.
+    const uint64_t page = guest_page_size();
     for (SurfaceEntry* s : r.touched) {
-        if (!s->written) {
-            // Unchanged by the batch: the image still holds what guest memory does.
-            s->written_hash = surface_hash(s->desc);
-            s->resident = true;
-            s->touched = false;
-            continue;
-        }
-        s->written = false;
+        if (!s->written) continue;
+        s->written = false, s->touched = false, s->resident = true;
         if (!s->coherent) {
             const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s->staging.memory, 0, VK_WHOLE_SIZE};
             host::check(vkInvalidateMappedMemoryRanges(gpu.device, 1, &range), "vkInvalidateMappedMemoryRanges");
         }
-        s->written_hash = surface_to_guest(*s);
+        if (!lazy) {
+            s->written_hash = surface_to_guest(*s);
+        } else if (!s->pending) {
+            s->pending = true;
+            s->page_from = s->desc.address / page * page;
+            s->page_to = (s->desc.address + surface_bytes(s->desc) + page - 1) / page * page;
+            guest_protect(s->page_from, s->page_to, false);
+            g_pending.push_back(s);
+        }
+    }
+    if (lazy) t_holding_pending = false, pending_lock.unlock();
+    for (SurfaceEntry* s : r.touched) {
+        if (!s->touched) continue;
+        // Unchanged by the batch: the image still holds what guest memory does (or will, once written back). (Read
+        // without the lock: only a flush, on this thread, makes a surface pending.)
+        if (!s->pending) s->written_hash = surface_hash(s->desc);
         s->resident = true;
         s->touched = false;
     }
@@ -853,6 +923,36 @@ void renderer_guest_written(uint32_t address, uint64_t bytes, const char* why) {
         if (cached.checked == r.flushes && overlaps(address, bytes, cached.address, cached.bytes)) cached.checked = UINT64_MAX;
 }
 
+void renderer_guest_access(uint32_t address, uint64_t bytes) {
+    if (bytes == 0 || !renderer_started() || !lazy_writeback()) return;
+    const uint64_t page = guest_page_size();
+    const std::lock_guard lock(g_pending_mutex);
+    write_back_pages(address / page * page, (address + bytes + page - 1) / page * page);
+}
+
+bool renderer_fault(uint32_t address) {
+    if (!renderer_started() || !lazy_writeback()) return false;
+    if (t_holding_pending) fatal("the renderer touched guest memory at %08x, on a page of a surface not yet written back, while writing surfaces back", address);
+    const uint64_t page = guest_page_size(), from = address / page * page;
+    {
+        const std::lock_guard lock(g_pending_mutex);
+        t_holding_pending = true;
+        const bool ours = std::ranges::any_of(g_pending, [&](const SurfaceEntry* s) { return s->page_from <= from && from < s->page_to; });
+        if (ours) write_back_pages(from, from + page);
+        t_holding_pending = false;
+        if (ours) return true;
+    }
+    // Not a pending surface's page now. Another thread may have written it back between this fault and the lock: the
+    // access is made once more, and if it faults again at the same address, the fault was never the renderer's.
+    thread_local uint64_t retried = UINT64_MAX;
+    if (retried == address) {
+        retried = UINT64_MAX;
+        return false;
+    }
+    retried = address;
+    return true;
+}
+
 void renderer_report() {
     const auto ms = [](const std::atomic<uint64_t>& ns) { return static_cast<double>(ns.load()) / 1e6; };
     qilin::rt::log("renderer: %llu draws (%.0f ms, of which textures %.0f ms: %llu decoded, %llu MB; surfaces from guest memory %.0f ms, %llu times), "
@@ -861,6 +961,8 @@ void renderer_report() {
                    static_cast<unsigned long long>(g_stats.texture_bytes.load() >> 20), ms(g_stats.upload_ns), static_cast<unsigned long long>(g_stats.uploads.load()),
                    static_cast<unsigned long long>(g_stats.flushes.load()), ms(g_stats.flush_ns), ms(g_stats.wait_ns), ms(g_stats.writeback_ns),
                    ms(g_stats.gpu_draw_ns), ms(g_stats.gpu_copy_ns));
+    qilin::rt::log("renderer: %llu surfaces written back when touched (%.0f ms)%s", static_cast<unsigned long long>(g_stats.on_demand.load()), ms(g_stats.on_demand_ns),
+                   lazy_writeback() ? "" : " (RR7_EAGER_WRITEBACK, or faults not handled: written back at every flush)");
     const std::lock_guard lock(g_flush_reasons_mutex);
     for (const auto& [why, count] : g_flush_reasons) qilin::rt::log("renderer: %llu flushes for %s", static_cast<unsigned long long>(count), why.c_str());
 }

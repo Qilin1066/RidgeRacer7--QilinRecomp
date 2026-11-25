@@ -105,6 +105,11 @@ std::span<const qilin::rt::LiftedSpuProgram> spu_programs();
 
 // From now on a bad memory access is reported, with the guest's address and call stack, before the process stops (fault.cpp).
 void report_faults(std::span<const qilin::rt::LiftedFunction> functions);
+// Whether report_faults has run: from then on a fault on a page made unreadable with guest_protect goes to renderer_fault.
+bool faults_handled();
+// The host's page size, and guest pages [from, to) (page-aligned) made unreadable, or readable and writable again.
+uint32_t guest_page_size();
+void guest_protect(uint64_t from, uint64_t to, bool access);
 
 // The guest's memory, for native code: plain host memory at base + address.
 uint8_t* guest_memory();

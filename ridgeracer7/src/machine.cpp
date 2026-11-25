@@ -14,6 +14,7 @@
 #include "kernel.hpp"
 #include "qilin/rt/memory.hpp"
 #include "qilin/rt/report.hpp"
+#include "renderer.hpp"
 #include "syscall_names.hpp"
 
 namespace rr7 {
@@ -169,6 +170,10 @@ uint32_t native_function(void (*handler)(Cpu&)) {
 }
 
 void commit(uint32_t address, uint32_t size) {
+    // (Committing pages makes them readable again: a surface still to be written back there is written back first, or
+    // its pages would be readable while the renderer takes them for unreadable, and a later fault would write the old
+    // picture over what the game put there since.)
+    renderer_guest_access(address, size);
     if (!g_machine->space.commit(address, size)) fatal("the host refused %u bytes of memory for the guest at %08x", size, address);
 }
 

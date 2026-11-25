@@ -94,8 +94,9 @@ struct Draw {
 // The device to draw with, and the lock every use of its queue takes (the window's presentation uses the queue too).
 void renderer_start(qilin::host::Gpu& gpu, std::mutex& queue);
 bool renderer_started();
-// Draws it, into a batch: surfaces stay on the GPU until the batch is flushed, when everything drawn is written back to
-// guest memory. The RSX's thread flushes at every point where the game may look (rsx.cpp); the renderer itself when a
+// Draws it, into a batch: surfaces stay on the GPU until the batch is flushed. Then what was drawn is written back to guest
+// memory: when something first touches it (its pages are unreadable until then: renderer_fault), or at once where faults
+// aren't handled or RR7_EAGER_WRITEBACK is set. The RSX's thread flushes at every point where the game may look (rsx.cpp); the renderer itself when a
 // draw would read a surface drawn in the batch (a texture, or the same memory as another surface), or its batch is full.
 void renderer_draw(const Draw& d);
 // `why`: what asked for it, a short phrase (a timed run's report counts flushes by it).
@@ -104,6 +105,12 @@ void renderer_flush(const char* why);
 // drawn in it overlaps them (so the bytes land after what was drawn); otherwise textures the batch has read from them
 // are read again at their next use.
 void renderer_guest_written(uint32_t address, uint64_t bytes, const char* why);
+// Host code is about to read or write these guest bytes through the host's system (a file read or write): any surface
+// still to be written back there is written back first, since the system can't take a fault for it as code can.
+void renderer_guest_access(uint32_t address, uint64_t bytes);
+// A fault at this guest address (fault.cpp): true if it was on a page of a surface still to be written back, which
+// now has been, so the access can be made again.
+bool renderer_fault(uint32_t address);
 // Where the renderer's time has gone (a development aid: logged when a timed run ends).
 void renderer_report();
 

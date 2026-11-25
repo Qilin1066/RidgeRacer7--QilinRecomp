@@ -48,6 +48,7 @@ struct Rsx {
     uint32_t program_at = 0;
     std::array<float, 468 * 4> constants{};
     uint32_t constant_at = 0;
+    uint64_t constants_version = 0;  // counts writes to them: the renderer reuses its copy while this is unchanged
     // Between SET_BEGIN_END's begin and its end: the primitive, and the ranges of vertices drawn.
     uint32_t primitive = 0;
     struct Range {
@@ -298,7 +299,7 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         const uint32_t offset = state(0x1680 + 4 * a);
         d.attribute_address[a] = guest_address(offset >> 31, (offset & 0x7fffffffu) + state(0x1738), "a vertex array");
     }
-    d.vertex_constants = r.constants.data();
+    d.vertex_constants = r.constants.data(), d.constants_version = r.constants_version;
     // The vertex program: from its start to the instruction marked last, as big-endian bytes.
     {
         const uint32_t start = state(0x1ea0);
@@ -585,6 +586,7 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     if (method >= 0x1f00 && method < 0x1f80) {  // SET_TRANSFORM_CONSTANT: a word of the constants
         if (r.constant_at >= r.constants.size()) fatal("vertex constants written past the 468 (at offset %08x)", at);
         r.constants[r.constant_at++] = std::bit_cast<float>(argument);
+        ++r.constants_version;
         return;
     }
     switch (method) {

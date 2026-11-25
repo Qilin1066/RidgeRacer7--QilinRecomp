@@ -44,6 +44,7 @@ struct Draw {
     // Vertex attributes: the raw format word (SET_VERTEX_DATA_ARRAY_FORMAT) and the address of the first vertex's.
     std::array<uint32_t, 16> attribute_format{}, attribute_address{};
     const float* vertex_constants = nullptr;  // 468 vec4
+    uint64_t constants_version = 0;           // changes whenever any of them does (rsx.cpp)
     std::vector<uint8_t> vertex_program;      // its microcode, big-endian, from its first instruction to its last
     std::vector<uint8_t> fragment_program;    // likewise, as the RSX reads it (halves exchanged), with its constants
     // The viewport: the RSX's scale and offset, its clip rectangle, the window's height and origin.

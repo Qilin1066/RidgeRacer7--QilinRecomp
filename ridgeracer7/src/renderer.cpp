@@ -148,6 +148,10 @@ struct Renderer {
     bool recording = false;
     host::Buffer arena;
     VkDeviceSize arena_used = 0, align = 256;
+    // The vertex constants' copy in the arena: valid in batch `constants_batch` (a count of flushes) while the game's
+    // constants are at `constants_version`.
+    VkDeviceSize constants_at = 0;
+    uint64_t constants_batch = UINT64_MAX, constants_version = 0;
     uint32_t sets_used = 0;
     std::unordered_map<std::array<uint32_t, 6>, CachedTexture, WordsHash> textures;  // by address, format, size, pitch, remap and cube
     std::vector<SurfaceEntry*> touched;     // the surfaces it draws to
@@ -1090,8 +1094,13 @@ void renderer_draw(const Draw& d) {
         std::memcpy(arena_at(r, index_at), index_list.data(), index_list.size() * 4);
     }
     // The constants.
-    const VkDeviceSize vertex_constants_at = arena_take(r, kVertexConstants * 16);
-    std::memcpy(arena_at(r, vertex_constants_at), d.vertex_constants, kVertexConstants * 16);
+    // (The vertex constants copied again only when the game has changed them since the batch's last copy.)
+    if (r.constants_batch != r.flushes || r.constants_version != d.constants_version) {
+        r.constants_at = arena_take(r, kVertexConstants * 16);
+        std::memcpy(arena_at(r, r.constants_at), d.vertex_constants, kVertexConstants * 16);
+        r.constants_batch = r.flushes, r.constants_version = d.constants_version;
+    }
+    const VkDeviceSize vertex_constants_at = r.constants_at;
     VkDeviceSize fragment_constants_at = 0;
     if (fs.constant_slot_count) {
         fragment_constants_at = arena_take(r, fs.constant_slot_count * 16);

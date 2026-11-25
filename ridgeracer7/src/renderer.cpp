@@ -950,6 +950,11 @@ void renderer_draw(const Draw& d) {
                 const uint32_t stored = (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) | p[3];
                 reinterpret_cast<uint32_t*>(arena_at(r, fragment_constants_at))[4 * i + c] = (stored << 16) | (stored >> 16);
             }
+        if (d.logged)
+            for (size_t i = 0; i < fs.constant_slot_count; ++i) {
+                const float* v = reinterpret_cast<const float*>(arena_at(r, fragment_constants_at)) + 4 * i;
+                qilin::rt::log("(draw)   fragment constant %zu (at byte %u): %g %g %g %g", i, static_cast<unsigned>(fs.constant_slots[i]), v[0], v[1], v[2], v[3]);
+            }
     }
     // Their descriptors.
     VkDescriptorSet set0;

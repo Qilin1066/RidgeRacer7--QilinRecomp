@@ -77,6 +77,7 @@ struct Draw {
     float bounds_min = 0, bounds_max = 1;
     uint32_t depth_func = 0;
     Surface depth;
+    bool logged = false;  // RR7_DRAWLOG: the renderer logs the fragment program's inline constants too
 };
 
 // The device to draw with, and the lock every use of its queue takes (the window's presentation uses the queue too).

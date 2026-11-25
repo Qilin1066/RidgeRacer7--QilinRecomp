@@ -120,7 +120,7 @@ void cellAtracSetDataAndGetMemSize(Cpu& c) {
     if (!a.frame_bytes || !a.total) fatal("cellAtracSetDataAndGetMemSize: an ATRAC file with no frame size or samples");
     a.file_size = uint64_t{a.data_offset} + a.data_size;
     a.on_memory = read >= a.file_size;
-    if (!a.on_memory && size % a.frame_bytes) fatal("an ATRAC stream through a buffer of %u bytes, not whole frames of %u", size, a.frame_bytes);
+    if (!a.on_memory && size < a.frame_bytes) fatal("an ATRAC stream through a buffer of %u bytes, less than a frame of %u", size, a.frame_bytes);
     a.delivered = a.read_at = read;
     a.consumed = a.decode_at = a.data_offset;
     store32(work, 0x10000);
@@ -249,8 +249,12 @@ void cellAtracDecode(Cpu& c) {
             c.r[3] = kNoData;
             return;
         }
-        const uint32_t at = static_cast<uint32_t>(a.consumed % a.buffer_size);  // (whole frames: no wrap inside one)
-        std::memcpy(frame.data(), guest_memory() + a.buffer + at, a.frame_bytes);
+        // Stream positions are file positions, and the frames start after the header, which isn't a whole number of frames:
+        // so a frame can run over the ring's end and go on at its start.
+        const uint32_t at = static_cast<uint32_t>(a.consumed % a.buffer_size);
+        const uint32_t first_part = std::min(a.frame_bytes, a.buffer_size - at);
+        std::memcpy(frame.data(), guest_memory() + a.buffer + at, first_part);
+        std::memcpy(frame.data() + first_part, guest_memory() + a.buffer, a.frame_bytes - first_part);
         a.consumed += a.frame_bytes;
     }
     // The samples this frame holds, in the decoded stream (with the delay), and those this pass keeps.

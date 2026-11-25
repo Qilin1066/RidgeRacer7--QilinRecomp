@@ -365,6 +365,7 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
     ++g_frame_draws;
     if (d.color.address < kRsxLocal) g_frame_main_memory = true;
     if (draw_logged()) {
+        d.logged = true;
         uint32_t textures = 0;
         for (uint32_t u = 0; u < 16; ++u) textures |= d.textures[u].enabled() && d.textures[u].format ? 1u << u : 0;
         qilin::rt::log("(draw) surface %08x %ux%u format %u mask %08x | depth %s func %#x write %d at %08x | blend %d %08x %08x eq %08x | alpha test %d | prim %u, %u vertices%s | cull %d | textures %#x | vp %08x fp %08x",

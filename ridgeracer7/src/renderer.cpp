@@ -113,15 +113,17 @@ uint64_t hash_bytes(const uint8_t* p, size_t n) {
 constexpr uint32_t kMostSets = 1024;                   // descriptor sets in a batch
 constexpr VkDeviceSize kArenaBytes = 64u << 20;        // vertices, indices, constants and texels of a batch
 
-// A pipeline's key: the programs and every piece of state that goes into it (pipeline_for), as words.
-using PipelineKey = std::array<uint32_t, 39>;
-struct PipelineKeyHash {
-    size_t operator()(const PipelineKey& key) const noexcept {
+// A hash of a key made of words, for the renderer's hash tables.
+struct WordsHash {
+    template <size_t N>
+    size_t operator()(const std::array<uint32_t, N>& key) const noexcept {
         uint64_t h = 0x9e3779b97f4a7c15ull;
         for (const uint32_t w : key) h = (h ^ w) * 0xff51afd7ed558ccdull;
         return static_cast<size_t>(h ^ (h >> 32));
     }
 };
+// A pipeline's key: the programs and every piece of state that goes into it (pipeline_for), as words.
+using PipelineKey = std::array<uint32_t, 39>;
 
 struct Renderer {
     host::Gpu* gpu = nullptr;
@@ -140,14 +142,14 @@ struct Renderer {
     };
     std::array<ShaderMemo, 8> recent_shaders[2];  // [0] fragment, [1] vertex
     std::map<const qilin::rt::TranslatedShader*, VkShaderModule> modules;
-    std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> pipelines;
+    std::unordered_map<PipelineKey, VkPipeline, WordsHash> pipelines;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, SurfaceEntry> surfaces;  // by address, format, width, height
     // The batch being recorded (renderer.hpp).
     bool recording = false;
     host::Buffer arena;
     VkDeviceSize arena_used = 0, align = 256;
     uint32_t sets_used = 0;
-    std::map<std::array<uint32_t, 6>, CachedTexture> textures;  // by address, format, size, pitch and remap
+    std::unordered_map<std::array<uint32_t, 6>, CachedTexture, WordsHash> textures;  // by address, format, size, pitch, remap and cube
     std::vector<SurfaceEntry*> touched;     // the surfaces it draws to
     SurfaceEntry* rendering = nullptr;      // the surface a rendering instance is open on
     SurfaceEntry* rendering_depth = nullptr;  // and its depth surface, if any

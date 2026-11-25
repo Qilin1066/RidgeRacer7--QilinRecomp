@@ -78,7 +78,11 @@ void run_thread(Start start) {
         Thread& self = g_threads[start.id];
         self.finished = true;
         self.exit_value = value;
-        if (!self.joinable) self.host.detach();  // nobody will join it: the host thread ends by itself
+        if (!self.joinable) {
+            // A detach syscall may already have detached the running host.
+            if (self.host.joinable()) self.host.detach();
+            g_threads.erase(start.id);
+        }
     }
     g_finished.notify_all();
 }
@@ -171,12 +175,13 @@ void sys_ppu_thread_detach(Cpu& c) {
         c.r[3] = kEsrch;
         return;
     }
-    if (!it->second.joinable) {
+    if (!it->second.joinable || it->second.joined) {
         c.r[3] = kEinval;
         return;
     }
     it->second.joinable = false;
     if (it->second.host.joinable()) it->second.host.detach();
+    if (it->second.finished) g_threads.erase(it);
     c.r[3] = kOk;
 }
 
@@ -264,3 +269,4 @@ std::span<const NativeSystemCall> thread_system_calls() { return kCalls; }
 std::span<const NativeImport> thread_imports() { return kImports; }
 
 }  // namespace rr7
+

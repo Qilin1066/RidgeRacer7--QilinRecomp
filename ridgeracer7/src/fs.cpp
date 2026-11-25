@@ -208,6 +208,14 @@ void cellFsOpen(Cpu& c) {
         c.r[3] = kEexist;
         return;
     }
+    // Reserve a descriptor before any creation/truncation: a failed open
+    // must not change the file when the descriptor table is full.
+    const std::lock_guard lock(g_mutex);
+    const uint32_t fd = free_descriptor();
+    if (!fd) {
+        c.r[3] = kEmfile;
+        return;
+    }
     // The host's mode: reading alone; or writing, on a file made or emptied first if that was asked.
     const char* mode = "rb";
     if (writing) {
@@ -220,12 +228,6 @@ void cellFsOpen(Cpu& c) {
             std::fclose(made);
         }
         mode = "r+b";
-    }
-    const std::lock_guard lock(g_mutex);
-    const uint32_t fd = free_descriptor();
-    if (!fd) {
-        c.r[3] = kEmfile;
-        return;
     }
     std::FILE* file = open_host(where.host, mode);
     if (!file) fatal("cellFsOpen(%s): the host won't open %s", path.c_str(), where.host.string().c_str());
@@ -257,16 +259,15 @@ void cellFsClose(Cpu& c) {
 void cellFsRead(Cpu& c) {
     const uint32_t buffer = static_cast<uint32_t>(c.r[4]), out = static_cast<uint32_t>(c.r[6]);
     const uint64_t bytes = c.r[5];
-    std::FILE* file;
-    {
-        const std::lock_guard lock(g_mutex);
-        Handle* h = handle(c.r[3], false);
-        if (!h) {
-            c.r[3] = kEbadf;
-            return;
-        }
-        file = h->file;
+    // Keep the handle alive through the read, as write and seek do. Another
+    // guest thread may close it while this thread waits for renderer access.
+    const std::lock_guard lock(g_mutex);
+    Handle* h = handle(c.r[3], false);
+    if (!h) {
+        c.r[3] = kEbadf;
+        return;
     }
+    std::FILE* const file = h->file;
     if (bytes > (uint64_t{1} << 32) - buffer) {
         c.r[3] = kEfault;
         return;
@@ -446,3 +447,4 @@ constexpr NativeImport kImports[] = {
 std::span<const NativeImport> fs_imports() { return kImports; }
 
 }  // namespace rr7
+

@@ -88,6 +88,16 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ### Known
 - The heaviest lifted file (`spu_p24`) still takes MSVC 4 GB and about two minutes: its longest function is 2,500 lines.
 
+## [0.13.1] - 2026-11-25
+
+### Fixed
+- Detaching a running PPU thread no longer detaches its host thread a second time at exit. Detached threads retire their bookkeeping; detaching a thread already claimed by a join is rejected.
+- File reads keep their descriptor locked until the read completes, so another guest thread cannot close the host file underneath them.
+- File creation and truncation check descriptor availability first. A full handle table leaves existing files intact and does not create new files.
+
+### Tests
+- Added game-free tests of the real file/thread syscalls: descriptor exhaustion, a controlled read/close race, detached-thread exit and a normal join. The first three fail against the previous code; they pass with the fixes.
+
 ## [0.13.0] - 2026-11-21
 
 The game runs to the start of SPURS; the window layer is in.
@@ -306,3 +316,4 @@ The start of the project: the tools that read the game. Nothing runs yet.
 
 ### Checked
 - On the owner's disc (USA, `BLUS30001`, version 01.02): `PARAM.SFO` and the SELF's plain header read, and `EBOOT.BIN` recognised by its SHA-256. The results are in `docs/elf-analysis.md`: 4.25 MB of code, 14,046 function descriptors, 248 functions imported from 22 system libraries, C++ unwinding tables, SPURS, and a 1 MB section that is probably the SPU programs. The program was built with SDK 1.02 from `libc`, `libm`, `libstdc++` and the graphics library's command writers.
+

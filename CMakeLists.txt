@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(RidgeRacer7QilinRecomp VERSION 0.13.0 LANGUAGES C CXX)
+project(RidgeRacer7QilinRecomp VERSION 0.13.1 LANGUAGES C CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -117,6 +117,15 @@ qilin_tool(qilin)
 target_compile_definitions(qilin PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 
 enable_testing()
+find_package(Threads REQUIRED)
+add_executable(ridgeracer7_runtime_io_test ridgeracer7/tests/runtime_io_test.cpp
+    ridgeracer7/src/fs.cpp ridgeracer7/src/threads.cpp)
+target_include_directories(ridgeracer7_runtime_io_test PRIVATE recomp/src runtime/include ridgeracer7/src)
+target_link_libraries(ridgeracer7_runtime_io_test PRIVATE qilin_warnings Threads::Threads)
+foreach(case open read-close threads)
+    add_test(NAME ridgeracer7_runtime_io_${case} COMMAND ridgeracer7_runtime_io_test ${case})
+    set_tests_properties(ridgeracer7_runtime_io_${case} PROPERTIES TIMEOUT 20)
+endforeach()
 add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_game qilin_recomp qilin_warnings)
 qilin_tool(qilin_tests)
@@ -339,3 +348,4 @@ else()
     set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/spu_difftest_cases.cpp PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 add_test(NAME qilin_spu_difftest COMMAND qilin_spu_difftest)
+

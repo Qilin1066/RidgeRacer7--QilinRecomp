@@ -1467,7 +1467,7 @@ void renderer_clear(const Clear& c) {
     }
     if (depth) {
         // Depth as depth_to_host makes it: d / (2^24 - 1).
-        clears[n].aspectMask = (c.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u) | (c.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        clears[n].aspectMask = (c.depth ? VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT} : VkImageAspectFlags{0}) | (c.stencil ? VkImageAspectFlags{VK_IMAGE_ASPECT_STENCIL_BIT} : VkImageAspectFlags{0});
         clears[n].clearValue.depthStencil = {static_cast<float>(c.depth_value >> 8) / 16777215.0f, c.depth_value & 0xffu};
         ++n;
     }

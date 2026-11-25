@@ -130,6 +130,16 @@ std::string texture_extent(const TextureUnit& t, size_t& guest_bytes) {
     return {};
 }
 
+bool texture_is_plain_argb(const TextureUnit& t) {
+    const uint32_t f = (t.format >> 8) & 0x1f, levels = (t.format >> 16) & 0xffff;
+    const bool linear = (t.format >> 13) & 1, cube = (t.format & 4) != 0;
+    if (f != kA8R8G8B8 || !linear || cube || levels != 1 || ((t.format >> 4) & 0xf) != 2 || ((t.format >> 14) & 1) || (t.control3 >> 20) != 1) return false;
+    // The remap as stored: each output (A, R, G, B) its own input.
+    for (unsigned c = 0; c < 4; ++c)
+        if (((t.remap >> (2 * c)) & 3) != c || ((t.remap >> (8 + 2 * c)) & 3) != 2) return false;
+    return (t.remap >> 16) == 0;
+}
+
 std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& out) {
     if (size_t bytes = 0; !texture_extent(t, bytes).empty()) return texture_extent(t, bytes);
     const uint32_t f = (t.format >> 8) & 0x1f;

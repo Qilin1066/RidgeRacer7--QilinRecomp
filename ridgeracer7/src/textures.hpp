@@ -32,6 +32,10 @@ struct Texels {
 // success; otherwise what isn't taken.
 std::string texture_extent(const TextureUnit& t, size_t& guest_bytes);
 
+// Whether a texture's texels are a colour surface's pixels as the renderer's image holds them: 2D, linear A8R8G8B8, one
+// level, its channels as stored (the renderer then copies the surface's image on the GPU instead of reading guest memory).
+bool texture_is_plain_argb(const TextureUnit& t);
+
 // Reads a texture's texels from `memory` (guest memory). An empty string on success; otherwise what isn't taken, and
 // the texture is not read.
 std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& out);

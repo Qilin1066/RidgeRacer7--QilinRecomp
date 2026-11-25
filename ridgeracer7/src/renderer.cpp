@@ -237,6 +237,7 @@ struct Stats {
     std::atomic<uint64_t> draw_ns{0}, texture_ns{0}, upload_ns{0}, flush_ns{0}, wait_ns{0}, writeback_ns{0};
     std::atomic<uint64_t> gpu_draw_ns{0}, gpu_copy_ns{0};  // the GPU's own time: the batch's commands, and its copies back
     std::atomic<uint64_t> on_demand{0}, on_demand_ns{0};  // surfaces written back when touched
+    std::atomic<uint64_t> surface_textures{0};            // textures copied from a surface on the GPU
 };
 Stats g_stats;
 std::mutex g_flush_reasons_mutex;
@@ -747,9 +748,10 @@ bool touched_overlap(const Renderer& r, uint32_t address, uint64_t bytes, const 
 // A development aid: the first 40 times a draw's surface or texture overlaps a surface drawn in the batch (each one a
 // flush), what each is, so that the cases worth keeping on the GPU are known.
 void log_conflict(const Renderer& r, const char* what, uint32_t address, uint32_t format, uint32_t width, uint32_t height, uint32_t pitch) {
-    static int logged = 0;
-    if (logged >= 40) return;
-    ++logged;
+    static int logged[2] = {};  // (surfaces, textures: 40 each)
+    int& count = logged[what[0] == 't' ? 1 : 0];
+    if (count >= 40) return;
+    ++count;
     for (const SurfaceEntry* s : r.touched)
         if (overlaps(address, uint64_t{pitch ? pitch : width * 4} * height, s->desc.address, surface_bytes(s->desc)))
             qilin::rt::log("(conflict) %s at %08x format %08x %ux%u pitch %u overlaps the %s surface at %08x format %u %ux%u pitch %u", what, address, format, width,
@@ -1223,6 +1225,7 @@ void renderer_report() {
                    static_cast<unsigned long long>(g_stats.texture_bytes.load() >> 20), ms(g_stats.upload_ns), static_cast<unsigned long long>(g_stats.uploads.load()),
                    static_cast<unsigned long long>(g_stats.flushes.load()), ms(g_stats.flush_ns), ms(g_stats.wait_ns), ms(g_stats.writeback_ns),
                    ms(g_stats.gpu_draw_ns), ms(g_stats.gpu_copy_ns));
+    qilin::rt::log("renderer: %llu textures copied from surfaces on the GPU", static_cast<unsigned long long>(g_stats.surface_textures.load()));
     qilin::rt::log("renderer: %llu surfaces written back when touched (%.0f ms)%s", static_cast<unsigned long long>(g_stats.on_demand.load()), ms(g_stats.on_demand_ns),
                    lazy_writeback() ? "" : " (RR7_EAGER_WRITEBACK, or faults not handled: written back at every flush)");
     const std::lock_guard lock(g_flush_reasons_mutex);
@@ -1337,6 +1340,9 @@ void renderer_draw(const Draw& d) {
         bool decode;    // its texels changed (or are new): decoded, and uploaded in this draw
         Texels texels;  // when decoded
         VkSampler sampler;
+        // A colour surface the renderer holds whose pixels the texture is (texture_is_plain_argb): copied from its image on
+        // the GPU, not read from guest memory (where they may not be yet).
+        SurfaceEntry* surface;
     };
     static std::vector<Upload> uploads;  // (kept between draws, emptied below: only the RSX's thread draws)
     const Clock::time_point texture_start = Clock::now();
@@ -1350,12 +1356,27 @@ void renderer_draw(const Draw& d) {
             size_t bytes = 0;
             if (const std::string why = texture_extent(t, bytes); !why.empty())
                 fatal("texture %u (at %08x, format %08x): %s, which the renderer doesn't take yet", u, t.address, t.format, why.c_str());
-            if (touched_overlap(r, t.address, bytes, nullptr)) {
+            // A picture the renderer drew and holds (in this batch, or not yet written back): copied on the GPU.
+            SurfaceEntry* surface = nullptr;
+            if (texture_is_plain_argb(t)) {
+                const auto found = r.surfaces.find({t.address, 8u, t.rect >> 16, t.rect & 0xffff});
+                if (found != r.surfaces.end() && found->second.desc.pitch == (t.control3 & 0xfffff)) {
+                    SurfaceEntry& held = found->second;
+                    bool pending = false;
+                    if (lazy_writeback()) {
+                        const std::lock_guard lock(g_pending_mutex);
+                        pending = held.pending;
+                    }
+                    if (held.touched || pending) surface = &held;
+                }
+            }
+            if (touched_overlap(r, t.address, bytes, surface)) {
                 overlap = true;
                 log_conflict(r, "texture", t.address, t.format, t.rect >> 16, t.rect & 0xffff, t.control3 & 0xfffff);
             }
             Upload& up = uploads.emplace_back();
             up.unit = u;
+            up.surface = surface;
             up.cached = &r.textures[{t.address, t.format, t.rect, t.control3, t.remap, (fs.cube_textures >> u) & 1}];
             if (((fs.cube_textures >> u) & 1) != ((t.format >> 2) & 1))
                 fatal("the fragment program at %08x samples texture %u as %s, and it is %s", fs.address, u, (fs.cube_textures >> u) & 1 ? "a cube map" : "2D",
@@ -1363,7 +1384,13 @@ void renderer_draw(const Draw& d) {
             // Its bytes are hashed once a batch. Within one the game can't change a texture the batch has drawn with: it can't
             // know the RSX is done with it without a label, a wait or a flip, each of which ends the batch. (The texture
             // cache's invalidation doesn't change that, and the game sends one before nearly every draw.)
-            if (!up.cached->image.image || up.cached->checked != r.flushes) {
+            if (surface) {
+                // (Its texels are the surface's from now: read from guest memory again only when next it is no surface's.)
+                up.decode = false;
+                up.cached->hash = 0, up.cached->checked = UINT64_MAX;
+                up.texels.width = t.rect >> 16, up.texels.height = t.rect & 0xffff, up.texels.levels = 1, up.texels.faces = 1;
+                ++g_stats.surface_textures;
+            } else if (!up.cached->image.image || up.cached->checked != r.flushes) {
                 const uint64_t hash = hash_bytes(guest_memory() + t.address, bytes);
                 up.decode = !up.cached->image.image || up.cached->hash != hash;
                 up.cached->hash = hash;
@@ -1388,8 +1415,8 @@ void renderer_draw(const Draw& d) {
         ++g_stats.textures, g_stats.texture_bytes += up.texels.rgba.size();
     }
     g_stats.texture_ns += since(texture_start);
-    bool any_decoded = false;
-    for (const Upload& up : uploads) any_decoded = any_decoded || up.decode;
+    bool any_decoded = false;  // (or copied from a surface: either is done outside a rendering instance)
+    for (const Upload& up : uploads) any_decoded = any_decoded || up.decode || up.surface;
 
     // What the draw takes from the arena, and two descriptor sets: if the batch hasn't room, it is flushed first.
     uint32_t attributes = 0;
@@ -1500,6 +1527,20 @@ void renderer_draw(const Draw& d) {
             images[i] = {up.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             texture_writes[i].dstSet = set1, texture_writes[i].dstBinding = up.unit, texture_writes[i].descriptorCount = 1;
             texture_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_writes[i].pImageInfo = &images[i];
+            if (up.surface) {
+                // The surface's image into the texture's. (A surface drawn in this batch is a colour attachment until its
+                // flush; one waiting to be written back is as its flush left it.)
+                SurfaceEntry& from = *up.surface;
+                if (from.touched) host::transition(cmd, from.image.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                transition_texture(cmd, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VkImageCopy copy{};
+                copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.extent = {up.texels.width, up.texels.height, 1};
+                vkCmdCopyImage(cmd, from.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                transition_texture(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                if (from.touched) host::transition(cmd, from.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                continue;
+            }
             if (!up.decode) continue;
             // (Draws earlier in the batch that sampled it are ordered before this copy by the transition's barrier.)
             const VkDeviceSize at = arena_take(r, up.texels.rgba.size());

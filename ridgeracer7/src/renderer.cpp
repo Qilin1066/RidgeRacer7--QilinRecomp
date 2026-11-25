@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <unordered_map>
 #include <span>
 #include <string>
@@ -883,16 +884,18 @@ void renderer_draw(const Draw& d) {
     // drawn as lists of triangles through indices: a quad (a, b, c, d) as (a, b, c) and (a, c, d), a fan's or polygon's
     // triangles about its first vertex (*the diagonals are a stated choice*).
     // The order the vertices are drawn in: the game's indices, or the vertices one after another.
-    std::vector<uint32_t> order;
-    if (d.indexed) {
-        order = d.indices;
-    } else {
-        order.resize(d.count);
-        for (uint32_t v = 0; v < d.count; ++v) order[v] = v;
+    // (Neither copied: the game's list as the draw holds it, or a list of 0, 1, 2... kept for that, grown as needed.)
+    static std::vector<uint32_t> sequence;
+    if (!d.indexed && sequence.size() < d.count) {
+        const size_t had = sequence.size();
+        sequence.resize(d.count);
+        std::iota(sequence.begin() + static_cast<std::ptrdiff_t>(had), sequence.end(), static_cast<uint32_t>(had));
     }
+    const std::span<const uint32_t> order = d.indexed ? std::span<const uint32_t>(d.indices) : std::span<const uint32_t>(sequence.data(), d.count);
     const uint32_t n = static_cast<uint32_t>(order.size());
     VkPrimitiveTopology topology;
-    std::vector<uint32_t> indices;
+    static std::vector<uint32_t> indices;  // the triangles made here, when the primitive is one Vulkan lacks (kept: only the RSX's thread draws)
+    indices.clear();
     bool indexed = d.indexed;
     // With primitive restart, each piece between restarts is a primitive of its own: all made into a list of triangles (a
     // strip's triangles keeping their alternate windings).
@@ -938,7 +941,8 @@ void renderer_draw(const Draw& d) {
         break;
     default: fatal("a draw of primitive %u, which the renderer doesn't take yet", d.primitive);
     }
-    if (indexed && indices.empty() && d.primitive <= 6) indices = order;  // the game's own indices, as they are
+    // What the GPU is given: the triangles made here, or the game's own indices as they are.
+    const std::span<const uint32_t> index_list = indexed && indices.empty() && d.primitive <= 6 ? order : std::span<const uint32_t>(indices);
     uint32_t pixel_bytes = 0;
     const VkFormat format = surface_format(d.color.format, pixel_bytes);
 
@@ -980,7 +984,7 @@ void renderer_draw(const Draw& d) {
         Texels texels;  // when decoded
         VkSampler sampler;
     };
-    std::vector<Upload> uploads;
+    static std::vector<Upload> uploads;  // (kept between draws, emptied below: only the RSX's thread draws)
     const Clock::time_point texture_start = Clock::now();
     for (int pass = 0; pass < 2; ++pass) {
         uploads.clear();
@@ -1033,7 +1037,7 @@ void renderer_draw(const Draw& d) {
     // What the draw takes from the arena, and two descriptor sets: if the batch hasn't room, it is flushed first.
     uint32_t attributes = 0;
     for (uint32_t a = 0; a < 16; ++a) attributes += (vs.inputs >> a) & 1;
-    VkDeviceSize needed = r.align * 8 + VkDeviceSize{16} * attributes * d.count + indices.size() * 4 + kVertexConstants * 16 + fs.constant_slot_count * 16;
+    VkDeviceSize needed = r.align * 8 + VkDeviceSize{16} * attributes * d.count + index_list.size() * 4 + kVertexConstants * 16 + fs.constant_slot_count * 16;
     for (const Upload& up : uploads) needed += up.decode ? up.texels.rgba.size() + r.align : 0;
     if (needed > r.arena.size) {
         // A draw larger than the arena: the batch is written back and the arena made big enough (a power of two).
@@ -1062,7 +1066,7 @@ void renderer_draw(const Draw& d) {
     }
 
     // The vertices: every attribute the program reads, as four floats.
-    std::vector<VkDeviceSize> offsets;
+    std::array<VkDeviceSize, 16> offsets{};  // each attribute read's place in the arena, by slot
     const VkDeviceSize vertex_at = arena_take(r, std::max<VkDeviceSize>(16, VkDeviceSize{16} * attributes * d.count));
     for (uint32_t a = 0, slot = 0; a < 16; ++a) {
         if (!(vs.inputs & (1u << a))) continue;
@@ -1076,13 +1080,12 @@ void renderer_draw(const Draw& d) {
             qilin::rt::log("(draw)   attribute %u format %08x: first vertex %g %g %g %g (bytes %02x %02x %02x %02x)", a, format_word, out[0], out[1], out[2], out[3], raw[0],
                            raw[1], raw[2], raw[3]);
         }
-        offsets.push_back(at);
-        ++slot;
+        offsets[slot++] = at;
     }
     VkDeviceSize index_at = 0;
-    if (!indices.empty()) {
-        index_at = arena_take(r, indices.size() * 4);
-        std::memcpy(arena_at(r, index_at), indices.data(), indices.size() * 4);
+    if (!index_list.empty()) {
+        index_at = arena_take(r, index_list.size() * 4);
+        std::memcpy(arena_at(r, index_at), index_list.data(), index_list.size() * 4);
     }
     // The constants.
     const VkDeviceSize vertex_constants_at = arena_take(r, kVertexConstants * 16);
@@ -1125,8 +1128,10 @@ void renderer_draw(const Draw& d) {
         ds.pSetLayouts = &r.sets[1];
         host::check(vkAllocateDescriptorSets(gpu.device, &ds, &set1), "vkAllocateDescriptorSets");
         ++r.sets_used;
-        std::vector<VkDescriptorImageInfo> images(uploads.size());
-        std::vector<VkWriteDescriptorSet> texture_writes(uploads.size(), {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
+        // (At most 16 textures: one for each unit.)
+        std::array<VkDescriptorImageInfo, 16> images{};
+        std::array<VkWriteDescriptorSet, 16> texture_writes{};
+        texture_writes.fill({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
         for (size_t i = 0; i < uploads.size(); ++i) {
             Upload& up = uploads[i];
             host::Image& image = up.cached->image;
@@ -1150,7 +1155,7 @@ void renderer_draw(const Draw& d) {
             vkCmdCopyBufferToImage(cmd, r.arena.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(levels.size()), levels.data());
             transition_texture(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
-        vkUpdateDescriptorSets(gpu.device, static_cast<uint32_t>(texture_writes.size()), texture_writes.data(), 0, nullptr);
+        vkUpdateDescriptorSets(gpu.device, static_cast<uint32_t>(uploads.size()), texture_writes.data(), 0, nullptr);
     }
     // The surfaces from guest memory, as the batch begins with them.
     const Clock::time_point upload_start = Clock::now();
@@ -1224,9 +1229,9 @@ void renderer_draw(const Draw& d) {
     for (uint32_t a = 0, slot = 0; a < 16; ++a)
         if (vs.inputs & (1u << a)) vkCmdBindVertexBuffers(cmd, a, 1, &r.arena.buffer, &offsets[slot]), ++slot;
     if (indexed) {
-        if (!indices.empty()) {
+        if (!index_list.empty()) {
             vkCmdBindIndexBuffer(cmd, r.arena.buffer, index_at, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+            vkCmdDrawIndexed(cmd, static_cast<uint32_t>(index_list.size()), 1, 0, 0, 0);
         }
     } else {
         vkCmdDraw(cmd, d.count, 1, 0, 0);

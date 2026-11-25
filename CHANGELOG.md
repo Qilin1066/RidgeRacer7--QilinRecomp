@@ -82,6 +82,9 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - An attribute a vertex program reads that the draw gives no array reads 0, 0, 0, 1 (its starting value: the game sends none of the methods that set one), instead of stopping.
 - One image for a piece of memory drawn as surfaces of several sizes (by address, format and pitch): the game draws 256 by 128 passes in the corner of 1920 by 1080 buffers, which as separate surfaces flushed the batch, wrote one back and read the other in at each change (39,000 times in a 20-minute run).
 
+- SPU single precision on the host's float unit (x86-64): each SPU thread sets its float unit to round toward zero with denormals zero in and out, under which an add, subtract or multiply gives the SPU's result bit for bit, and a fused multiply-add too, done in double precision; zeros are made +0 and lanes the host can't stand in for (an operand's exponent 255, a result's 254 or more) are done the exact way. 600 million lanes of the six operations, weighted to the hard cases, agree bit for bit with the exact way; an operation takes about a quarter of the time. ARM hosts, and the differential test, keep the exact way.
+- `RR7_PROFILE`: every millisecond, where each guest thread is (which system call, which of the game's functions); a timed run logs each thread's commonest places, and the SPURS tasks' starts and running times by program. It showed the frame rate is set by the main thread waiting for the vertical blank and for the SPURS effects tasks.
+
 ### Known
 - The heaviest lifted file (`spu_p24`) still takes MSVC 4 GB and about two minutes: its longest function is 2,500 lines.
 

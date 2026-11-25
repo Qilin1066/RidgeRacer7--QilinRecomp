@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -45,13 +46,22 @@
 
 #include "events.hpp"
 #include "kernel.hpp"
+#include "machine.hpp"
 #include "qilin/rt/report.hpp"
 #include "qilin/rt/spu.hpp"
+#include "qilin/rt/spu_fp.hpp"
 #include "spu_image.hpp"
 
 namespace rr7 {
 
 namespace {
+
+// SPURS tasks' times (spu_report): starting them, and running them, by program.
+using Clock = std::chrono::steady_clock;
+uint64_t since_ns(Clock::time_point t) { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
+std::atomic<uint64_t> g_tasks_started{0}, g_task_setup_ns{0};
+std::mutex g_task_times_mutex;
+std::map<std::string, std::pair<uint64_t, uint64_t>> g_task_times;  // by program name: runs, nanoseconds
 
 using qilin::rt::fatal;
 using qilin::rt::Spu;
@@ -376,6 +386,20 @@ void finish(Thread& t, uint32_t cause, uint32_t status) {
 void run_thread(std::shared_ptr<Thread> thread) {
     Thread& t = *thread;
     set_current_thread(t.id);
+    qilin::rt::spu::enter_single_mode();  // (the host's float unit for its single precision: spu_fp.hpp)
+    const Clock::time_point started = Clock::now();
+    // (A task's time, from its start to its end, however it ends.)
+    struct Timed {
+        const Thread& t;
+        Clock::time_point started;
+        ~Timed() {
+            if (!t.task) return;
+            const uint64_t ns = since_ns(started);
+            const std::lock_guard lock(g_task_times_mutex);
+            auto& [runs, total] = g_task_times[t.name];
+            ++runs, total += ns;
+        }
+    } timed{t, started};
     try {
         t.program->call(t.spu, t.image.entry, t.image.entry);
         fatal("SPU thread %s: its program returned from its entry point", t.name.c_str());
@@ -760,6 +784,7 @@ std::span<const NativeImport> spu_imports() { return kImports; }
 
 // A SPURS task: a thread of no group, started at once, on a host thread of its own (spurs.cpp: what SPURS makes of it).
 void start_spu_task(SpuTaskSetup setup) {
+    const Clock::time_point setup_start = Clock::now();
     const uint32_t image_address = setup.image;
     const std::string name = setup.name;
     auto thread = std::make_shared<Thread>();
@@ -779,6 +804,19 @@ void start_spu_task(SpuTaskSetup setup) {
     prepare(*thread);
     // (The host thread is left to end by itself; the task's record is dropped when it ends: finish.)
     std::thread(run_thread, thread).detach();
+    ++g_tasks_started;
+    g_task_setup_ns += since_ns(setup_start);
+}
+
+void spu_report() {
+    qilin::rt::log("spu: %llu SPURS tasks started (%.0f ms starting them)", static_cast<unsigned long long>(g_tasks_started.load()),
+                   static_cast<double>(g_task_setup_ns.load()) / 1e6);
+    const std::lock_guard lock(g_task_times_mutex);
+    std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> top(g_task_times.begin(), g_task_times.end());
+    std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    for (size_t i = 0; i < top.size() && i < 12; ++i)
+        qilin::rt::log("spu: task %s: %llu runs, %.0f ms in all, %.3f ms each", top[i].first.c_str(), static_cast<unsigned long long>(top[i].second.first),
+                       static_cast<double>(top[i].second.second) / 1e6, static_cast<double>(top[i].second.second) / 1e6 / static_cast<double>(top[i].second.first));
 }
 
 std::mutex& spu_atomic_mutex() { return g_atomic; }

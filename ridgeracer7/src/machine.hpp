@@ -105,6 +105,15 @@ std::span<const qilin::rt::LiftedSpuProgram> spu_programs();
 
 // From now on a bad memory access is reported, with the guest's address and call stack, before the process stops (fault.cpp).
 void report_faults(std::span<const qilin::rt::LiftedFunction> functions);
+// RR7_PROFILE (a development aid, kernel.cpp): every millisecond, where each guest thread is (inside which system call,
+// or in which of the game's functions) is counted; profile_report logs each thread's commonest places.
+void start_profile();
+void profile_report();
+// SPURS tasks: how many started, the time spent starting them, and each program's time running (spu.cpp; logged with
+// the profile).
+void spu_report();
+// The lifted function a guest address is in (its start), or 0 (fault.cpp: from the table report_faults is given).
+uint32_t lifted_function_at(uint32_t address);
 // Whether report_faults has run: from then on a fault on a page made unreadable with guest_protect goes to renderer_fault.
 bool faults_handled();
 // The host's page size, and guest pages [from, to) (page-aligned) made unreadable, or readable and writable again.

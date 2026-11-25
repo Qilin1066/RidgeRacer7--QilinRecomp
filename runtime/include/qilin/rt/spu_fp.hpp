@@ -36,6 +36,17 @@
 // The helpers here are left to the compiler to inline or not: forced into every one of the game's 13,000 uses,
 // they made the lifted SPU code take over twenty minutes to compile. (What that costs at run time is to be measured.)
 //
+// **The host's float unit, where it can stand in (x86-64).** The SPU's single precision is IEEE's with truncation, no
+// denormals, +0 for every zero and no infinities or NaNs: a host float unit set to round toward zero, with denormals
+// flushed to zero in and out, gives an add, subtract or multiply's result bit for bit, and a fused multiply-add's
+// too, done in double precision (the product of two singles is exact there, and truncating twice, to 53 bits and
+// then to 24, is truncating once). What it gives otherwise is put right: a zero is made +0, and a lane with an operand
+// whose exponent is 255 (a number to the SPU, infinity or NaN to the host) or a result whose exponent is 254 or more
+// (where the SPU's range goes on and the host's saturates) is done again the exact way below. The mode is the SPU
+// thread's own (enter_single_mode: the runtime enters it as each SPU thread starts); without it, as in the
+// differential test, everything is done the exact way. The double-precision instructions and the estimates' tables
+// want rounding to nearest: they have it, for their own few instructions (NearestMode).
+//
 // Included by spu.hpp's users after it. Runtime code: no std::format here.
 #pragma once
 
@@ -45,9 +56,46 @@
 #include <cstdint>
 #include <utility>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define QILIN_SPU_HOST_SINGLE 1
+#else
+#define QILIN_SPU_HOST_SINGLE 0
+#endif
+
 #include "qilin/rt/spu.hpp"
 
 namespace qilin::rt::spu {
+
+// ---- the host's float unit for single precision (see the top) ----
+inline thread_local bool t_single_mode = false;
+
+// The calling thread's float unit set for SPU single precision (round toward zero, denormals zero in and out).
+inline void enter_single_mode() {
+#if QILIN_SPU_HOST_SINGLE
+    _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
+    t_single_mode = true;
+#endif
+}
+
+// For its own lifetime, the float unit as it is by default (round to nearest, denormals kept), if this thread had it
+// set for single precision.
+struct NearestMode {
+#if QILIN_SPU_HOST_SINGLE
+    unsigned saved = 0;
+    bool set = false;
+    NearestMode() {
+        if (t_single_mode) saved = _mm_getcsr(), set = true, _mm_setcsr(saved & ~(0x6000u | 0x8000u | 0x0040u));
+    }
+    ~NearestMode() {
+        if (set) _mm_setcsr(saved);
+    }
+#else
+    NearestMode() {}  // (no mode to change: the exact way is the only one)
+#endif
+    NearestMode(const NearestMode&) = delete;
+    NearestMode& operator=(const NearestMode&) = delete;
+};
 
 // ---- single precision, extended range ----
 // A number that isn't zero is mantissa * 2^exponent, with its sign apart.
@@ -109,21 +157,83 @@ inline uint32_t fused32(uint32_t a, uint32_t b, uint32_t c, bool negate_product,
     if (z.zero) return pack(product_negative, product, x.exponent + y.exponent);
     return sum(product_negative, product << 14, x.exponent + y.exponent - 14, z.negative != negate_addend, uint64_t{z.mantissa} << 38, z.exponent - 38);
 }
-inline SpuReg fa(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, false); }); }
-inline SpuReg fs(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, true); }); }
-inline SpuReg fm(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return multiply32(p, q); }); }
-inline SpuReg fma(const SpuReg& a, const SpuReg& b, const SpuReg& c) {
-    return {{fused32(a.w[0], b.w[0], c.w[0], false, false), fused32(a.w[1], b.w[1], c.w[1], false, false), fused32(a.w[2], b.w[2], c.w[2], false, false),
-             fused32(a.w[3], b.w[3], c.w[3], false, false)}};
+#if QILIN_SPU_HOST_SINGLE
+// The host's result, put right: zeros made +0, and the lanes the host can't stand in for (an operand's exponent 255, the
+// result's 254 or more) done again by `exact(lane)`.
+inline __m128i exponents(__m128i v) { return _mm_and_si128(_mm_srli_epi32(v, 23), _mm_set1_epi32(0xff)); }
+template <typename Exact>
+inline SpuReg host_result(__m128 result, __m128i bad_operands, Exact exact) {
+    __m128i r = _mm_castps_si128(result);
+    const __m128i e = exponents(r);
+    const __m128i bad = _mm_or_si128(bad_operands, _mm_cmpgt_epi32(e, _mm_set1_epi32(253)));
+    r = _mm_andnot_si128(_mm_cmpeq_epi32(e, _mm_setzero_si128()), r);
+    SpuReg out;
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out.w), r);
+    if (const int lanes = _mm_movemask_ps(_mm_castsi128_ps(bad)))
+        for (unsigned i = 0; i < 4; ++i)
+            if (lanes & (1 << i)) out.w[i] = exact(i);
+    return out;
 }
-inline SpuReg fms(const SpuReg& a, const SpuReg& b, const SpuReg& c) {
-    return {{fused32(a.w[0], b.w[0], c.w[0], false, true), fused32(a.w[1], b.w[1], c.w[1], false, true), fused32(a.w[2], b.w[2], c.w[2], false, true),
-             fused32(a.w[3], b.w[3], c.w[3], false, true)}};
+inline __m128i load(const SpuReg& v) { return _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.w)); }
+inline __m128i top_exponent(__m128i v) { return _mm_cmpeq_epi32(exponents(v), _mm_set1_epi32(0xff)); }
+// a * b + c (with `negate_product` c - a * b, with `negate_addend` a * b - c), in double precision.
+inline __m128 fused_host(__m128i a, __m128i b, __m128i c, bool negate_product, bool negate_addend) {
+    const __m128 x = _mm_castsi128_ps(a), y = _mm_castsi128_ps(b), z = _mm_castsi128_ps(c);
+    const auto half = [&](__m128d px, __m128d py, __m128d pz) {
+        __m128d product = _mm_mul_pd(px, py);
+        if (negate_product) product = _mm_sub_pd(_mm_setzero_pd(), product);
+        return negate_addend ? _mm_sub_pd(product, pz) : _mm_add_pd(product, pz);
+    };
+    const __m128d low = half(_mm_cvtps_pd(x), _mm_cvtps_pd(y), _mm_cvtps_pd(z));
+    const __m128d high = half(_mm_cvtps_pd(_mm_movehl_ps(x, x)), _mm_cvtps_pd(_mm_movehl_ps(y, y)), _mm_cvtps_pd(_mm_movehl_ps(z, z)));
+    return _mm_movelh_ps(_mm_cvtpd_ps(low), _mm_cvtpd_ps(high));
 }
-inline SpuReg fnms(const SpuReg& a, const SpuReg& b, const SpuReg& c) {
-    return {{fused32(a.w[0], b.w[0], c.w[0], true, false), fused32(a.w[1], b.w[1], c.w[1], true, false), fused32(a.w[2], b.w[2], c.w[2], true, false),
-             fused32(a.w[3], b.w[3], c.w[3], true, false)}};
+#endif
+
+inline SpuReg fa(const SpuReg& a, const SpuReg& b) {
+#if QILIN_SPU_HOST_SINGLE
+    if (t_single_mode) {
+        const __m128i x = load(a), y = load(b);
+        return host_result(_mm_add_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(y)), _mm_or_si128(top_exponent(x), top_exponent(y)),
+                           [&](unsigned i) { return add32(a.w[i], b.w[i], false); });
+    }
+#endif
+    return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, false); });
 }
+inline SpuReg fs(const SpuReg& a, const SpuReg& b) {
+#if QILIN_SPU_HOST_SINGLE
+    if (t_single_mode) {
+        const __m128i x = load(a), y = load(b);
+        return host_result(_mm_sub_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(y)), _mm_or_si128(top_exponent(x), top_exponent(y)),
+                           [&](unsigned i) { return add32(a.w[i], b.w[i], true); });
+    }
+#endif
+    return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, true); });
+}
+inline SpuReg fm(const SpuReg& a, const SpuReg& b) {
+#if QILIN_SPU_HOST_SINGLE
+    if (t_single_mode) {
+        const __m128i x = load(a), y = load(b);
+        return host_result(_mm_mul_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(y)), _mm_or_si128(top_exponent(x), top_exponent(y)),
+                           [&](unsigned i) { return multiply32(a.w[i], b.w[i]); });
+    }
+#endif
+    return words(a, b, [](uint32_t p, uint32_t q) { return multiply32(p, q); });
+}
+inline SpuReg fused(const SpuReg& a, const SpuReg& b, const SpuReg& c, bool negate_product, bool negate_addend) {
+#if QILIN_SPU_HOST_SINGLE
+    if (t_single_mode) {
+        const __m128i x = load(a), y = load(b), z = load(c);
+        return host_result(fused_host(x, y, z, negate_product, negate_addend), _mm_or_si128(_mm_or_si128(top_exponent(x), top_exponent(y)), top_exponent(z)),
+                           [&](unsigned i) { return fused32(a.w[i], b.w[i], c.w[i], negate_product, negate_addend); });
+    }
+#endif
+    return {{fused32(a.w[0], b.w[0], c.w[0], negate_product, negate_addend), fused32(a.w[1], b.w[1], c.w[1], negate_product, negate_addend),
+             fused32(a.w[2], b.w[2], c.w[2], negate_product, negate_addend), fused32(a.w[3], b.w[3], c.w[3], negate_product, negate_addend)}};
+}
+inline SpuReg fma(const SpuReg& a, const SpuReg& b, const SpuReg& c) { return fused(a, b, c, false, false); }
+inline SpuReg fms(const SpuReg& a, const SpuReg& b, const SpuReg& c) { return fused(a, b, c, false, true); }
+inline SpuReg fnms(const SpuReg& a, const SpuReg& b, const SpuReg& c) { return fused(a, b, c, true, false); }
 
 // ---- compares: every word with a zero exponent is the one zero ----
 inline int64_t ordered(uint32_t w) {
@@ -199,15 +309,24 @@ inline std::array<uint32_t, 32> estimate_table(G g) {
     return table;
 }
 inline uint32_t reciprocal_estimate32(uint32_t w) {
-    static const std::array<uint32_t, 32> table = estimate_table([](double m) { return 2.0 / m; });
+    static const std::array<uint32_t, 32> table = [] {
+        const NearestMode nearest;
+        return estimate_table([](double m) { return 2.0 / m; });
+    }();
     const uint32_t sign = w & 0x80000000u, exponent = (w >> 23) & 0xffu;
     if (exponent == 0) return sign | 0x7fffffffu;  // 1/0: the largest there is
     if (exponent >= 253) return 0;                 // too small to hold
     return sign | ((253 - exponent) << 23) | table[(w >> 18) & 31u];
 }
 inline uint32_t reciprocal_root_estimate32(uint32_t w) {
-    static const std::array<uint32_t, 32> even = estimate_table([](double m) { return 2.0 / std::sqrt(m); });
-    static const std::array<uint32_t, 32> odd = estimate_table([](double m) { return std::sqrt(2.0) / std::sqrt(m); });
+    static const std::array<uint32_t, 32> even = [] {
+        const NearestMode nearest;
+        return estimate_table([](double m) { return 2.0 / std::sqrt(m); });
+    }();
+    static const std::array<uint32_t, 32> odd = [] {
+        const NearestMode nearest;
+        return estimate_table([](double m) { return std::sqrt(2.0) / std::sqrt(m); });
+    }();
     const uint32_t exponent = (w >> 23) & 0xffu;
     if (exponent == 0) return 0x7fffffffu;
     // x = m * 2^e. With e even, 1/sqrt(x) = (2/sqrt(m)) * 2^(-e/2 - 1); with e odd, (sqrt(2)/sqrt(m)) * 2^(-(e-1)/2 - 1).
@@ -230,6 +349,7 @@ inline double operand64(uint64_t d) {
 }
 template <typename F>
 inline SpuReg doubles(const SpuReg& a, const SpuReg& b, F f) {
+    const NearestMode nearest;
     SpuReg r;
     for (unsigned i = 0; i < 2; ++i) {
         const uint64_t x = pair(a, i), y = pair(b, i);
@@ -248,6 +368,7 @@ inline SpuReg dfs(const SpuReg& a, const SpuReg& b) { return doubles(a, b, [](do
 inline SpuReg dfm(const SpuReg& a, const SpuReg& b) { return doubles(a, b, [](double x, double y) { return x * y; }); }
 // fesd: the single in the left word of each pair, as a double. frds: each double as a single in the left word, zeros in the right.
 inline SpuReg fesd(const SpuReg& a) {
+    const NearestMode nearest;
     SpuReg r;
     for (unsigned i = 0; i < 2; ++i) {
         uint32_t w = a.w[2 * i];
@@ -264,6 +385,7 @@ inline SpuReg fesd(const SpuReg& a) {
     return r;
 }
 inline SpuReg frds(const SpuReg& a) {
+    const NearestMode nearest;
     SpuReg r;
     for (unsigned i = 0; i < 2; ++i) {
         const uint64_t d = pair(a, i);

@@ -266,6 +266,7 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
         cpu.r[12] = elf.process_param() ? elf.process_param()->malloc_page_size : 0x100000u;
     }
     start_watch();
+    start_profile();
     g_log_errors = std::getenv("RR7_ERRORS") != nullptr;
     if (const char* const who = std::getenv("RR7_CALLS")) {
         g_trace_all = std::string(who) == "all";

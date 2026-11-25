@@ -277,6 +277,8 @@ int main(int argc, char** argv) {
             if (gpu_frame >= 0) rr7::renderer_frame_pixels(gpu_frame, frame);
             if (!frame.empty()) write_bmp(0, frame.data(), frame_width, frame_height);
             rr7::renderer_report();
+            rr7::profile_report();
+            rr7::spu_report();
             qilin::rt::log("stopped: RR7_SECONDS's %s seconds are over, at flip %llu", seconds, static_cast<unsigned long long>(flips.load()));
             std::fflush(nullptr);
             std::_Exit(0);

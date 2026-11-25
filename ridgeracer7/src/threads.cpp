@@ -72,6 +72,7 @@ void run_thread(Start start) {
     } catch (const ThreadExit& exit) {
         value = exit.value;
     }
+    set_current_cpu(nullptr);  // (its registers go with this function)
     {
         const std::lock_guard lock(g_mutex);
         Thread& self = g_threads[start.id];

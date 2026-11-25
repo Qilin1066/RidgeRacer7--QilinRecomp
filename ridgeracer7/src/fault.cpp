@@ -45,6 +45,7 @@ struct HostFunction {
     uint32_t guest;
 };
 std::vector<HostFunction> g_by_host;  // sorted by host address
+std::vector<uint32_t> g_starts;       // the lifted functions' guest addresses, sorted
 uintptr_t g_guest_base = 0;
 bool g_installed = false;
 
@@ -252,12 +253,20 @@ void report_faults(std::span<const qilin::rt::LiftedFunction> functions) {
     g_by_host.reserve(functions.size());
     for (const qilin::rt::LiftedFunction& f : functions) g_by_host.push_back({reinterpret_cast<uintptr_t>(f.fn), f.address});
     std::ranges::sort(g_by_host, {}, &HostFunction::host);
+    g_starts.reserve(functions.size());
+    for (const qilin::rt::LiftedFunction& f : functions) g_starts.push_back(f.address);
+    std::ranges::sort(g_starts);
     install();
     g_installed = true;
     start_write_watch();
 }
 
 bool faults_handled() { return g_installed; }
+
+uint32_t lifted_function_at(uint32_t address) {
+    const auto it = std::ranges::upper_bound(g_starts, address);
+    return it == g_starts.begin() ? 0 : *std::prev(it);
+}
 
 uint32_t guest_page_size() {
     static const uint32_t size = [] {

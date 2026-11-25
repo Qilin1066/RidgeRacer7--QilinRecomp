@@ -38,6 +38,7 @@ struct PastCall {
 };
 size_t past_calls(PastCall* out, size_t most);
 void start_watch();
+void start_profile();  // (machine.hpp)
 
 // Objects of one kind, by id. Ids start at `first` and are never reused
 // while the process runs (a stale id is then always an error, never another object).

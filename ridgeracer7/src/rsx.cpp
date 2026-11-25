@@ -412,11 +412,13 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
 // CLEAR_SURFACE: the colour surface and the depth-stencil surface filled with their clear values, in guest memory (where
 // this first renderer keeps every surface: renderer.hpp). The argument's bits: depth 1, stencil 2, red 0x10, green 0x20,
 // blue 0x40, alpha 0x80. *The clear rectangle is taken in the surface's own coordinates, from its top-left corner, and
-// the colour write mask is not applied to a clear: stated choices, to be compared with the console.*
+// the colour write mask is not applied to a clear: stated choices, to be compared with the console. Whether the scissor limits
+// a clear isn't known here: the game's clears seen so far are under a scissor covering their surface.*
 void clear(uint32_t mask, uint32_t at) {
     if (draw_logged())
-        qilin::rt::log("(draw) clear %#x of surface offset %08x %ux%u, colour %08x, depth-stencil %08x at offset %08x", mask, state(0x0210), state(0x0200) >> 16, state(0x0204) >> 16,
-                       state(0x1d90), state(0x1d8c), state(0x0214));
+        qilin::rt::log("(draw) clear %#x of surface offset %08x %ux%u, colour %08x, depth-stencil %08x at offset %08x | scissor %u,%u %ux%u", mask, state(0x0210),
+                       state(0x0200) >> 16, state(0x0204) >> 16, state(0x1d90), state(0x1d8c), state(0x0214), state(0x08c0) & 0xffff, state(0x08c4) & 0xffff,
+                       state(0x08c0) >> 16, state(0x08c4) >> 16);
     renderer_flush();
     if (mask & ~0xf3u) fatal("CLEAR_SURFACE with bits %#x, which this runtime doesn't know (at offset %08x)", mask, at);
     const uint32_t format = state(0x0208);

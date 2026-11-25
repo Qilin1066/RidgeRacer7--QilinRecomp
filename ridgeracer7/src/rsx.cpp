@@ -418,9 +418,9 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
     renderer_draw(d);
 }
 
-// CLEAR_SURFACE: the colour surface and the depth-stencil surface filled with their clear values, in guest memory (where
-// this first renderer keeps every surface: renderer.hpp). The argument's bits: depth 1, stencil 2, red 0x10, green 0x20,
-// blue 0x40, alpha 0x80. *The clear rectangle is taken in the surface's own coordinates, from its top-left corner, and
+// CLEAR_SURFACE: the colour surface and the depth-stencil surface filled with their clear values: on the GPU, in the
+// renderer's batch, or (a clear of only some colour channels) in guest memory after a flush. The argument's bits: depth 1,
+// stencil 2, red 0x10, green 0x20, blue 0x40, alpha 0x80. *The clear rectangle is taken in the surface's own coordinates, from its top-left corner, and
 // the colour write mask is not applied to a clear: stated choices, to be compared with the console. Whether the scissor limits
 // a clear isn't known here: the game's clears seen so far are under a scissor covering their surface.*
 void clear(uint32_t mask, uint32_t at) {
@@ -428,16 +428,32 @@ void clear(uint32_t mask, uint32_t at) {
         qilin::rt::log("(draw) clear %#x of surface offset %08x %ux%u, colour %08x, depth-stencil %08x at offset %08x | scissor %u,%u %ux%u", mask, state(0x0210),
                        state(0x0200) >> 16, state(0x0204) >> 16, state(0x1d90), state(0x1d8c), state(0x0214), state(0x08c0) & 0xffff, state(0x08c4) & 0xffff,
                        state(0x08c0) >> 16, state(0x08c4) >> 16);
-    renderer_flush("a clear");
     if (mask & ~0xf3u) fatal("CLEAR_SURFACE with bits %#x, which this runtime doesn't know (at offset %08x)", mask, at);
     const uint32_t format = state(0x0208);
     if (((format >> 8) & 0xf) != 1) fatal("a clear of a surface of type %u (not linear) (at offset %08x)", (format >> 8) & 0xf, at);
     const uint32_t x0 = state(0x1d98) & 0xffff, x1 = x0 + (state(0x1d98) >> 16), y0 = state(0x1d9c) & 0xffff, y1 = y0 + (state(0x1d9c) >> 16);
     const uint32_t width = state(0x0200) >> 16, height = state(0x0204) >> 16;
     const uint32_t right = std::min(x1, width), bottom = std::min(y1, height);
+    if ((mask & 0xf0) && state(0x0220) != 1) fatal("a clear of colour targets %#x (only surface A is taken yet) (at offset %08x)", state(0x0220), at);
+    if ((mask & 0xf0) && (format & 0x1f) != 8) fatal("a clear of a colour surface of format %u, which this runtime doesn't clear yet (at offset %08x)", format & 0x1f, at);
+    if ((mask & 3) && ((format >> 5) & 7) != 2) fatal("a clear of a depth surface of format %u, which this runtime doesn't clear yet (at offset %08x)", (format >> 5) & 7, at);
+    // All four colour channels or none: the renderer's.
+    if ((mask & 0xf0) == 0xf0 || (mask & 0xf0) == 0) {
+        Clear c;
+        c.x0 = std::min(x0, width), c.y0 = std::min(y0, height), c.x1 = right, c.y1 = bottom;
+        if (mask & 0xf0) {
+            c.color = true, c.color_value = state(0x1d90);
+            c.color_surface = {guest_address(surface_location(state(0x0194)), state(0x0210), "a colour surface"), state(0x020c), format & 0x1f, width, height};
+        }
+        if (mask & 3) {
+            c.depth = (mask & 1) != 0, c.stencil = (mask & 2) != 0, c.depth_value = state(0x1d8c);
+            c.depth_surface = {guest_address(surface_location(state(0x0198)), state(0x0214), "a depth surface"), state(0x022c), 2, width, height};
+        }
+        renderer_clear(c);
+        return;
+    }
+    renderer_flush("a clear");
     if (mask & 0xf0) {
-        if (state(0x0220) != 1) fatal("a clear of colour targets %#x (only surface A is taken yet) (at offset %08x)", state(0x0220), at);
-        if ((format & 0x1f) != 8) fatal("a clear of a colour surface of format %u, which this runtime doesn't clear yet (at offset %08x)", format & 0x1f, at);
         const uint32_t address = guest_address(surface_location(state(0x0194)), state(0x0210), "a colour surface"), pitch = state(0x020c);
         const uint32_t value = state(0x1d90);  // A8R8G8B8
         // The channels kept: a pixel is A, R, G, B in memory.
@@ -451,8 +467,6 @@ void clear(uint32_t mask, uint32_t at) {
             }
     }
     if (mask & 3) {
-        const uint32_t depth_format = (format >> 5) & 7;  // 1 Z16, 2 Z24S8
-        if (depth_format != 2) fatal("a clear of a depth surface of format %u, which this runtime doesn't clear yet (at offset %08x)", depth_format, at);
         const uint32_t address = guest_address(surface_location(state(0x0198)), state(0x0214), "a depth surface"), pitch = state(0x022c);
         const uint32_t value = state(0x1d8c);  // depth in the top 24 bits, stencil in the bottom 8
         for (uint32_t y = y0; y < bottom; ++y)

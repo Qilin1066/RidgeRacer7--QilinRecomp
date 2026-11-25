@@ -49,8 +49,9 @@ struct SurfaceEntry {
     uint64_t written_hash = 0;
     bool touched = false;  // drawn in the batch being recorded
     bool written = false;  // and written by a draw in it (a depth surface only tested isn't): only then copied back
-    // Its staging buffer holds what guest memory should, and its guest pages [page_from, page_to) are unreadable until
-    // it is written back there (renderer_fault). Changed only with g_pending_mutex held.
+    // Its image holds what guest memory should (as the last flush left it: a batch being recorded hasn't run), and its
+    // guest pages [page_from, page_to) are unreadable until it is copied out and written back there (renderer_fault).
+    // Changed only with g_pending_mutex held.
     bool pending = false;
     uint64_t page_from = 0, page_to = 0;
 };
@@ -137,6 +138,11 @@ struct Renderer {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+    // For the copies a write-back when touched makes (write_back_pages), on whichever thread touched: used only with
+    // g_pending_mutex held.
+    VkCommandPool demand_pool = VK_NULL_HANDLE;
+    VkCommandBuffer demand_cmd = VK_NULL_HANDLE;
+    VkFence demand_fence = VK_NULL_HANDLE;
     VkDescriptorSetLayout sets[2] = {};
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptors = VK_NULL_HANDLE;
@@ -588,6 +594,10 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
     host::check(vkAllocateCommandBuffers(gpu.device, &alloc, &r->cmd), "vkAllocateCommandBuffers");
     VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     host::check(vkCreateFence(gpu.device, &fence, nullptr, &r->fence), "vkCreateFence");
+    host::check(vkCreateCommandPool(gpu.device, &pool, nullptr, &r->demand_pool), "vkCreateCommandPool");
+    alloc.commandPool = r->demand_pool;
+    host::check(vkAllocateCommandBuffers(gpu.device, &alloc, &r->demand_cmd), "vkAllocateCommandBuffers");
+    host::check(vkCreateFence(gpu.device, &fence, nullptr, &r->demand_fence), "vkCreateFence");
     // The layout every translated program fits (rsx_spirv.hpp): set 0 the constant blocks, set 1 sixteen textures, 32 bytes of push constants.
     VkDescriptorSetLayoutBinding constants[2] = {};
     for (uint32_t i = 0; i < 2; ++i) {
@@ -650,7 +660,7 @@ VkDeviceSize arena_take(Renderer& r, VkDeviceSize size) {
 uint8_t* arena_at(Renderer& r, VkDeviceSize offset) { return static_cast<uint8_t*>(r.arena.mapped) + offset; }
 
 void end_rendering(Renderer& r) {
-    if (r.rendering) vkCmdEndRendering(r.cmd), r.rendering = nullptr, r.rendering_depth = nullptr;
+    if (r.rendering || r.rendering_depth) vkCmdEndRendering(r.cmd), r.rendering = nullptr, r.rendering_depth = nullptr;
 }
 
 bool overlaps(uint32_t a, uint64_t a_bytes, uint32_t b, uint64_t b_bytes) { return a < b + b_bytes && b < a + a_bytes; }
@@ -764,7 +774,40 @@ void write_back_pages(uint64_t from, uint64_t to) {
     }
     if (due.empty()) return;
     const Clock::time_point start = Clock::now();
+    // Their images to their staging buffers. (Each is in TRANSFER_SRC_OPTIMAL, as the flush that drew it left it: the
+    // lock is held from a batch's submission to its fence, so no batch runs between that flush and this copy, and the
+    // barrier of that flush's transition orders the copy after its draws.)
+    Renderer& r = *g_renderer;
+    const host::Gpu& gpu = *r.gpu;
+    host::check(vkResetCommandBuffer(r.demand_cmd, 0), "vkResetCommandBuffer");
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    host::check(vkBeginCommandBuffer(r.demand_cmd, &begin), "vkBeginCommandBuffer");
+    for (const SurfaceEntry* s : due) {
+        VkBufferImageCopy copies[2];
+        const uint32_t n = surface_copies(*s, copies);
+        vkCmdCopyImageToBuffer(r.demand_cmd, s->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->staging.buffer, n, copies);
+    }
+    VkMemoryBarrier2 to_host_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    to_host_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, to_host_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_host_barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, to_host_barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.memoryBarrierCount = 1, dependency.pMemoryBarriers = &to_host_barrier;
+    vkCmdPipelineBarrier2(r.demand_cmd, &dependency);
+    host::check(vkEndCommandBuffer(r.demand_cmd), "vkEndCommandBuffer");
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1, submit.pCommandBuffers = &r.demand_cmd;
+    {
+        const std::lock_guard lock(*r.queue);
+        host::check(vkQueueSubmit(gpu.queue, 1, &submit, r.demand_fence), "vkQueueSubmit");
+    }
+    host::check(vkWaitForFences(gpu.device, 1, &r.demand_fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    host::check(vkResetFences(gpu.device, 1, &r.demand_fence), "vkResetFences");
     for (SurfaceEntry* s : due) {
+        if (!s->coherent) {
+            const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s->staging.memory, 0, VK_WHOLE_SIZE};
+            host::check(vkInvalidateMappedMemoryRanges(gpu.device, 1, &range), "vkInvalidateMappedMemoryRanges");
+        }
         s->pending = false;
         guest_protect(s->page_from, s->page_to, true);
     }
@@ -773,10 +816,15 @@ void write_back_pages(uint64_t from, uint64_t to) {
     g_stats.on_demand_ns += since(start);
 }
 
-// The surface from guest memory into its image, as a batch first draws to it, ready to draw to.
-void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s) {
+// The surface from guest memory into its image, as a batch first draws to it, ready to draw to. `discard`: the batch
+// begins by replacing every pixel (a clear of the whole surface), so what is there now isn't wanted.
+void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s, bool discard) {
     // (Not copied when the image already holds what guest memory does.)
     const VkImageLayout ready = s.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    if (discard) {
+        host::transition(cmd, s.image.image, VK_IMAGE_LAYOUT_UNDEFINED, ready, aspects(s));
+        return;
+    }
     // (Still to be written back, it can't have changed in guest memory: nothing can write there unseen.)
     bool pending = false;
     if (lazy_writeback()) {
@@ -806,6 +854,95 @@ void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s) {
                      s.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, aspects(s));
 }
 
+// The surface entry kept for a colour surface, its image made the first time.
+SurfaceEntry& colour_entry(Renderer& r, const Surface& c) {
+    uint32_t pixel_bytes = 0;
+    const VkFormat format = surface_format(c.format, pixel_bytes);
+    SurfaceEntry& e = r.surfaces[{c.address, c.format, c.width, c.height}];
+    if (!e.image.image) {
+        e.desc = c;
+        e.image = host::Image::create(*r.gpu, c.width, c.height, format,
+                                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        e.staging = readback_buffer(*r.gpu, VkDeviceSize{c.width} * c.height * 4, e.coherent);
+    }
+    if (e.desc.pitch != c.pitch) fatal("a surface at %08x drawn with pitch %u, and before with %u", c.address, c.pitch, e.desc.pitch);
+    return e;
+}
+
+// And for a depth-stencil surface (Z24S8), with its view of both aspects.
+SurfaceEntry& depth_entry(Renderer& r, const Surface& z) {
+    SurfaceEntry& e = r.surfaces[{z.address, 0x100 | z.format, z.width, z.height}];
+    if (!e.image.image) {
+        const host::Gpu& gpu = *r.gpu;
+        e.desc = z, e.depth = true;
+        e.image = host::Image::create(gpu, z.width, z.height, r.depth_format,
+                                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        e.staging = readback_buffer(gpu, VkDeviceSize{z.width} * z.height * 5, e.coherent);
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image = e.image.image, vci.viewType = VK_IMAGE_VIEW_TYPE_2D, vci.format = r.depth_format;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+        host::check(vkCreateImageView(gpu.device, &vci, nullptr, &e.attachment_view), "vkCreateImageView");
+    }
+    if (e.desc.pitch != z.pitch) fatal("a depth surface at %08x used with pitch %u, and before with %u", z.address, z.pitch, e.desc.pitch);
+    return e;
+}
+
+// A rendering instance open on these surfaces (either may be absent, not both), each brought from guest memory as the
+// batch first draws to it (`discard_*`: unless the batch begins by replacing every pixel of it).
+void open_rendering(Renderer& r, SurfaceEntry* target, SurfaceEntry* depth, bool discard_target, bool discard_depth) {
+    const VkCommandBuffer cmd = r.cmd;
+    const bool first_touch = target && !target->touched, depth_first_touch = depth && !depth->touched;
+    if (first_touch || depth_first_touch || r.rendering != target || r.rendering_depth != depth) end_rendering(r);
+    const Clock::time_point upload_start = Clock::now();
+    if (first_touch) {
+        surface_from_guest(cmd, *target, discard_target);
+        target->touched = true;
+        r.touched.push_back(target);
+    }
+    if (depth_first_touch) {
+        surface_from_guest(cmd, *depth, discard_depth);
+        depth->touched = true;
+        r.touched.push_back(depth);
+    }
+    g_stats.upload_ns += since(upload_start);
+    if (r.rendering == target && r.rendering_depth == depth && (target || depth)) return;
+    // (Between rendering instances on a surface, its earlier draws are made visible to the next.)
+    if (target && !first_touch) host::transition(cmd, target->image.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    if (depth && !depth_first_touch)
+        host::transition(cmd, depth->image.image, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, aspects(*depth));
+    VkRenderingAttachmentInfo depth_attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    if (depth) {
+        depth_attachment.imageView = depth->attachment_view, depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    const Surface& area = target ? target->desc : depth->desc;
+    rendering.renderArea = {{0, 0}, {area.width, area.height}};
+    rendering.layerCount = 1;
+    if (target) {
+        attachment.imageView = target->image.view, attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        rendering.colorAttachmentCount = 1, rendering.pColorAttachments = &attachment;
+    }
+    if (depth) rendering.pDepthAttachment = rendering.pStencilAttachment = &depth_attachment;
+    vkCmdBeginRendering(cmd, &rendering);
+    r.rendering = target;
+    r.rendering_depth = depth;
+}
+
+// The batch's command buffer, begun if this is its first command.
+void begin_batch(Renderer& r) {
+    if (r.recording) return;
+    host::check(vkResetCommandBuffer(r.cmd, 0), "vkResetCommandBuffer");
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    host::check(vkBeginCommandBuffer(r.cmd, &begin), "vkBeginCommandBuffer");
+    vkCmdResetQueryPool(r.cmd, r.timestamps, 0, 3);
+    vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.timestamps, 0);
+    r.recording = true;
+}
+
 }  // namespace
 
 // The batch: everything drawn since the last flush is submitted, waited for, and its surfaces written back to guest memory.
@@ -820,10 +957,12 @@ void renderer_flush(const char* why) {
     const host::Gpu& gpu = *r.gpu;
     end_rendering(r);
     vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.timestamps, 1);
+    // (Written back when touched, a surface is copied off the GPU only then: write_back_pages.)
+    const bool lazy = lazy_writeback();
     for (SurfaceEntry* s : r.touched) {
         const VkImageLayout layout = s->depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         host::transition(r.cmd, s->image.image, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, aspects(*s));
-        if (!s->written) continue;
+        if (!s->written || lazy) continue;
         VkBufferImageCopy copies[2];
         const uint32_t n = surface_copies(*s, copies);
         vkCmdCopyImageToBuffer(r.cmd, s->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->staging.buffer, n, copies);
@@ -839,8 +978,7 @@ void renderer_flush(const char* why) {
     host::check(vkEndCommandBuffer(r.cmd), "vkEndCommandBuffer");
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1, submit.pCommandBuffers = &r.cmd;
-    // (Nothing writes a pending surface back while the GPU may be writing its staging buffer.)
-    const bool lazy = lazy_writeback();
+    // (Nothing copies a pending surface out while a batch may be drawing to it.)
     std::unique_lock pending_lock(g_pending_mutex, std::defer_lock);
     if (lazy) pending_lock.lock(), t_holding_pending = true;
     {
@@ -865,11 +1003,11 @@ void renderer_flush(const char* why) {
     for (SurfaceEntry* s : r.touched) {
         if (!s->written) continue;
         s->written = false, s->touched = false, s->resident = true;
-        if (!s->coherent) {
-            const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s->staging.memory, 0, VK_WHOLE_SIZE};
-            host::check(vkInvalidateMappedMemoryRanges(gpu.device, 1, &range), "vkInvalidateMappedMemoryRanges");
-        }
         if (!lazy) {
+            if (!s->coherent) {
+                const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s->staging.memory, 0, VK_WHOLE_SIZE};
+                host::check(vkInvalidateMappedMemoryRanges(gpu.device, 1, &range), "vkInvalidateMappedMemoryRanges");
+            }
             s->written_hash = surface_to_guest(*s);
         } else if (!s->pending) {
             s->pending = true;
@@ -1056,28 +1194,10 @@ void renderer_draw(const Draw& d) {
 
     // The surface: kept on the GPU for the batch. One that overlaps another drawn in this batch (the same memory seen as
     // another surface) first has the batch written back.
-    SurfaceEntry& target = r.surfaces[{d.color.address, d.color.format, d.color.width, d.color.height}];
-    if (!target.image.image) {
-        target.desc = d.color;
-        target.image = host::Image::create(gpu, d.color.width, d.color.height, format,
-                                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-        target.staging = readback_buffer(gpu, VkDeviceSize{d.color.width} * d.color.height * 4, target.coherent);
-    }
-    if (target.desc.pitch != d.color.pitch) fatal("a surface at %08x drawn with pitch %u, and before with %u", d.color.address, d.color.pitch, target.desc.pitch);
+    SurfaceEntry& target = colour_entry(r, d.color);
     SurfaceEntry* depth = nullptr;
     if (d.depth_surface) {
-        depth = &r.surfaces[{d.depth.address, 0x100 | d.depth.format, d.depth.width, d.depth.height}];
-        if (!depth->image.image) {
-            depth->desc = d.depth, depth->depth = true;
-            depth->image = host::Image::create(gpu, d.depth.width, d.depth.height, r.depth_format,
-                                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-            depth->staging = readback_buffer(gpu, VkDeviceSize{d.depth.width} * d.depth.height * 5, depth->coherent);
-            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-            vci.image = depth->image.image, vci.viewType = VK_IMAGE_VIEW_TYPE_2D, vci.format = r.depth_format;
-            vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
-            host::check(vkCreateImageView(gpu.device, &vci, nullptr, &depth->attachment_view), "vkCreateImageView");
-        }
-        if (depth->desc.pitch != d.depth.pitch) fatal("a depth surface at %08x used with pitch %u, and before with %u", d.depth.address, d.depth.pitch, depth->desc.pitch);
+        depth = &depth_entry(r, d.depth);
         if (overlaps(d.depth.address, surface_bytes(d.depth), d.color.address, surface_bytes(d.color))) fatal("a draw's depth surface overlaps its colour surface");
     }
     if (touched_overlap(r, d.color.address, surface_bytes(d.color), &target) || (depth && touched_overlap(r, d.depth.address, surface_bytes(d.depth), depth)))
@@ -1163,15 +1283,7 @@ void renderer_draw(const Draw& d) {
     }
     if (r.recording && (r.arena_used + needed > r.arena.size || r.sets_used + 2 > kMostSets)) renderer_flush("a full batch");
     VkCommandBuffer cmd = r.cmd;
-    if (!r.recording) {
-        host::check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
-        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        host::check(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
-        vkCmdResetQueryPool(cmd, r.timestamps, 0, 3);
-        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.timestamps, 0);
-        r.recording = true;
-    }
+    begin_batch(r);
 
     // The vertices: every attribute the program reads, as four floats.
     std::array<VkDeviceSize, 16> offsets{};  // each attribute read's place in the arena, by slot
@@ -1270,40 +1382,8 @@ void renderer_draw(const Draw& d) {
         }
         vkUpdateDescriptorSets(gpu.device, static_cast<uint32_t>(uploads.size()), texture_writes.data(), 0, nullptr);
     }
-    // The surfaces from guest memory, as the batch begins with them.
-    const Clock::time_point upload_start = Clock::now();
-    if (first_touch) {
-        surface_from_guest(cmd, target);
-        target.touched = true;
-        r.touched.push_back(&target);
-    }
-    if (depth_first_touch) {
-        surface_from_guest(cmd, *depth);
-        depth->touched = true;
-        r.touched.push_back(depth);
-    }
-    g_stats.upload_ns += since(upload_start);
-    if (r.rendering != &target) {
-        // (Between rendering instances on a surface, its earlier draws are made visible to the next.)
-        if (!first_touch) host::transition(cmd, target.image.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        if (depth && !depth_first_touch)
-            host::transition(cmd, depth->image.image, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, aspects(*depth));
-        VkRenderingAttachmentInfo depth_attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        if (depth) {
-            depth_attachment.imageView = depth->attachment_view, depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-            depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        }
-        VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        attachment.imageView = target.image.view, attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-        rendering.renderArea = {{0, 0}, {d.color.width, d.color.height}};
-        rendering.layerCount = 1, rendering.colorAttachmentCount = 1, rendering.pColorAttachments = &attachment;
-        if (depth) rendering.pDepthAttachment = rendering.pStencilAttachment = &depth_attachment;
-        vkCmdBeginRendering(cmd, &rendering);
-        r.rendering = &target;
-        r.rendering_depth = depth;
-    }
+    // The surfaces from guest memory, as the batch begins with them, and a rendering instance on them.
+    open_rendering(r, &target, depth, false, false);
 
     // The viewport, as the translated programs take it (rsx_spirv.hpp): the RSX's scale and offset give window coordinates
     // in its convention, which this turns into Vulkan's clip space for a viewport covering the surface.
@@ -1356,6 +1436,45 @@ void renderer_draw(const Draw& d) {
     ++r.draws;
     ++g_stats.draws;
     g_stats.draw_ns += since(draw_start);
+}
+
+void renderer_clear(const Clear& c) {
+    if (!g_renderer) fatal("the game clears, and there is no renderer (no window)");
+    if (c.x0 >= c.x1 || c.y0 >= c.y1 || (!c.color && !c.depth && !c.stencil)) return;
+    Renderer& r = *g_renderer;
+    SurfaceEntry* target = c.color ? &colour_entry(r, c.color_surface) : nullptr;
+    SurfaceEntry* depth = c.depth || c.stencil ? &depth_entry(r, c.depth_surface) : nullptr;
+    if (target && depth && overlaps(c.depth_surface.address, surface_bytes(c.depth_surface), c.color_surface.address, surface_bytes(c.color_surface)))
+        fatal("a clear's depth surface overlaps its colour surface");
+    if ((target && touched_overlap(r, c.color_surface.address, surface_bytes(c.color_surface), target)) ||
+        (depth && touched_overlap(r, c.depth_surface.address, surface_bytes(c.depth_surface), depth)))
+        renderer_flush("a surface overlapping one drawn");
+    begin_batch(r);
+    // A clear of every pixel of a surface (and, for a depth surface, of both depth and stencil) needn't read it first.
+    const auto whole = [&](const Surface& sf) { return c.x0 == 0 && c.y0 == 0 && c.x1 >= sf.width && c.y1 >= sf.height; };
+    open_rendering(r, target, depth, target && whole(c.color_surface), depth && c.depth && c.stencil && whole(c.depth_surface));
+    VkClearAttachment clears[2] = {};
+    uint32_t n = 0;
+    if (target) {
+        // The image's channels are R, G, B, A, each an 8-bit fraction: n / 255 comes back as n.
+        const uint32_t v = c.color_value;
+        clears[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, clears[n].colorAttachment = 0;
+        clears[n].clearValue.color.float32[0] = static_cast<float>((v >> 16) & 0xff) / 255.0f;
+        clears[n].clearValue.color.float32[1] = static_cast<float>((v >> 8) & 0xff) / 255.0f;
+        clears[n].clearValue.color.float32[2] = static_cast<float>(v & 0xff) / 255.0f;
+        clears[n].clearValue.color.float32[3] = static_cast<float>(v >> 24) / 255.0f;
+        ++n;
+    }
+    if (depth) {
+        // Depth as depth_to_host makes it: d / (2^24 - 1).
+        clears[n].aspectMask = (c.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u) | (c.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        clears[n].clearValue.depthStencil = {static_cast<float>(c.depth_value >> 8) / 16777215.0f, c.depth_value & 0xffu};
+        ++n;
+    }
+    const VkClearRect rect{{{static_cast<int32_t>(c.x0), static_cast<int32_t>(c.y0)}, {c.x1 - c.x0, c.y1 - c.y0}}, 0, 1};
+    vkCmdClearAttachments(r.cmd, n, clears, 1, &rect);
+    if (target) target->written = true;
+    if (depth) depth->written = true;
 }
 
 void set_present_sink(std::function<void(const uint8_t*, uint32_t, uint32_t)> sink) {

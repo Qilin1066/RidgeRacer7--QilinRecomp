@@ -99,6 +99,18 @@ bool renderer_started();
 // aren't handled or RR7_EAGER_WRITEBACK is set. The RSX's thread flushes at every point where the game may look (rsx.cpp); the renderer itself when a
 // draw would read a surface drawn in the batch (a texture, or the same memory as another surface), or its batch is full.
 void renderer_draw(const Draw& d);
+// A clear (CLEAR_SURFACE) of whole pixels in a rectangle: the colour surface's four channels, the depth, the stencil.
+struct Clear {
+    bool color = false;  // all four channels (a clear of only some is done on guest memory: rsx.cpp)
+    Surface color_surface;
+    uint32_t color_value = 0;  // A8R8G8B8
+    bool depth = false, stencil = false;
+    Surface depth_surface;     // Z24S8
+    uint32_t depth_value = 0;  // depth in the top 24 bits, stencil in the low 8
+    uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // [x0, x1) by [y0, y1), within the surfaces
+};
+// Records it into the batch, on the surfaces kept on the GPU, as a draw would be.
+void renderer_clear(const Clear& c);
 // `why`: what asked for it, a short phrase (a timed run's report counts flushes by it).
 void renderer_flush(const char* why);
 // The RSX is about to write these guest bytes itself (an inline transfer): the batch is flushed first only if a surface

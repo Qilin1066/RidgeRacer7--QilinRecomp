@@ -46,6 +46,8 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The FPSCR on the PPU (`mffs`, `mtfsf`) and the SPU (`fscrrd`, `fscrwr`), with their differential test cases: every function of the game lifts, 14,294 on the PPU and 2,332 on the SPU. A rounding mode other than to nearest, or an exception enabled, stops the game by name (`CpuHooks::fpscr_mode`, the SPU's halt).
 - State the renderer doesn't take is refused by name instead of ignored: flat shading, logic operations, the depth bounds test, two-sided vertex colours, user clip planes, polygon stipple, polygons drawn as points or lines, a window offset.
 - The control-flow pass proves 293 of the 296 switches' sizes from the bound the code checks (264 before): the compare is found anywhere above its branch, stopping at anything else that writes the same CR field, and a switch's block may follow another's table or be entered by `bgt` then `b`. Every newly proven size equals the size found before; unit tests hold each rule.
+- The depth bounds test, as Vulkan's (the stored depth against the bounds, which are part of the pipeline); a GPU without it stops the game by name. The game uses it on its way to a race.
+- `RR7_SAVE_FRAME` takes a list of flips; `RR7_DRAWLOG` gives each draw's viewport, clip and scissor.
 
 ### Checked
 - On the owner's PC: the game starts its sound core (`bnusCoreSpu.elf`) as an SPU thread, which runs; it reads and unpacks its first packs of `RR7.DAT`, and runs on to its first drawing: it stops at the RSX method that loads a vertex program. 110 of its 248 imports and 54 of its 78 system calls are provided.
@@ -55,6 +57,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The renderer no longer writes every surface back each time the RSX briefly runs out of commands mid-frame: it waits 2 ms first (labels, waits and flips still flush at once).
 - `sys_memory_allocate` could give the same address twice when blocks of both page sizes were allocated: the game's packs then overwrote one another, and it faulted going over one's table.
 - The archive's directory: a record begins with its name, not ends with it. Every pack and file had its neighbour's name since v0.5.0 (`docs/data-files.md`).
+- The build scripts count 8 GB per compiler, not 5: four compilers at once ran a PC with 22 GB free critically low, though one measured alone peaks at 4 GB.
 
 ### Known
 - The heaviest lifted file (`spu_p24`) still takes MSVC 4 GB and about two minutes: its longest function is 2,500 lines.

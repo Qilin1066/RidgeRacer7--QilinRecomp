@@ -72,6 +72,9 @@ struct Draw {
     Stencil stencil_front, stencil_back;
     bool depth_bias = false;  // polygon offset
     float bias_factor = 0, bias_units = 0;
+    // The depth bounds test: the depth already stored at the pixel against [min, max], as Vulkan's.
+    bool depth_bounds = false;
+    float bounds_min = 0, bounds_max = 1;
     uint32_t depth_func = 0;
     Surface depth;
 };

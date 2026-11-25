@@ -372,7 +372,8 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
                               d.stencil_front.func, d.stencil_front.ref, d.stencil_front.func_mask, d.stencil_front.write_mask, d.stencil_front.fail, d.stencil_front.zfail,
                               d.stencil_front.zpass, d.stencil_back.func, d.stencil_back.ref, d.stencil_back.func_mask, d.stencil_back.write_mask, d.stencil_back.fail,
                               d.stencil_back.zfail, d.stencil_back.zpass,
-                              std::bit_cast<uint32_t>(d.bias_factor), std::bit_cast<uint32_t>(d.bias_units)};
+                              std::bit_cast<uint32_t>(d.bias_factor), std::bit_cast<uint32_t>(d.bias_units),
+                              d.depth_bounds, std::bit_cast<uint32_t>(d.bounds_min), std::bit_cast<uint32_t>(d.bounds_max)};
     auto& p = g_renderer->pipelines[key];
     if (p) return p;
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -431,6 +432,12 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
         depth.depthTestEnable = VK_TRUE;
         depth.depthWriteEnable = d.depth_write ? VK_TRUE : VK_FALSE;
         depth.depthCompareOp = compare_op(d.depth_func);
+    }
+    if (d.depth_bounds) {
+        if (!g_renderer->gpu->depth_bounds) fatal("a draw with the depth bounds test, which this GPU doesn't have");
+        // Vulkan takes bounds within [0, 1] only; the depth stored is within it, so clamping them changes no result.
+        depth.depthBoundsTestEnable = VK_TRUE;
+        depth.minDepthBounds = std::clamp(d.bounds_min, 0.0f, 1.0f), depth.maxDepthBounds = std::clamp(d.bounds_max, 0.0f, 1.0f);
     }
     if (d.stencil_test) {
         depth.stencilTestEnable = VK_TRUE;

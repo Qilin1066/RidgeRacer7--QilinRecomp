@@ -34,6 +34,9 @@ struct Gpu {
     // widths and its point sizes.
     bool logic_op = false, wide_lines = false, large_points = false;
     float max_line_width = 1.0f, max_point_size = 1.0f;
+    // The depth bounds test (a game that uses it stops without it: it can't be
+    // approximated, since it reads the depth already stored).
+    bool depth_bounds = false;
     // VK_KHR_present_id + VK_KHR_present_wait: the display can wait until a
     // frame is on screen, to keep at most one queued behind it (latency).
     bool present_wait = false;

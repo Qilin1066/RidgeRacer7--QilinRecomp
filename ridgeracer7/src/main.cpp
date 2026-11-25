@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 #include <string>
@@ -212,15 +213,25 @@ int main(int argc, char** argv) {
     static std::vector<uint8_t> frame;
     static uint32_t frame_width = 0, frame_height = 0;
     static std::atomic<uint64_t> flips{0};
-    // A development aid: RR7_SAVE_FRAME=<n> writes the nth flip's picture to frame-<n>.bmp in the current folder.
-    static const uint64_t save_frame = std::getenv("RR7_SAVE_FRAME") ? std::strtoull(std::getenv("RR7_SAVE_FRAME"), nullptr, 10) : 0;
+    // A development aid: RR7_SAVE_FRAME=<n>[,<n>...] writes the nth flip's picture to frame-<n>.bmp in the current folder.
+    static const std::set<uint64_t> save_frames = [] {
+        std::set<uint64_t> s;
+        for (const char* p = std::getenv("RR7_SAVE_FRAME"); p && *p;) {
+            char* end = nullptr;
+            s.insert(std::strtoull(p, &end, 10));
+            if (end == p) qilin::rt::fatal("RR7_SAVE_FRAME: flip numbers separated by commas, not \"%s\"", p);
+            p = *end == ',' ? end + 1 : end;
+            if (*end && *end != ',') qilin::rt::fatal("RR7_SAVE_FRAME: flip numbers separated by commas, not \"%s\"", end);
+        }
+        return s;
+    }();
     rr7::set_present_sink([](const uint8_t* rgba, uint32_t width, uint32_t height) {
         const std::lock_guard lock(frame_mutex);
         frame.assign(rgba, rgba + size_t{width} * height * 4);
         frame_width = width, frame_height = height;
         const uint64_t n = ++flips;
         if (n == 1 || n % 600 == 0) qilin::rt::log("flip %llu: %ux%u", static_cast<unsigned long long>(n), width, height);
-        if (n == save_frame) write_bmp(n, rgba, width, height);
+        if (save_frames.contains(n)) write_bmp(n, rgba, width, height);
     });
     static rr7::GameInfo game_info = std::move(info);
     static const qilin::Elf* program = &*elf;

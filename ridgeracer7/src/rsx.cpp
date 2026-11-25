@@ -216,7 +216,9 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         d.depth_func = state(0x0a6c), d.depth_write = state(0x0a70) != 0;
         if (d.depth_func < 0x200 || d.depth_func > 0x207) fatal("a depth test with function %#x (at offset %08x)", d.depth_func, at);
     }
-    if (d.depth_test || state(0x0328)) {
+    // The depth bounds test (SET_DEPTH_BOUNDS_TEST_ENABLE, DEPTH_BOUNDS_MIN, MAX: floats) reads the depth surface too.
+    if (state(0x0380)) d.depth_bounds = true, d.bounds_min = state_float(0x0384), d.bounds_max = state_float(0x0388);
+    if (d.depth_test || state(0x0328) || d.depth_bounds) {
         d.depth_surface = true;
         const uint32_t depth_format = (format >> 5) & 7;  // 1 Z16, 2 Z24S8
         if (depth_format != 2) fatal("a depth test on a depth surface of format %u, which the renderer doesn't take yet (at offset %08x)", depth_format, at);
@@ -243,11 +245,10 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         d.stencil_front = side(0x0328);
         d.stencil_back = state(0x0348) ? side(0x0348) : d.stencil_front;
     }
-    // State this renderer doesn't take, refused by name rather than ignored: flat shading, logic operations, the depth bounds
-    // test, two-sided vertex colours, user clip planes, polygon stipple, and polygons drawn as points or lines.
+    // State this renderer doesn't take, refused by name rather than ignored: flat shading, logic operations, two-sided vertex
+    // colours, user clip planes, polygon stipple, and polygons drawn as points or lines.
     if (state(0x0368) == 0x1d00) fatal("a draw with flat shading, which the renderer doesn't take yet (at offset %08x)", at);
     if (state(0x0374)) fatal("a draw with a logic operation (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x0378), at);
-    if (state(0x0380)) fatal("a draw with the depth bounds test, which the renderer doesn't take yet (at offset %08x)", at);
     if (state(0x142c)) fatal("a draw with two-sided vertex colours, which the renderer doesn't take yet (at offset %08x)", at);
     if (state(0x1478)) fatal("a draw with user clip planes (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x1478), at);
     if (state(0x147c)) fatal("a draw with polygon stipple, which the renderer doesn't take yet (at offset %08x)", at);
@@ -370,6 +371,9 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
                        d.color.address, d.color.width, d.color.height, d.color.format, d.color_mask, d.depth_test ? "on" : "off", d.depth_func, d.depth_write,
                        d.depth.address, d.blend, d.blend_src, d.blend_dst, d.blend_equation, state(0x0304) != 0, d.primitive, d.count, d.indexed ? " indexed" : "", d.cull,
                        textures, state(0x1ea0), state(0x08e4));
+        qilin::rt::log("(draw)   viewport scale %g %g offset %g %g | clip %u,%u %ux%u | scissor %u,%u %ux%u | window height %u%s", d.viewport_scale[0],
+                       d.viewport_scale[1], d.viewport_offset[0], d.viewport_offset[1], d.clip_x, d.clip_y, d.clip_width, d.clip_height, d.scissor_x,
+                       d.scissor_y, d.scissor_width, d.scissor_height, d.window_height, d.origin_bottom ? " bottom" : "");
         for (uint32_t u = 0; u < 16; ++u)
             if (textures & (1u << u))
             {

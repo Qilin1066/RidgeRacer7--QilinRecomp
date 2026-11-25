@@ -124,15 +124,16 @@ Invoke-Step "Translating your copy's shaders" $qilin @("shaders", $Game, "--out"
 Invoke-Step "Configuring the game" "cmake" @("-S", $root, "-B", $build, "-DQILIN_GEN_DIR=$gen")
 # How many of the game's files to compile at once: one per core, but no more
 # than the memory free now holds. The heaviest file (a lifted SPU program)
-# takes Visual Studio's compiler 4 GB, so 5 GB are counted for each, and 2 GB
-# kept back. Given through _CL_ (which comes after the
+# takes Visual Studio's compiler 4 GB measured alone, but four at once with 5 GB
+# counted each ran a 22 GB-free PC critically low: 8 GB are counted for each,
+# and 2 GB kept back. Given through _CL_ (which comes after the
 # project's own /MP) at build time, so a different count never rebuilds anything.
 if ($onWindows) {
     $cores = [Environment]::ProcessorCount
     $os = Get-CimInstance Win32_OperatingSystem
     $memoryGB = [int][math]::Floor($os.TotalVisibleMemorySize / 1MB)
     $freeGB = [int][math]::Floor($os.FreePhysicalMemory / 1MB)
-    $jobs = [int][math]::Max(1, [math]::Min([int]$cores, [int][math]::Floor(($freeGB - 2) / 5)))
+    $jobs = [int][math]::Max(1, [math]::Min([int]$cores, [int][math]::Floor(($freeGB - 2) / 8)))
     Write-Host "Compiling $jobs file(s) at once ($cores cores; $freeGB of $memoryGB GB of memory free)"
     $env:_CL_ = "/MP$jobs"
 }

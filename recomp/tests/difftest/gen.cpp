@@ -168,7 +168,7 @@ int main(int argc, char** argv) {
 
     std::ofstream f(argv[1], std::ios::binary);
     f << "// Written by qilin_difftest_gen: the lifter's output for the differential test's cases.\n"
-         "#include <bit>\n#include <cstdint>\n\n#include \"cases.hpp\"\n\nusing namespace qilin::rt;\nusing difftest::Kind;\n\n"
+         "#include <atomic>\n#include <bit>\n#include <cstdint>\n\n#include \"cases.hpp\"\n\nusing namespace qilin::rt;\nusing difftest::Kind;\n\n"
       << out.functions << "namespace difftest {\nconst Case kCases[] = {\n"
       << out.table << "};\nconst size_t kCaseCount = " << out.count << ";\n}  // namespace difftest\n";
     f.close();

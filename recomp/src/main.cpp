@@ -1001,7 +1001,7 @@ int cmd_lift(const Args& a) {
             if (!f) throw Failure{std::format("cannot write {}", path.string())};
             ++rewritten;
         };
-        write(folder / "functions.hpp", "// Lifted from the game's program by qilin: do not share.\n#pragma once\n#include <bit>\n#include <cstdint>\n"
+        write(folder / "functions.hpp", "// Lifted from the game's program by qilin: do not share.\n#pragma once\n#include <atomic>\n#include <bit>\n#include <cstdint>\n"
                                         "#include \"qilin/rt/cpu.hpp\"\nusing namespace qilin::rt;\n" + declarations);
         size_t files = 0;
         for (size_t i = 0; i < code.size(); i += 256) {

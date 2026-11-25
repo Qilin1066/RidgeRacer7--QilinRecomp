@@ -24,6 +24,8 @@
 
 namespace rr7 {
 
+static_assert(sizeof(void*) == 8, "renderer.hpp declares Vulkan's handles as a 64-bit host's");
+
 namespace {
 
 using qilin::rt::fatal;
@@ -54,6 +56,31 @@ struct SurfaceEntry {
     // Changed only with g_pending_mutex held.
     bool pending = false;
     uint64_t page_from = 0, page_to = 0;
+    uint64_t staging_batch = UINT64_MAX;  // the batch (a count of flushes) whose upload last read its staging buffer
+    // The pixels drawn or cleared since it was last written back: [x0, x1) by [y0, y1) (empty: x0 >= x1). Only these
+    // go back to guest memory, as only these would the RSX have written: the rest of the image is a copy of guest
+    // memory from when a batch began, which the game may have written since (its command buffers have lain under the
+    // far side of a surface declared larger than what is drawn on it).
+    // (Changed with g_pending_mutex held. The batch being recorded gathers its own, `drawn`, on the RSX's thread alone,
+    // added at its flush.)
+    uint32_t dirty_x0 = UINT32_MAX, dirty_y0 = UINT32_MAX, dirty_x1 = 0, dirty_y1 = 0;
+    uint32_t drawn_x0 = UINT32_MAX, drawn_y0 = UINT32_MAX, drawn_x1 = 0, drawn_y1 = 0;
+    bool dirty() const { return dirty_x0 < dirty_x1 && dirty_y0 < dirty_y1; }
+    void add_drawn(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
+        x1 = std::min(x1, desc.width), y1 = std::min(y1, desc.height);
+        if (x0 >= x1 || y0 >= y1) return;
+        drawn_x0 = std::min(drawn_x0, x0), drawn_y0 = std::min(drawn_y0, y0);
+        drawn_x1 = std::max(drawn_x1, x1), drawn_y1 = std::max(drawn_y1, y1);
+    }
+    // The batch's rectangle into the dirty one, at its flush.
+    void take_drawn() {
+        if (drawn_x0 < drawn_x1 && drawn_y0 < drawn_y1) {
+            dirty_x0 = std::min(dirty_x0, drawn_x0), dirty_y0 = std::min(dirty_y0, drawn_y0);
+            dirty_x1 = std::max(dirty_x1, drawn_x1), dirty_y1 = std::max(dirty_y1, drawn_y1);
+        }
+        drawn_x0 = drawn_y0 = UINT32_MAX, drawn_x1 = drawn_y1 = 0;
+    }
+    void clean() { dirty_x0 = dirty_y0 = UINT32_MAX, dirty_x1 = dirty_y1 = 0; }
 };
 
 // A buffer the CPU reads back from: in host-cached memory where there is some (uncached memory is read a word at a time
@@ -118,6 +145,7 @@ uint64_t hash_bytes(const uint8_t* p, size_t n) {
 }
 
 constexpr uint32_t kMostSets = 1024;                   // descriptor sets in a batch
+constexpr uint32_t kBatchesInFlight = 3;               // submitted and not waited for, at most (renderer_flush)
 constexpr VkDeviceSize kArenaBytes = 64u << 20;        // vertices, indices, constants and texels of a batch
 
 // A hash of a key made of words, for the renderer's hash tables.
@@ -143,6 +171,20 @@ struct Renderer {
     VkCommandPool demand_pool = VK_NULL_HANDLE;
     VkCommandBuffer demand_cmd = VK_NULL_HANDLE;
     VkFence demand_fence = VK_NULL_HANDLE;
+    // The flips' pictures, on the GPU (renderer_flip), in turn; and the command buffer their copies are made with (and
+    // reads of them back), used only with g_pending_mutex held.
+    struct FrameImage {
+        host::Image image;
+        VkImageView opaque = VK_NULL_HANDLE;  // alpha 1: a display buffer's X8R8G8B8 has no alpha
+    };
+    std::array<FrameImage, 3> frames;
+    uint32_t next_frame = 0;
+    VkCommandPool flip_pool = VK_NULL_HANDLE;
+    VkCommandBuffer flip_cmd = VK_NULL_HANDLE;
+    VkFence flip_fence = VK_NULL_HANDLE;
+    bool flip_submitted = false;  // flip_fence will be signalled
+    host::Buffer frame_readback;
+    bool frame_readback_coherent = true;
     VkDescriptorSetLayout sets[2] = {};
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptors = VK_NULL_HANDLE;
@@ -156,7 +198,19 @@ struct Renderer {
     std::map<const qilin::rt::TranslatedShader*, VkShaderModule> modules;
     std::unordered_map<PipelineKey, VkPipeline, WordsHash> pipelines;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, SurfaceEntry> surfaces;  // by address, format, width, height
-    // The batch being recorded (renderer.hpp).
+    // What each batch in flight has of its own; batch n (a count of flushes) uses batches[n % kBatchesInFlight], and is
+    // waited for only when that comes round again (begin_batch).
+    struct Batch {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VkDescriptorPool descriptors = VK_NULL_HANDLE;
+        host::Buffer arena;
+        VkQueryPool timestamps = VK_NULL_HANDLE;
+        bool submitted = false;  // its fence will be signalled
+        uint64_t number = 0;     // the batch last submitted with these
+    };
+    std::array<Batch, kBatchesInFlight> batches;
+    // The batch being recorded (renderer.hpp), and the current batch's own (copied from batches[] by begin_batch).
     bool recording = false;
     host::Buffer arena;
     VkDeviceSize arena_used = 0, align = 256;
@@ -202,7 +256,7 @@ bool lazy_writeback() {
     return lazy;
 }
 std::mutex g_present_mutex;
-std::function<void(const uint8_t*, uint32_t, uint32_t)> g_present;
+std::function<void(const Frame&)> g_present;
 
 uint64_t fnv(const std::vector<uint8_t>& bytes) {
     uint64_t h = 0xcbf29ce484222325ull;
@@ -591,13 +645,19 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
     host::check(vkCreateCommandPool(gpu.device, &pool, nullptr, &r->pool), "vkCreateCommandPool");
     VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     alloc.commandPool = r->pool, alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, alloc.commandBufferCount = 1;
-    host::check(vkAllocateCommandBuffers(gpu.device, &alloc, &r->cmd), "vkAllocateCommandBuffers");
     VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    host::check(vkCreateFence(gpu.device, &fence, nullptr, &r->fence), "vkCreateFence");
+    for (Renderer::Batch& b : r->batches) {
+        host::check(vkAllocateCommandBuffers(gpu.device, &alloc, &b.cmd), "vkAllocateCommandBuffers");
+        host::check(vkCreateFence(gpu.device, &fence, nullptr, &b.fence), "vkCreateFence");
+    }
     host::check(vkCreateCommandPool(gpu.device, &pool, nullptr, &r->demand_pool), "vkCreateCommandPool");
     alloc.commandPool = r->demand_pool;
     host::check(vkAllocateCommandBuffers(gpu.device, &alloc, &r->demand_cmd), "vkAllocateCommandBuffers");
     host::check(vkCreateFence(gpu.device, &fence, nullptr, &r->demand_fence), "vkCreateFence");
+    host::check(vkCreateCommandPool(gpu.device, &pool, nullptr, &r->flip_pool), "vkCreateCommandPool");
+    alloc.commandPool = r->flip_pool;
+    host::check(vkAllocateCommandBuffers(gpu.device, &alloc, &r->flip_cmd), "vkAllocateCommandBuffers");
+    host::check(vkCreateFence(gpu.device, &fence, nullptr, &r->flip_fence), "vkCreateFence");
     // The layout every translated program fits (rsx_spirv.hpp): set 0 the constant blocks, set 1 sixteen textures, 32 bytes of push constants.
     VkDescriptorSetLayoutBinding constants[2] = {};
     for (uint32_t i = 0; i < 2; ++i) {
@@ -621,11 +681,12 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
     const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * kMostSets}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 * kMostSets}};
     VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dp.maxSets = kMostSets, dp.poolSizeCount = 2, dp.pPoolSizes = sizes;
-    host::check(vkCreateDescriptorPool(gpu.device, &dp, nullptr, &r->descriptors), "vkCreateDescriptorPool");
+    for (Renderer::Batch& b : r->batches) host::check(vkCreateDescriptorPool(gpu.device, &dp, nullptr, &b.descriptors), "vkCreateDescriptorPool");
     for (size_t i = 0; i < qilin::rt::kTranslatedShaderCount; ++i) r->shaders[qilin::rt::kTranslatedShaders[i].key] = &qilin::rt::kTranslatedShaders[i];
     r->dummy = host::Buffer::host_visible(gpu, 16, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    r->arena = host::Buffer::host_visible(gpu, kArenaBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                                                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    for (Renderer::Batch& b : r->batches)
+        b.arena = host::Buffer::host_visible(gpu, kArenaBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     // D32S8 first: NVIDIA's copies of D24S8's depth out of the image took 32 ms a 1920 by 1080 surface against D32S8's 4.5,
     // and AMD has no D24S8 at all.
     for (const VkFormat f : {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT}) {
@@ -640,7 +701,7 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
     if (r->depth_format == VK_FORMAT_UNDEFINED) fatal("the GPU has no depth-stencil format the renderer can use (D24S8 or D32S8)");
     VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     query.queryType = VK_QUERY_TYPE_TIMESTAMP, query.queryCount = 3;
-    host::check(vkCreateQueryPool(gpu.device, &query, nullptr, &r->timestamps), "vkCreateQueryPool");
+    for (Renderer::Batch& b : r->batches) host::check(vkCreateQueryPool(gpu.device, &query, nullptr, &b.timestamps), "vkCreateQueryPool");
     r->align = std::max<VkDeviceSize>({256, gpu.properties.limits.minUniformBufferOffsetAlignment, gpu.properties.limits.optimalBufferCopyOffsetAlignment});
     g_renderer = r;
     qilin::rt::log("the renderer draws on %s, with %zu translated shaders", gpu.name.c_str(), qilin::rt::kTranslatedShaderCount);
@@ -683,6 +744,18 @@ bool touched_overlap(const Renderer& r, uint32_t address, uint64_t bytes, const 
     return false;
 }
 
+// A development aid: the first 40 times a draw's surface or texture overlaps a surface drawn in the batch (each one a
+// flush), what each is, so that the cases worth keeping on the GPU are known.
+void log_conflict(const Renderer& r, const char* what, uint32_t address, uint32_t format, uint32_t width, uint32_t height, uint32_t pitch) {
+    static int logged = 0;
+    if (logged >= 40) return;
+    ++logged;
+    for (const SurfaceEntry* s : r.touched)
+        if (overlaps(address, uint64_t{pitch ? pitch : width * 4} * height, s->desc.address, surface_bytes(s->desc)))
+            qilin::rt::log("(conflict) %s at %08x format %08x %ux%u pitch %u overlaps the %s surface at %08x format %u %ux%u pitch %u", what, address, format, width,
+                           height, pitch, s->depth ? "depth" : "colour", s->desc.address, s->desc.format, s->desc.width, s->desc.height, s->desc.pitch);
+}
+
 VkImageAspectFlags aspects(const SurfaceEntry& s) {
     return s.depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
 }
@@ -723,24 +796,26 @@ void depth_to_host(const SurfaceEntry& s) {
         }
     }
 }
-// The staging buffer's pixels to guest memory; returns their surface_hash.
-uint64_t surface_to_guest(const SurfaceEntry& s) {
-    uint64_t h = kSurfaceHashStart;
+// The staging buffer's pixels drawn since the last write-back (the dirty rectangle) to guest memory, which is then
+// clean; returns the surface's surface_hash.
+uint64_t surface_to_guest(SurfaceEntry& s) {
+    if (!s.dirty()) return surface_hash(s.desc);
+    const uint32_t x0 = s.dirty_x0, x1 = s.dirty_x1, y0 = s.dirty_y0, y1 = s.dirty_y1;
+    s.clean();
     if (!s.depth) {
-        for (uint32_t y = 0; y < s.desc.height; ++y) {
+        for (uint32_t y = y0; y < y1; ++y) {
             uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
-            to_guest(s.desc.format, static_cast<const uint8_t*>(s.staging.mapped) + size_t{y} * s.desc.width * 4, row, s.desc.width);
-            h = add_row(h, row, s.desc.width);
+            to_guest(s.desc.format, static_cast<const uint8_t*>(s.staging.mapped) + (size_t{y} * s.desc.width + x0) * 4, row + size_t{x0} * 4, x1 - x0);
         }
-        return h;
+        return surface_hash(s.desc);
     }
     const bool unorm = g_renderer->depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
     const size_t texels = size_t{s.desc.width} * s.desc.height;
     const uint32_t* depth = static_cast<const uint32_t*>(s.staging.mapped);
     const uint8_t* stencil = static_cast<const uint8_t*>(s.staging.mapped) + texels * 4;
-    for (uint32_t y = 0; y < s.desc.height; ++y) {
+    for (uint32_t y = y0; y < y1; ++y) {
         uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
-        for (uint32_t x = 0; x < s.desc.width; ++x) {
+        for (uint32_t x = x0; x < x1; ++x) {
             const size_t i = size_t{y} * s.desc.width + x;
             uint32_t d = depth[i] & 0xffffffu;
             // (Rounded half away from zero, as lround, on a non-negative float below 2^24: adding a half is exact in a double.)
@@ -748,9 +823,8 @@ uint64_t surface_to_guest(const SurfaceEntry& s) {
             const uint32_t w = std::byteswap((d << 8) | stencil[i]);
             std::memcpy(row + 4 * x, &w, 4);
         }
-        h = add_row(h, row, s.desc.width);
     }
-    return h;
+    return surface_hash(s.desc);
 }
 
 // Writes back the pending surfaces on guest pages [from, to), and every pending surface sharing a page with one of those
@@ -816,6 +890,8 @@ void write_back_pages(uint64_t from, uint64_t to) {
     g_stats.on_demand_ns += since(start);
 }
 
+void finish_batch_numbered(Renderer& r, uint64_t number);
+
 // The surface from guest memory into its image, as a batch first draws to it, ready to draw to. `discard`: the batch
 // begins by replacing every pixel (a clear of the whole surface), so what is there now isn't wanted.
 void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s, bool discard) {
@@ -836,6 +912,9 @@ void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s, bool discard) {
         return;
     }
     ++g_stats.uploads;
+    // (Its staging buffer is written here: a batch still in flight that read it is waited for.)
+    finish_batch_numbered(*g_renderer, s.staging_batch);
+    s.staging_batch = g_renderer->flushes;
     if (s.depth) {
         depth_to_host(s);
     } else {
@@ -931,9 +1010,38 @@ void open_rendering(Renderer& r, SurfaceEntry* target, SurfaceEntry* depth, bool
     r.rendering_depth = depth;
 }
 
-// The batch's command buffer, begun if this is its first command.
+// Waits for a batch in flight: its fence, and its GPU times (renderer_report).
+void finish_batch(Renderer& r, Renderer::Batch& b) {
+    if (!b.submitted) return;
+    const host::Gpu& gpu = *r.gpu;
+    const Clock::time_point wait_start = Clock::now();
+    host::check(vkWaitForFences(gpu.device, 1, &b.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    host::check(vkResetFences(gpu.device, 1, &b.fence), "vkResetFences");
+    g_stats.wait_ns += since(wait_start);
+    b.submitted = false;
+    uint64_t t[3];
+    host::check(vkGetQueryPoolResults(gpu.device, b.timestamps, 0, 3, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT), "vkGetQueryPoolResults");
+    const double period = gpu.properties.limits.timestampPeriod;
+    g_stats.gpu_draw_ns += static_cast<uint64_t>(static_cast<double>(t[1] - t[0]) * period);
+    g_stats.gpu_copy_ns += static_cast<uint64_t>(static_cast<double>(t[2] - t[1]) * period);
+}
+
+// Waits for batch `number` (a count of flushes) if it is still in flight.
+void finish_batch_numbered(Renderer& r, uint64_t number) {
+    if (number == UINT64_MAX || number >= r.flushes) return;  // (none, or the batch being recorded: not submitted)
+    Renderer::Batch& b = r.batches[number % kBatchesInFlight];
+    if (b.number == number) finish_batch(r, b);
+}
+
+// The batch's command buffer, begun if this is its first command, with this batch's own arena, descriptor pool and
+// timestamps (waited for, if the batch that last had them is still in flight).
 void begin_batch(Renderer& r) {
     if (r.recording) return;
+    Renderer::Batch& b = r.batches[r.flushes % kBatchesInFlight];
+    finish_batch(r, b);
+    host::check(vkResetDescriptorPool(r.gpu->device, b.descriptors, 0), "vkResetDescriptorPool");
+    r.cmd = b.cmd, r.fence = b.fence, r.descriptors = b.descriptors, r.arena = b.arena, r.timestamps = b.timestamps;
+    r.sets_used = 0, r.arena_used = 0;
     host::check(vkResetCommandBuffer(r.cmd, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -945,7 +1053,8 @@ void begin_batch(Renderer& r) {
 
 }  // namespace
 
-// The batch: everything drawn since the last flush is submitted, waited for, and its surfaces written back to guest memory.
+// The batch: everything drawn since the last flush is submitted, and its surfaces written back to guest memory (when
+// touched: then nothing waits for it here).
 void renderer_flush(const char* why) {
     if (!g_renderer || !g_renderer->recording) return;
     const Clock::time_point flush_start = Clock::now();
@@ -978,24 +1087,18 @@ void renderer_flush(const char* why) {
     host::check(vkEndCommandBuffer(r.cmd), "vkEndCommandBuffer");
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1, submit.pCommandBuffers = &r.cmd;
-    // (Nothing copies a pending surface out while a batch may be drawing to it.)
+    // Submitted, and (written back when touched) not waited for: whatever touches a surface it draws to copies it out by
+    // a submission of its own, which the queue runs after this. (The lock: a fault mid-submission finds the surface as
+    // it was before, or pending after.)
+    Renderer::Batch& batch = r.batches[r.flushes % kBatchesInFlight];
     std::unique_lock pending_lock(g_pending_mutex, std::defer_lock);
     if (lazy) pending_lock.lock(), t_holding_pending = true;
     {
         const std::lock_guard lock(*r.queue);
         host::check(vkQueueSubmit(gpu.queue, 1, &submit, r.fence), "vkQueueSubmit");
     }
-    const Clock::time_point wait_start = Clock::now();
-    host::check(vkWaitForFences(gpu.device, 1, &r.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-    host::check(vkResetFences(gpu.device, 1, &r.fence), "vkResetFences");
-    g_stats.wait_ns += since(wait_start);
-    {
-        uint64_t t[3];
-        host::check(vkGetQueryPoolResults(gpu.device, r.timestamps, 0, 3, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT), "vkGetQueryPoolResults");
-        const double period = gpu.properties.limits.timestampPeriod;
-        g_stats.gpu_draw_ns += static_cast<uint64_t>(static_cast<double>(t[1] - t[0]) * period);
-        g_stats.gpu_copy_ns += static_cast<uint64_t>(static_cast<double>(t[2] - t[1]) * period);
-    }
+    batch.submitted = true, batch.number = r.flushes;
+    if (!lazy) finish_batch(r, batch);
     const Clock::time_point writeback_start = Clock::now();
     // The surfaces drawn: back to guest memory, as the game expects to find them; or pending, their pages unreadable until
     // something touches them.
@@ -1003,18 +1106,31 @@ void renderer_flush(const char* why) {
     for (SurfaceEntry* s : r.touched) {
         if (!s->written) continue;
         s->written = false, s->touched = false, s->resident = true;
+        s->take_drawn();
         if (!lazy) {
             if (!s->coherent) {
                 const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s->staging.memory, 0, VK_WHOLE_SIZE};
                 host::check(vkInvalidateMappedMemoryRanges(gpu.device, 1, &range), "vkInvalidateMappedMemoryRanges");
             }
             s->written_hash = surface_to_guest(*s);
-        } else if (!s->pending) {
+        } else if (!s->pending && s->dirty()) {
             s->pending = true;
-            s->page_from = s->desc.address / page * page;
-            s->page_to = (s->desc.address + surface_bytes(s->desc) + page - 1) / page * page;
+            // (The pages under the dirty rectangle: what a write-back writes.)
+            const uint64_t first = s->desc.address + uint64_t{s->dirty_y0} * s->desc.pitch + uint64_t{s->dirty_x0} * 4;
+            const uint64_t end = s->desc.address + uint64_t{s->dirty_y1 - 1} * s->desc.pitch + uint64_t{s->dirty_x1} * 4;
+            s->page_from = first / page * page;
+            s->page_to = (end + page - 1) / page * page;
             guest_protect(s->page_from, s->page_to, false);
             g_pending.push_back(s);
+        } else if (s->pending) {
+            // (Drawn again while waiting: its rectangle may have grown past the pages made unreadable.)
+            const uint64_t first = s->desc.address + uint64_t{s->dirty_y0} * s->desc.pitch + uint64_t{s->dirty_x0} * 4;
+            const uint64_t end = s->desc.address + uint64_t{s->dirty_y1 - 1} * s->desc.pitch + uint64_t{s->dirty_x1} * 4;
+            const uint64_t from = first / page * page, to = (end + page - 1) / page * page;
+            if (from < s->page_from || to > s->page_to) {
+                s->page_from = std::min(s->page_from, from), s->page_to = std::max(s->page_to, to);
+                guest_protect(s->page_from, s->page_to, false);
+            }
         }
     }
     if (lazy) t_holding_pending = false, pending_lock.unlock();
@@ -1028,7 +1144,7 @@ void renderer_flush(const char* why) {
     }
     r.touched.clear();
     g_stats.writeback_ns += since(writeback_start);
-    // (The GPU is idle here: textures unused for a while can go.)
+    // Textures unused for a while can go. (Unused in the last 300 batches: those that used them are no longer in flight.)
     if (r.textures.size() > 1024) {
         for (auto it = r.textures.begin(); it != r.textures.end();) {
             if (it->second.used + 300 < r.flushes) {
@@ -1039,9 +1155,6 @@ void renderer_flush(const char* why) {
             }
         }
     }
-    host::check(vkResetDescriptorPool(gpu.device, r.descriptors, 0), "vkResetDescriptorPool");
-    r.sets_used = 0;
-    r.arena_used = 0;
     r.recording = false;
     ++r.flushes;
     ++g_stats.flushes;
@@ -1075,8 +1188,19 @@ bool renderer_fault(uint32_t address) {
     {
         const std::lock_guard lock(g_pending_mutex);
         t_holding_pending = true;
-        const bool ours = std::ranges::any_of(g_pending, [&](const SurfaceEntry* s) { return s->page_from <= from && from < s->page_to; });
-        if (ours) write_back_pages(from, from + page);
+        const auto hit = std::ranges::find_if(g_pending, [&](const SurfaceEntry* s) { return s->page_from <= from && from < s->page_to; });
+        const bool ours = hit != g_pending.end();
+        if (ours) {
+            // (A development aid: the first 40, and who touched them.)
+            static int logged = 0;
+            if (logged < 40) {
+                ++logged;
+                const Surface& sd = (*hit)->desc;
+                qilin::rt::log("(touched) guest %08x by thread %08x: the %s surface at %08x %ux%u", address, current_thread(), (*hit)->depth ? "depth" : "colour", sd.address,
+                               sd.width, sd.height);
+            }
+            write_back_pages(from, from + page);
+        }
         t_holding_pending = false;
         if (ours) return true;
     }
@@ -1200,8 +1324,10 @@ void renderer_draw(const Draw& d) {
         depth = &depth_entry(r, d.depth);
         if (overlaps(d.depth.address, surface_bytes(d.depth), d.color.address, surface_bytes(d.color))) fatal("a draw's depth surface overlaps its colour surface");
     }
-    if (touched_overlap(r, d.color.address, surface_bytes(d.color), &target) || (depth && touched_overlap(r, d.depth.address, surface_bytes(d.depth), depth)))
+    if (touched_overlap(r, d.color.address, surface_bytes(d.color), &target) || (depth && touched_overlap(r, d.depth.address, surface_bytes(d.depth), depth))) {
+        log_conflict(r, "surface", d.color.address, d.color.format, d.color.width, d.color.height, d.color.pitch);
         renderer_flush("a surface overlapping one drawn");
+    }
 
     // The textures the fragment program samples, read from guest memory: after the batch is written back, if they
     // overlap a surface drawn in it (a picture drawn and then sampled).
@@ -1224,7 +1350,10 @@ void renderer_draw(const Draw& d) {
             size_t bytes = 0;
             if (const std::string why = texture_extent(t, bytes); !why.empty())
                 fatal("texture %u (at %08x, format %08x): %s, which the renderer doesn't take yet", u, t.address, t.format, why.c_str());
-            overlap = overlap || touched_overlap(r, t.address, bytes, nullptr);
+            if (touched_overlap(r, t.address, bytes, nullptr)) {
+                overlap = true;
+                log_conflict(r, "texture", t.address, t.format, t.rect >> 16, t.rect & 0xffff, t.control3 & 0xfffff);
+            }
             Upload& up = uploads.emplace_back();
             up.unit = u;
             up.cached = &r.textures[{t.address, t.format, t.rect, t.control3, t.remap, (fs.cube_textures >> u) & 1}];
@@ -1267,23 +1396,30 @@ void renderer_draw(const Draw& d) {
     for (uint32_t a = 0; a < 16; ++a) attributes += (vs.inputs >> a) & 1;
     VkDeviceSize needed = r.align * 8 + VkDeviceSize{16} * attributes * d.count + index_list.size() * 4 + kVertexConstants * 16 + fs.constant_slot_count * 16;
     for (const Upload& up : uploads) needed += up.decode ? up.texels.rgba.size() + r.align : 0;
+    begin_batch(r);
     if (needed > r.arena.size) {
-        // A draw larger than the arena: the batch is written back and the arena made big enough (a power of two).
+        // A draw larger than the arena: the batch is flushed and the next one's arena made big enough (a power of two;
+        // begin_batch waited for its last use).
         renderer_flush("a draw larger than the arena");
+        begin_batch(r);
         VkDeviceSize size = r.arena.size;
         while (size < needed) size *= 2;
-        r.arena.destroy(gpu);
-        r.arena = host::Buffer::host_visible(gpu, size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        host::Buffer& arena = r.batches[r.flushes % kBatchesInFlight].arena;
+        arena.destroy(gpu);
+        arena = host::Buffer::host_visible(gpu, size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        r.arena = arena;
         size_t texels = 0;
         for (const Upload& up : uploads) texels += up.decode ? up.texels.rgba.size() : 0;
         qilin::rt::log("the renderer's arena grows to %llu MB for a draw of %llu MB: %u vertices from %u (%s, %zu indices), %u attributes, %zu MB of texels",
                        static_cast<unsigned long long>(size >> 20), static_cast<unsigned long long>(needed >> 20), d.count, d.first, d.indexed ? "indexed" : "arrays",
                        d.indices.size(), attributes, texels >> 20);
     }
-    if (r.recording && (r.arena_used + needed > r.arena.size || r.sets_used + 2 > kMostSets)) renderer_flush("a full batch");
+    if (r.arena_used + needed > r.arena.size || r.sets_used + 2 > kMostSets) {
+        renderer_flush("a full batch");
+        begin_batch(r);
+    }
     VkCommandBuffer cmd = r.cmd;
-    begin_batch(r);
 
     // The vertices: every attribute the program reads, as four floats.
     std::array<VkDeviceSize, 16> offsets{};  // each attribute read's place in the arena, by slot
@@ -1430,9 +1566,15 @@ void renderer_draw(const Draw& d) {
         vkCmdDraw(cmd, d.count, 1, 0, 0);
     }
     target.written = true;
+    target.add_drawn(static_cast<uint32_t>(scissor.offset.x), static_cast<uint32_t>(scissor.offset.y), static_cast<uint32_t>(scissor.offset.x) + scissor.extent.width,
+                     static_cast<uint32_t>(scissor.offset.y) + scissor.extent.height);
     // (A depth-stencil surface is written by depth writes, and by a stencil test that may change it.)
     const auto changes = [](const Draw::Stencil& st) { return st.write_mask && (st.fail != 0x1e00 || st.zfail != 0x1e00 || st.zpass != 0x1e00); };
-    if (depth && (d.depth_write || (d.stencil_test && (changes(d.stencil_front) || changes(d.stencil_back))))) depth->written = true;
+    if (depth && (d.depth_write || (d.stencil_test && (changes(d.stencil_front) || changes(d.stencil_back))))) {
+        depth->written = true;
+        depth->add_drawn(static_cast<uint32_t>(scissor.offset.x), static_cast<uint32_t>(scissor.offset.y), static_cast<uint32_t>(scissor.offset.x) + scissor.extent.width,
+                         static_cast<uint32_t>(scissor.offset.y) + scissor.extent.height);
+    }
     ++r.draws;
     ++g_stats.draws;
     g_stats.draw_ns += since(draw_start);
@@ -1473,18 +1615,127 @@ void renderer_clear(const Clear& c) {
     }
     const VkClearRect rect{{{static_cast<int32_t>(c.x0), static_cast<int32_t>(c.y0)}, {c.x1 - c.x0, c.y1 - c.y0}}, 0, 1};
     vkCmdClearAttachments(r.cmd, n, clears, 1, &rect);
-    if (target) target->written = true;
-    if (depth) depth->written = true;
+    if (target) target->written = true, target->add_drawn(c.x0, c.y0, c.x1, c.y1);
+    if (depth) depth->written = true, depth->add_drawn(c.x0, c.y0, c.x1, c.y1);
 }
 
-void set_present_sink(std::function<void(const uint8_t*, uint32_t, uint32_t)> sink) {
+// The flip command buffer, ready to record: what it last did finished. g_pending_mutex held.
+void begin_flip_commands(Renderer& r) {
+    const host::Gpu& gpu = *r.gpu;
+    if (r.flip_submitted) {
+        host::check(vkWaitForFences(gpu.device, 1, &r.flip_fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        host::check(vkResetFences(gpu.device, 1, &r.flip_fence), "vkResetFences");
+        r.flip_submitted = false;
+    }
+    host::check(vkResetCommandBuffer(r.flip_cmd, 0), "vkResetCommandBuffer");
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    host::check(vkBeginCommandBuffer(r.flip_cmd, &begin), "vkBeginCommandBuffer");
+}
+void submit_flip_commands(Renderer& r) {
+    host::check(vkEndCommandBuffer(r.flip_cmd), "vkEndCommandBuffer");
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1, submit.pCommandBuffers = &r.flip_cmd;
+    const std::lock_guard lock(*r.queue);
+    host::check(vkQueueSubmit(r.gpu->queue, 1, &submit, r.flip_fence), "vkQueueSubmit");
+    r.flip_submitted = true;
+}
+
+bool renderer_flip(uint32_t address, uint32_t pitch, uint32_t width, uint32_t height) {
+    if (!g_renderer || !lazy_writeback()) return false;
+    Renderer& r = *g_renderer;
+    const host::Gpu& gpu = *r.gpu;
+    const auto found = r.surfaces.find({address, 8u, width, height});
+    if (found == r.surfaces.end() || found->second.desc.pitch != pitch) return false;
+    const SurfaceEntry& surface = found->second;
+    int index = -1;
+    {
+        const std::lock_guard lock(g_pending_mutex);
+        // (Only one still to be written back: then the image is newer than guest memory, and nothing has written there.)
+        if (!surface.pending) return false;
+        index = static_cast<int>(r.next_frame);
+        r.next_frame = (r.next_frame + 1) % r.frames.size();
+        Renderer::FrameImage& f = r.frames[static_cast<size_t>(index)];
+        if (f.image.image && (f.image.width != width || f.image.height != height)) {
+            // (A new size: rare. The window may still be showing the old one.)
+            {
+                const std::lock_guard queue_lock(*r.queue);
+                host::check(vkQueueWaitIdle(gpu.queue), "vkQueueWaitIdle");
+            }
+            vkDestroyImageView(gpu.device, f.opaque, nullptr);
+            f.image.destroy(gpu);
+            f = {};
+        }
+        if (!f.image.image) {
+            f.image = host::Image::create(gpu, width, height, VK_FORMAT_R8G8B8A8_UNORM,
+                                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.image = f.image.image, vci.viewType = VK_IMAGE_VIEW_TYPE_2D, vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+            vci.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_ONE};
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            host::check(vkCreateImageView(gpu.device, &vci, nullptr, &f.opaque), "vkCreateImageView");
+        }
+        // The surface's image is in TRANSFER_SRC_OPTIMAL, as the flush before this left it (and no batch runs while the
+        // lock is held).
+        begin_flip_commands(r);
+        host::transition(r.flip_cmd, f.image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy copy{};
+        copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.extent = {width, height, 1};
+        vkCmdCopyImage(r.flip_cmd, surface.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        host::transition(r.flip_cmd, f.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        submit_flip_commands(r);
+    }
+    present_frame(Frame{nullptr, index, width, height});
+    return true;
+}
+
+void renderer_frame_image(int gpu_frame, VkImage& image, VkImageView& view) {
+    const Renderer::FrameImage& f = g_renderer->frames.at(static_cast<size_t>(gpu_frame));
+    image = f.image.image, view = f.opaque;
+}
+
+void renderer_frame_pixels(int gpu_frame, std::vector<uint8_t>& rgba) {
+    Renderer& r = *g_renderer;
+    const host::Gpu& gpu = *r.gpu;
+    const std::lock_guard lock(g_pending_mutex);
+    const Renderer::FrameImage& f = r.frames.at(static_cast<size_t>(gpu_frame));
+    const VkDeviceSize bytes = VkDeviceSize{f.image.width} * f.image.height * 4;
+    if (r.frame_readback.size < bytes) {
+        if (r.frame_readback.buffer) r.frame_readback.destroy(gpu);
+        r.frame_readback = readback_buffer(gpu, bytes, r.frame_readback_coherent);
+    }
+    begin_flip_commands(r);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {f.image.width, f.image.height, 1};
+    vkCmdCopyImageToBuffer(r.flip_cmd, f.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r.frame_readback.buffer, 1, &region);
+    VkMemoryBarrier2 to_host_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    to_host_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, to_host_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_host_barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, to_host_barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.memoryBarrierCount = 1, dependency.pMemoryBarriers = &to_host_barrier;
+    vkCmdPipelineBarrier2(r.flip_cmd, &dependency);
+    submit_flip_commands(r);
+    host::check(vkWaitForFences(gpu.device, 1, &r.flip_fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    if (!r.frame_readback_coherent) {
+        const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, r.frame_readback.memory, 0, VK_WHOLE_SIZE};
+        host::check(vkInvalidateMappedMemoryRanges(gpu.device, 1, &range), "vkInvalidateMappedMemoryRanges");
+    }
+    // (Copied out with the alpha the surface had: a display buffer's X byte. Shown opaque.)
+    const uint8_t* from = static_cast<const uint8_t*>(r.frame_readback.mapped);
+    rgba.assign(from, from + bytes);
+    for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
+}
+
+void set_present_sink(std::function<void(const Frame&)> sink) {
     const std::lock_guard lock(g_present_mutex);
     g_present = std::move(sink);
 }
-void present_frame(const uint8_t* rgba, uint32_t width, uint32_t height) {
+void present_frame(const Frame& frame) {
     const std::lock_guard lock(g_present_mutex);
     if (!g_present) fatal("the game flips, and there is no window to show it in");
-    g_present(rgba, width, height);
+    g_present(frame);
 }
 
 }  // namespace rr7

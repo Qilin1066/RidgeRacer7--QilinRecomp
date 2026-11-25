@@ -23,6 +23,9 @@
 namespace qilin::host {
 struct Gpu;
 }
+// (Vulkan's handles, as vulkan_core.h declares them on a 64-bit host, so that this header needn't include it.)
+typedef struct VkImage_T* VkImage;
+typedef struct VkImageView_T* VkImageView;
 
 namespace rr7 {
 
@@ -126,8 +129,24 @@ bool renderer_fault(uint32_t address);
 // Where the renderer's time has gone (a development aid: logged when a timed run ends).
 void renderer_report();
 
-// Where a flip's picture goes (main.cpp: the window): RGBA8, `width` by `height`, rows packed.
-void set_present_sink(std::function<void(const uint8_t* rgba, uint32_t width, uint32_t height)> sink);
-void present_frame(const uint8_t* rgba, uint32_t width, uint32_t height);
+// A flip's picture: RGBA8 pixels, `width` by `height`, rows packed; or (rgba null) one the renderer keeps on the GPU,
+// numbered `gpu_frame` (renderer_frame_image).
+struct Frame {
+    const uint8_t* rgba = nullptr;
+    int gpu_frame = -1;
+    uint32_t width = 0, height = 0;
+};
+// Where a flip's picture goes (main.cpp: the window).
+void set_present_sink(std::function<void(const Frame&)> sink);
+void present_frame(const Frame& frame);
+// The flip of the display buffer at `address`: true if it is a surface the renderer holds on the GPU, newer than guest
+// memory, which is then copied to a picture of the renderer's own on the GPU and given to the present sink without
+// passing through guest memory; false if guest memory holds it (the caller shows it from there).
+bool renderer_flip(uint32_t address, uint32_t pitch, uint32_t width, uint32_t height);
+// A picture renderer_flip made: its image (TRANSFER_SRC_OPTIMAL, sampled; its copy submitted to the queue before the
+// flip gave it) and a view of it with alpha 1, for Display::present_image. Kept until two flips later.
+void renderer_frame_image(int gpu_frame, VkImage& image, VkImageView& view);
+// Its pixels, read back (RGBA8, rows packed): a development aid, for pictures saved to files.
+void renderer_frame_pixels(int gpu_frame, std::vector<uint8_t>& rgba);
 
 }  // namespace rr7

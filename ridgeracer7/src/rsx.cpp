@@ -11,6 +11,7 @@
 // state. **A method that isn't in the table of known ones stops the game
 // with its number**: none is skipped.
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <bit>
 #include <cstdio>
@@ -518,6 +519,8 @@ void flip(uint32_t id, uint32_t at) {
     if (!b.set) fatal("the RSX is to show display buffer %u, which the game never set (at offset %08x)", id, at);
     const VideoMode mode = video_mode();
     if (!mode.configured || mode.format != 0) fatal("a flip with the video output in format %u, which this runtime doesn't show yet", mode.format);
+    // Drawn by the renderer and still on the GPU: shown from there.
+    if (renderer_flip(kRsxLocal + b.offset, b.pitch, b.width, b.height)) return;
     std::vector<uint8_t> rgba(size_t{b.width} * b.height * 4);
     const uint8_t* from = guest_memory() + kRsxLocal + b.offset;
     for (uint32_t y = 0; y < b.height; ++y)
@@ -526,7 +529,7 @@ void flip(uint32_t id, uint32_t at) {
             uint8_t* q = rgba.data() + (size_t{y} * b.width + x) * 4;
             q[0] = p[1], q[1] = p[2], q[2] = p[3], q[3] = 255;
         }
-    present_frame(rgba.data(), b.width, b.height);
+    present_frame(Frame{rgba.data(), -1, b.width, b.height});
 }
 
 // NV308A's image from the CPU: words given in the command stream (COLOR, 0xa400 on) written into the 2D surface from POINT,
@@ -709,6 +712,9 @@ void serve() {
     bool idle_flushed = false;
     for (;;) {
         const uint32_t put = load32(control);
+        // (The commands before put were written before it moved: the game's own fence orders that, and this one keeps
+        // this thread's reads of them after its read of put.)
+        std::atomic_thread_fence(std::memory_order_acquire);
         g_put = put;
         if (r.get == put) {
             // Out of commands for 2 ms: what was drawn goes to guest memory. (Not at once: the game often runs the RSX dry

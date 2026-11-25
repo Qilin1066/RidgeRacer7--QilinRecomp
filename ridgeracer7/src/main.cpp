@@ -223,6 +223,7 @@ int main(int argc, char** argv) {
     static std::mutex frame_mutex;
     static std::vector<uint8_t> frame;
     static uint32_t frame_width = 0, frame_height = 0;
+    static int gpu_frame = -1;  // the last flip's picture, when the renderer keeps it on the GPU
     static std::atomic<uint64_t> flips{0};
     // A development aid: RR7_SAVE_FRAME=<n>[,<n>...] writes the nth flip's picture to frame-<n>.bmp in the current folder.
     static const std::set<uint64_t> save_frames = [] {
@@ -236,13 +237,20 @@ int main(int argc, char** argv) {
         }
         return s;
     }();
-    rr7::set_present_sink([](const uint8_t* rgba, uint32_t width, uint32_t height) {
+    rr7::set_present_sink([](const rr7::Frame& f) {
         const std::lock_guard lock(frame_mutex);
-        frame.assign(rgba, rgba + size_t{width} * height * 4);
-        frame_width = width, frame_height = height;
+        // (A picture on the GPU is kept as its number: the window shows it from there.)
+        if (f.rgba) frame.assign(f.rgba, f.rgba + size_t{f.width} * f.height * 4);
+        else frame.clear();
+        gpu_frame = f.gpu_frame;
+        frame_width = f.width, frame_height = f.height;
         const uint64_t n = ++flips;
-        if (n == 1 || n % 600 == 0) qilin::rt::log("flip %llu: %ux%u", static_cast<unsigned long long>(n), width, height);
-        if (save_frames.contains(n)) write_bmp(n, rgba, width, height);
+        if (n == 1 || n % 600 == 0) qilin::rt::log("flip %llu: %ux%u", static_cast<unsigned long long>(n), f.width, f.height);
+        if (save_frames.contains(n)) {
+            std::vector<uint8_t> pixels;
+            if (!f.rgba) rr7::renderer_frame_pixels(f.gpu_frame, pixels);
+            write_bmp(n, f.rgba ? f.rgba : pixels.data(), f.width, f.height);
+        }
     });
     static rr7::GameInfo game_info = std::move(info);
     static const qilin::Elf* program = &*elf;
@@ -266,6 +274,7 @@ int main(int argc, char** argv) {
     while (display.poll()) {
         if (seconds && std::chrono::steady_clock::now() > ends) {
             const std::lock_guard lock(frame_mutex);
+            if (gpu_frame >= 0) rr7::renderer_frame_pixels(gpu_frame, frame);
             if (!frame.empty()) write_bmp(0, frame.data(), frame_width, frame_height);
             rr7::renderer_report();
             qilin::rt::log("stopped: RR7_SECONDS's %s seconds are over, at flip %llu", seconds, static_cast<unsigned long long>(flips.load()));
@@ -313,14 +322,23 @@ int main(int argc, char** argv) {
             continue;
         }
         if (flips != shown) {
+            int on_gpu = -1;
             {
                 const std::lock_guard lock(frame_mutex);
-                picture = frame;
+                on_gpu = gpu_frame;
+                if (on_gpu < 0) picture = frame;
                 width = frame_width, height = frame_height;
                 shown = flips;
             }
             const std::lock_guard lock(queue);
-            display.present(width, height, picture.data(), 16.0f / 9.0f, height);
+            if (on_gpu >= 0) {
+                VkImage image = VK_NULL_HANDLE;
+                VkImageView view = VK_NULL_HANDLE;
+                rr7::renderer_frame_image(on_gpu, image, view);
+                display.present_image(image, view, width, height, 16.0f / 9.0f, height);
+            } else {
+                display.present(width, height, picture.data(), 16.0f / 9.0f, height);
+            }
         } else {
             const std::lock_guard lock(queue);
             display.present_again();

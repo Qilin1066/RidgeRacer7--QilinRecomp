@@ -632,8 +632,19 @@ private:
                                  SO(), OV(), CA(), R(d)));
             return true;
 
+        // ---------------------------------------------------------------- ordering: the host's fences
+        // Another thread (the RSX's above all: commands written, then the put pointer moved) must see the game's memory
+        // accesses in the order these promise, so they are fences, not nothing: the compiler may otherwise move the
+        // game's stores past them, and an ARM host's memory reorders them too. sync: a full fence; lwsync and eieio
+        // (which orders stores, as the game uses it): acquire and release, a compiler barrier on x86; isync: acquire.
+        case Op::sync:
+            line(in.ls() == 1 ? "std::atomic_thread_fence(std::memory_order_acq_rel);  // lwsync" : "std::atomic_thread_fence(std::memory_order_seq_cst);  // sync");
+            return true;
+        case Op::eieio: line("std::atomic_thread_fence(std::memory_order_acq_rel);  // eieio"); return true;
+        case Op::isync: line("std::atomic_thread_fence(std::memory_order_acquire);  // isync"); return true;
+
         // ---------------------------------------------------------------- nothing to do on a host
-        case Op::sync: case Op::eieio: case Op::isync: case Op::dcbt: case Op::dcbtst: case Op::dcbst: case Op::dcbf: case Op::icbi:
+        case Op::dcbt: case Op::dcbtst: case Op::dcbst: case Op::dcbf: case Op::icbi:
             line(std::format("// {}", ppu::spec(in.op).name));
             return true;
 

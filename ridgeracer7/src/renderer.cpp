@@ -930,6 +930,11 @@ void renderer_draw(const Draw& d) {
         const VkDeviceSize at = vertex_at + VkDeviceSize{slot} * 16 * d.count;
         float* out = reinterpret_cast<float*>(arena_at(r, at));
         for (uint32_t v = 0; v < d.count; ++v) attribute(format_word, guest_memory() + d.attribute_address[a] + (d.first + v) * stride, out + 4 * v);
+        if (d.logged && d.count) {
+            const uint8_t* raw = guest_memory() + d.attribute_address[a] + d.first * stride;
+            qilin::rt::log("(draw)   attribute %u format %08x: first vertex %g %g %g %g (bytes %02x %02x %02x %02x)", a, format_word, out[0], out[1], out[2], out[3], raw[0],
+                           raw[1], raw[2], raw[3]);
+        }
         offsets.push_back(at);
         ++slot;
     }

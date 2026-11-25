@@ -57,6 +57,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The renderer no longer writes every surface back each time the RSX briefly runs out of commands mid-frame: it waits 2 ms first (labels, waits and flips still flush at once).
 - `sys_memory_allocate` could give the same address twice when blocks of both page sizes were allocated: the game's packs then overwrote one another, and it faulted going over one's table.
 - The archive's directory: a record begins with its name, not ends with it. Every pack and file had its neighbour's name since v0.5.0 (`docs/data-files.md`).
+- Trees, fence posts and banner frames were the fog's blue: a vertex program's ADD reads its second source from slot 2, and the translation and `qilin shaders --disasm` took slot 1 (unused, read as the position). `RR7_DRAWLOG` gives a draw's programs and vertex constants.
 - Streamed music (`cellAtrac`) stopped the game in its first race: frames start after the file's header, so once the ring buffer had gone round, a frame ran over its end, and was read past it. Such a frame is now read in two parts. `RR7_DRAWLOG` gives a draw's fragment constants.
 - The build scripts count 8 GB per compiler, not 5: four compilers at once ran a PC with 22 GB free critically low, though one measured alone peaks at 4 GB.
 

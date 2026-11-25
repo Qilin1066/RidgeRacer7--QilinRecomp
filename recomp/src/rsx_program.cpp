@@ -119,6 +119,8 @@ std::string vp_source(const VpInsn& in, unsigned i) {
     return s.negate ? "-" + t : t;
 }
 // How many sources each operation reads, and from which of the three slots.
+// The slot an operation's `i`th source is in: ADD's second is in slot 2 (slot 1 is left unused), as nouveau places it.
+unsigned vec_slot(unsigned op, unsigned i) { return op == kVecAdd && i == 1 ? 2 : i; }
 unsigned vec_sources(unsigned op) {
     switch (op) {
     case kVecNop: return 0;
@@ -146,7 +148,7 @@ std::string disasm(const VpInsn& in) {
         out += std::format("{}{} {}", name ? name : std::format("vec{:#x}", in.vec_op).c_str(), flags, dest_text(in.vec_result, in.vec_temp, in.vec_mask));
         out += cond;
         const unsigned n = vec_sources(in.vec_op);
-        for (unsigned i = 0; i < n; ++i) out += ", " + vp_source(in, i);
+        for (unsigned i = 0; i < n; ++i) out += ", " + vp_source(in, vec_slot(in.vec_op, i));
     }
     if (in.sca_op != kScaNop) {
         if (!out.empty()) out += "  +  ";
@@ -389,8 +391,10 @@ std::vector<std::string> check_program(const CgProgram& p) {
             // The sources the operations read: the vector unit's from slots 0 to 2, the scalar unit's from slot 2.
             const unsigned reads = vec_sources(in.vec_op);
             const bool scalar_reads = in.sca_op != kScaNop && in.sca_op != kScaBra && in.sca_op != kScaCal && in.sca_op != kScaRet;
+            bool read[3] = {false, false, scalar_reads};
+            for (unsigned k = 0; k < reads; ++k) read[vec_slot(in.vec_op, k)] = true;
             for (unsigned k = 0; k < 3; ++k) {
-                if (!(k < reads || (k == 2 && scalar_reads))) continue;
+                if (!read[k]) continue;
                 if (in.src[k].type == VpRegister::constant) constants.insert(in.constant);
                 if (in.src[k].type == VpRegister::input) inputs.insert(in.input);
                 if (in.src[k].type == VpRegister::unknown) bad(std::format("instruction {}: source {} of register type 0", i, k));

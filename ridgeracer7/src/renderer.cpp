@@ -734,6 +734,15 @@ void renderer_draw(const Draw& d) {
     const host::Gpu& gpu = *r.gpu;
     const qilin::rt::TranslatedShader& vs = find_shader(d.vertex_program, true);
     const qilin::rt::TranslatedShader& fs = find_shader(d.fragment_program, false);
+    if (d.logged) {
+        // Which compiled programs (their addresses in the program, as `qilin shaders` lists them), and the vertex
+        // constants the game sets that aren't zero, past the matrices.
+        qilin::rt::log("(draw)   vertex program at %08x, fragment program at %08x", vs.address, fs.address);
+        for (unsigned c = 24; c < kVertexConstants; ++c) {
+            const float* v = d.vertex_constants + 4 * c;
+            if (v[0] != 0 || v[1] != 0 || v[2] != 0 || v[3] != 0) qilin::rt::log("(draw)   vertex constant %u: %g %g %g %g", c, v[0], v[1], v[2], v[3]);
+        }
+    }
     // What the fragment program reads, the vertex program must write (COL0 1, COL1 2, FOGC 5, TEXn 7 + n).
     static constexpr unsigned kLocation[14] = {0, 1, 2, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     for (unsigned n = 1; n < 14; ++n)

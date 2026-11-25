@@ -284,7 +284,7 @@ private:
             switch (in.vec_op) {
             case kVecMov: vec = a; break;
             case kVecMul: vec = mul(a, bsrc()); break;
-            case kVecAdd: vec = add(a, bsrc()); break;
+            case kVecAdd: vec = add(a, source(in, 2)); break;  // (its second source is in slot 2)
             case kVecMad: { const uint32_t c = bsrc(); vec = add(mul(a, c), source(in, 2)); break; }
             case kVecDp3: vec = dot3(a, bsrc()); break;
             case kVecDp4: vec = dot4(a, bsrc()); break;

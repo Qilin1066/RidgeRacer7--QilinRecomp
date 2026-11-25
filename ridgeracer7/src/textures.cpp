@@ -177,7 +177,7 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
             if (stride < row) return what("a compressed texture's pitch %u", pitch);
             for (uint32_t by = 0; by < bh; ++by)
                 for (uint32_t bx = 0; bx < bw; ++bx) {
-                    uint8_t argb[16][4];
+                    uint8_t argb[16][4] = {};
                     block(f, level + size_t{by} * stride + size_t{bx} * unit_bytes(f), argb);
                     for (uint32_t i = 0; i < 16; ++i) {
                         const uint32_t x = bx * 4 + i % 4, y = by * 4 + i / 4;
@@ -208,7 +208,7 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
                     continue;
                 }
                 for (uint32_t x = 0; x < w; ++x) {
-                    uint8_t argb[4];
+                    uint8_t argb[4] = {};  // (every format texel() takes fills all four)
                     texel(f, row + xs[x], argb);
                     put(x, y, argb);
                 }

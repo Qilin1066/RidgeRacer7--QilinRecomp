@@ -1,8 +1,11 @@
 #include "textures.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 namespace rr7 {
 
@@ -142,6 +145,14 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
     if (f == kB8)
         for (unsigned c = 0; c < 4; ++c)
             if (kind[c] == 2 && source[c] != 3) return what("a B8 texture's remap %08x, which reads a channel other than B", t.remap);
+    // Each channel out (R, G, B, A, as the image holds them) as an index into {A, R, G, B, 0, 255}: output R is the remap's
+    // channel 1, G 2, B 3, A 0.
+    std::array<uint8_t, 4> pick{};
+    for (unsigned c = 0; c < 4; ++c) {
+        const unsigned o = c == 3 ? 0 : c + 1;
+        pick[c] = static_cast<uint8_t>(kind[o] == 0 ? 4 : kind[o] == 1 ? 5 : source[o]);
+    }
+    const bool as_stored = pick == std::array<uint8_t, 4>{1, 2, 3, 0};  // R, G, B, A as they are
 
     const uint32_t faces = (t.format & 4) ? 6 : 1;
     out = {width, height, levels, faces, {}, {}};
@@ -156,12 +167,9 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
         uint8_t* rgba = out.rgba.data() + base;
         const uint8_t* level = memory + t.address + at;
         const auto put = [&](uint32_t x, uint32_t y, const uint8_t* argb) {
+            const uint8_t choices[6] = {argb[0], argb[1], argb[2], argb[3], 0, 255};
             uint8_t* q = rgba + (size_t{y} * w + x) * 4;
-            for (unsigned c = 0; c < 4; ++c) {
-                // RGBA order out: output R is remap channel 1, G 2, B 3, A 0.
-                const unsigned o = c == 3 ? 0 : c + 1;
-                q[c] = kind[o] == 0 ? 0 : kind[o] == 1 ? 255 : argb[source[o]];
-            }
+            for (unsigned c = 0; c < 4; ++c) q[c] = choices[pick[c]];
         };
         if (compressed(f)) {
             const uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, row = bw * unit_bytes(f);
@@ -181,12 +189,30 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
             const uint32_t bytes = unit_bytes(f);
             if (linear && pitch < w * bytes) return what("a linear texture's pitch %u", pitch);
             const uint32_t lw = static_cast<uint32_t>(std::countr_zero(w)), lh = static_cast<uint32_t>(std::countr_zero(h));
-            for (uint32_t y = 0; y < h; ++y)
+            // A texel's place in guest memory, as a column's part and a row's: swizzled, x's bits and y's never share a
+            // place, so the offset of (x, y) is that of (x, 0) plus that of (0, y).
+            std::vector<size_t> xs(w), ys(h);
+            for (uint32_t x = 0; x < w; ++x) xs[x] = linear ? size_t{x} * bytes : size_t{swizzled(x, 0, lw, lh)} * bytes;
+            for (uint32_t y = 0; y < h; ++y) ys[y] = linear ? size_t{y} * pitch : size_t{swizzled(0, y, lw, lh)} * bytes;
+            for (uint32_t y = 0; y < h; ++y) {
+                const uint8_t* row = level + ys[y];
+                if (f == kA8R8G8B8 && as_stored) {
+                    // A, R, G, B in memory to R, G, B, A: a word turned by a byte (on a little-endian host, as load32 assumes).
+                    uint8_t* q = rgba + size_t{y} * w * 4;
+                    for (uint32_t x = 0; x < w; ++x) {
+                        uint32_t v;
+                        std::memcpy(&v, row + xs[x], 4);
+                        v = std::rotr(v, 8);
+                        std::memcpy(q + 4 * size_t{x}, &v, 4);
+                    }
+                    continue;
+                }
                 for (uint32_t x = 0; x < w; ++x) {
                     uint8_t argb[4];
-                    texel(f, level + (linear ? size_t{y} * pitch + size_t{x} * bytes : size_t{swizzled(x, y, lw, lh)} * bytes), argb);
+                    texel(f, row + xs[x], argb);
                     put(x, y, argb);
                 }
+            }
             at += linear ? size_t{pitch} * h : size_t{w} * h * bytes;
         }
     }

@@ -298,12 +298,18 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         d.attribute_address[a] = guest_address(offset >> 31, (offset & 0x7fffffffu) + state(0x1738), "a vertex array");
     }
     d.vertex_constants = r.constants.data();
-    // The vertex program: from its start to the instruction marked last.
-    for (uint32_t i = state(0x1ea0); i < 512; ++i) {
-        for (unsigned k = 0; k < 4; ++k)
-            for (int b = 24; b >= 0; b -= 8) d.vertex_program.push_back(static_cast<uint8_t>(r.program[4 * i + k] >> b));
-        if (r.program[4 * i + 3] & 1) break;
-        if (i == 511) fatal("the vertex program from slot %u has no last instruction", state(0x1ea0));
+    // The vertex program: from its start to the instruction marked last, as big-endian bytes.
+    {
+        const uint32_t start = state(0x1ea0);
+        if (start >= 512) fatal("a vertex program started at slot %u, past the 512", start);
+        uint32_t last = start;
+        while (last < 512 && !(r.program[4 * last + 3] & 1)) ++last;
+        if (last == 512) fatal("the vertex program from slot %u has no last instruction", start);
+        d.vertex_program.resize(size_t{last - start + 1} * 16);
+        for (size_t w = 0; w < d.vertex_program.size() / 4; ++w) {
+            const uint32_t big = std::byteswap(r.program[4 * start + w]);
+            std::memcpy(d.vertex_program.data() + 4 * w, &big, 4);
+        }
     }
     // The fragment program: from its address to the instruction marked as the end, with its inline constants.
     {

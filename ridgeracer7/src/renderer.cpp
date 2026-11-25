@@ -9,6 +9,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <span>
 #include <string>
 #include <tuple>
 
@@ -110,6 +112,16 @@ uint64_t hash_bytes(const uint8_t* p, size_t n) {
 constexpr uint32_t kMostSets = 1024;                   // descriptor sets in a batch
 constexpr VkDeviceSize kArenaBytes = 64u << 20;        // vertices, indices, constants and texels of a batch
 
+// A pipeline's key: the programs and every piece of state that goes into it (pipeline_for), as words.
+using PipelineKey = std::array<uint32_t, 39>;
+struct PipelineKeyHash {
+    size_t operator()(const PipelineKey& key) const noexcept {
+        uint64_t h = 0x9e3779b97f4a7c15ull;
+        for (const uint32_t w : key) h = (h ^ w) * 0xff51afd7ed558ccdull;
+        return static_cast<size_t>(h ^ (h >> 32));
+    }
+};
+
 struct Renderer {
     host::Gpu* gpu = nullptr;
     std::mutex* queue = nullptr;
@@ -120,8 +132,14 @@ struct Renderer {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkDescriptorPool descriptors = VK_NULL_HANDLE;
     std::map<uint64_t, const qilin::rt::TranslatedShader*> shaders;  // by key
+    // The programs last drawn with, newest first, by their microcode as the game gave it (find_shader).
+    struct ShaderMemo {
+        std::vector<uint8_t> microcode;
+        const qilin::rt::TranslatedShader* shader = nullptr;
+    };
+    std::array<ShaderMemo, 8> recent_shaders[2];  // [0] fragment, [1] vertex
     std::map<const qilin::rt::TranslatedShader*, VkShaderModule> modules;
-    std::map<std::vector<uint32_t>, VkPipeline> pipelines;
+    std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> pipelines;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, SurfaceEntry> surfaces;  // by address, format, width, height
     // The batch being recorded (renderer.hpp).
     bool recording = false;
@@ -211,7 +229,39 @@ void attribute(uint32_t format, const uint8_t* p, float* out) {
     }
 }
 
+// Whether two programs' microcode is the same but for the inline constants (whose places `s` lists, in order).
+bool same_program(std::span<const uint8_t> a, std::span<const uint8_t> b, const qilin::rt::TranslatedShader& s) {
+    if (a.size() != b.size()) return false;
+    size_t from = 0;
+    for (size_t i = 0; i < s.constant_slot_count; ++i) {
+        const size_t slot = s.constant_slots[i];
+        if (slot < from || slot + 16 > a.size()) return false;  // (not in order: taken as different, and keyed afresh)
+        if (std::memcmp(a.data() + from, b.data() + from, slot - from) != 0) return false;
+        from = slot + 16;
+    }
+    return std::memcmp(a.data() + from, b.data() + from, a.size() - from) == 0;
+}
+
+const qilin::rt::TranslatedShader& find_shader_keyed(const std::vector<uint8_t>& microcode, bool vertex);
+
+// A draw's program. The game draws thousands of times a frame with a few programs, changing only a fragment program's
+// constants between draws: the last eight are compared first, constants left out, before the key is worked out.
 const qilin::rt::TranslatedShader& find_shader(const std::vector<uint8_t>& microcode, bool vertex) {
+    auto& recent = g_renderer->recent_shaders[vertex];
+    for (size_t i = 0; i < recent.size() && recent[i].shader; ++i)
+        if (same_program(microcode, recent[i].microcode, *recent[i].shader)) {
+            std::rotate(recent.begin(), recent.begin() + static_cast<std::ptrdiff_t>(i), recent.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+            return *recent[0].shader;
+        }
+    const qilin::rt::TranslatedShader& found = find_shader_keyed(microcode, vertex);
+    std::rotate(recent.begin(), recent.end() - 1, recent.end());
+    recent[0].microcode.assign(microcode.begin(), microcode.end());
+    recent[0].shader = &found;
+    return found;
+}
+
+// The program whose key (shaders.hpp: its microcode's hash, the inline constants left out) the microcode's is.
+const qilin::rt::TranslatedShader& find_shader_keyed(const std::vector<uint8_t>& microcode, bool vertex) {
     std::vector<uint8_t> keyed = microcode;
     if (!vertex) {
         // The inline constants left out, as `qilin shaders` keys it: after any instruction with a source of type 2.
@@ -376,7 +426,7 @@ VkStencilOpState stencil_state(const Draw::Stencil& s) {
 }
 
 VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, const qilin::rt::TranslatedShader& fs, VkFormat format, VkPrimitiveTopology topology) {
-    std::vector<uint32_t> key{static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs) >> 32),
+    const PipelineKey key{static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs) >> 32),
                               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs) >> 32),
                               static_cast<uint32_t>(format), static_cast<uint32_t>(topology), d.color_mask, d.blend, d.blend_src, d.blend_dst, d.blend_equation,
                               d.depth_test, d.depth_write, d.depth_func, d.cull, d.cull_face, d.front_face, d.depth_bias, d.depth_surface, d.stencil_test,

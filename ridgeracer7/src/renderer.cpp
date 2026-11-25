@@ -41,7 +41,7 @@ struct SurfaceEntry {
     bool depth = false;
     bool coherent = true;  // whether its memory needs invalidating before the CPU reads what the GPU wrote
     // After a write-back the image holds what guest memory does, until something else writes there: the hash of the
-    // guest bytes as written back tells.
+    // guest bytes as written back tells (surface_hash).
     bool resident = false;
     uint64_t written_hash = 0;
     bool touched = false;  // drawn in the batch being recorded
@@ -630,6 +630,16 @@ void end_rendering(Renderer& r) {
 bool overlaps(uint32_t a, uint64_t a_bytes, uint32_t b, uint64_t b_bytes) { return a < b + b_bytes && b < a + a_bytes; }
 uint64_t surface_bytes(const Surface& s) { return uint64_t{s.pitch} * s.height; }
 
+// A surface's guest bytes as its image holds them: each row's pixels (four bytes each), not the pitch's padding past them,
+// hashed a row at a time, so that a write-back can hash each row while it is still in the cache.
+uint64_t add_row(uint64_t h, const uint8_t* row, uint32_t width) { return (h ^ hash_bytes(row, size_t{width} * 4)) * 0xff51afd7ed558ccdull; }
+constexpr uint64_t kSurfaceHashStart = 0x9e3779b97f4a7c15ull;
+uint64_t surface_hash(const Surface& d) {
+    uint64_t h = kSurfaceHashStart;
+    for (uint32_t y = 0; y < d.height; ++y) h = add_row(h, guest_memory() + d.address + size_t{y} * d.pitch, d.width);
+    return h;
+}
+
 // Whether guest memory [address, address + bytes) overlaps a surface drawn in this batch (other than `except`).
 bool touched_overlap(const Renderer& r, uint32_t address, uint64_t bytes, const SurfaceEntry* except) {
     for (const SurfaceEntry* s : r.touched)
@@ -677,12 +687,16 @@ void depth_to_host(const SurfaceEntry& s) {
         }
     }
 }
-void surface_to_guest(const SurfaceEntry& s) {
+// The staging buffer's pixels to guest memory; returns their surface_hash.
+uint64_t surface_to_guest(const SurfaceEntry& s) {
+    uint64_t h = kSurfaceHashStart;
     if (!s.depth) {
-        for (uint32_t y = 0; y < s.desc.height; ++y)
-            to_guest(s.desc.format, static_cast<const uint8_t*>(s.staging.mapped) + size_t{y} * s.desc.width * 4, guest_memory() + s.desc.address + size_t{y} * s.desc.pitch,
-                     s.desc.width);
-        return;
+        for (uint32_t y = 0; y < s.desc.height; ++y) {
+            uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
+            to_guest(s.desc.format, static_cast<const uint8_t*>(s.staging.mapped) + size_t{y} * s.desc.width * 4, row, s.desc.width);
+            h = add_row(h, row, s.desc.width);
+        }
+        return h;
     }
     const bool unorm = g_renderer->depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
     const size_t texels = size_t{s.desc.width} * s.desc.height;
@@ -698,14 +712,16 @@ void surface_to_guest(const SurfaceEntry& s) {
             const uint32_t w = std::byteswap((d << 8) | stencil[i]);
             std::memcpy(row + 4 * x, &w, 4);
         }
+        h = add_row(h, row, s.desc.width);
     }
+    return h;
 }
 
 // The surface from guest memory into its image, as a batch first draws to it, ready to draw to.
 void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s) {
     // (Not copied when the image already holds what guest memory does.)
     const VkImageLayout ready = s.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    if (s.resident && hash_bytes(guest_memory() + s.desc.address, surface_bytes(s.desc)) == s.written_hash) {
+    if (s.resident && surface_hash(s.desc) == s.written_hash) {
         host::transition(cmd, s.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ready, aspects(s));
         return;
     }
@@ -781,7 +797,7 @@ void renderer_flush(const char* why) {
     for (SurfaceEntry* s : r.touched) {
         if (!s->written) {
             // Unchanged by the batch: the image still holds what guest memory does.
-            s->written_hash = hash_bytes(guest_memory() + s->desc.address, surface_bytes(s->desc));
+            s->written_hash = surface_hash(s->desc);
             s->resident = true;
             s->touched = false;
             continue;
@@ -791,8 +807,7 @@ void renderer_flush(const char* why) {
             const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s->staging.memory, 0, VK_WHOLE_SIZE};
             host::check(vkInvalidateMappedMemoryRanges(gpu.device, 1, &range), "vkInvalidateMappedMemoryRanges");
         }
-        surface_to_guest(*s);
-        s->written_hash = hash_bytes(guest_memory() + s->desc.address, surface_bytes(s->desc));
+        s->written_hash = surface_to_guest(*s);
         s->resident = true;
         s->touched = false;
     }

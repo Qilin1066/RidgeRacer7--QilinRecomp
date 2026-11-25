@@ -49,6 +49,9 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The depth bounds test, as Vulkan's (the stored depth against the bounds, which are part of the pipeline); a GPU without it stops the game by name. The game uses it on its way to a race.
 - `RR7_SAVE_FRAME` takes a list of flips; `RR7_DRAWLOG` gives each draw's viewport, clip and scissor.
 
+### Changed
+- README rewritten to the layout shared by the QilinRecomp projects: what works and how to build and play it, without the development history.
+
 ### Checked
 - On the owner's PC: the game starts its sound core (`bnusCoreSpu.elf`) as an SPU thread, which runs; it reads and unpacks its first packs of `RR7.DAT`, and runs on to its first drawing: it stops at the RSX method that loads a vertex program. 110 of its 248 imports and 54 of its 78 system calls are provided.
 

@@ -207,25 +207,54 @@ void to_guest(uint32_t format, const uint8_t* from, uint8_t* to, size_t pixels) 
 }
 
 // One vertex attribute's components as floats: the RSX's types (CELL_GCM_VERTEX_...), big-endian.
-void attribute(uint32_t format, const uint8_t* p, float* out) {
+uint32_t load_be32(const uint8_t* p) {
+    uint32_t w;
+    std::memcpy(&w, p, 4);
+    return std::byteswap(w);
+}
+
+// A half (big-endian bytes) as a float. A normal one is built from its bits (exactly 1.m times 2 to the e - 15).
+float half_float(const uint8_t* p) {
+    const uint16_t h = static_cast<uint16_t>((p[0] << 8) | p[1]);
+    const uint32_t sign = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    if (e != 0 && e != 31) return std::bit_cast<float>((sign << 31) | ((e + 112) << 23) | (m << 13));
+    const float v = e == 0 ? std::ldexp(static_cast<float>(m), -24) : m ? NAN : INFINITY;
+    return sign ? -v : v;
+}
+
+// One component of a vertex attribute of the RSX's type `Type` (CELL_GCM_VERTEX_...), big-endian.
+template <uint32_t Type>
+float component(const uint8_t* p, uint32_t c) {
+    if constexpr (Type == 1) return std::max(-1.0f, static_cast<float>(static_cast<int16_t>((p[2 * c] << 8) | p[2 * c + 1])) / 32767.0f);  // S1
+    if constexpr (Type == 2) return std::bit_cast<float>(load_be32(p + 4 * c));                                                         // F
+    if constexpr (Type == 3) return half_float(p + 2 * c);                                                                             // SF
+    if constexpr (Type == 4) return static_cast<float>(p[c]) / 255.0f;                                                                 // UB
+    if constexpr (Type == 5) return static_cast<float>(static_cast<int16_t>((p[2 * c] << 8) | p[2 * c + 1]));                         // S32K
+    if constexpr (Type == 7) return static_cast<float>(p[c]);                                                                          // UB256
+}
+template <uint32_t Type>
+void decode_attribute(const uint8_t* p, size_t stride, uint32_t size, uint32_t count, float* out) {
+    for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) {
+        out[0] = out[1] = out[2] = 0.0f, out[3] = 1.0f;
+        for (uint32_t c = 0; c < size; ++c) out[c] = component<Type>(p, c);
+    }
+}
+
+// An attribute's `count` vertices from `p`, `stride` bytes apart, as four floats each (missing components 0, 0, 0, 1).
+void decode_attributes(uint32_t format, const uint8_t* p, size_t stride, uint32_t count, float* out) {
     const uint32_t type = format & 0xf, size = (format >> 4) & 0xf;
-    out[0] = out[1] = out[2] = 0.0f, out[3] = 1.0f;
-    for (uint32_t c = 0; c < size; ++c) {
-        switch (type) {
-        case 1: out[c] = std::max(-1.0f, static_cast<float>(static_cast<int16_t>((p[2 * c] << 8) | p[2 * c + 1])) / 32767.0f); break;  // S1
-        case 2: out[c] = std::bit_cast<float>((uint32_t{p[4 * c]} << 24) | (uint32_t{p[4 * c + 1]} << 16) | (uint32_t{p[4 * c + 2]} << 8) | p[4 * c + 3]); break;  // F
-        case 3: {  // SF: a half
-            const uint16_t h = static_cast<uint16_t>((p[2 * c] << 8) | p[2 * c + 1]);
-            const uint32_t sign = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
-            float v = e == 0 ? std::ldexp(static_cast<float>(m), -24) : e == 31 ? (m ? NAN : INFINITY) : std::ldexp(static_cast<float>(m | 0x400), static_cast<int>(e) - 25);
-            out[c] = sign ? -v : v;
-            break;
-        }
-        case 4: out[c] = static_cast<float>(p[c]) / 255.0f; break;  // UB
-        case 5: out[c] = static_cast<float>(static_cast<int16_t>((p[2 * c] << 8) | p[2 * c + 1])); break;  // S32K
-        case 7: out[c] = static_cast<float>(p[c]); break;  // UB256
-        default: fatal("a vertex attribute of type %u, which the renderer doesn't take yet", type);
-        }
+    if (!count || !size) {
+        for (uint32_t v = 0; v < count; ++v) out[4 * v] = out[4 * v + 1] = out[4 * v + 2] = 0.0f, out[4 * v + 3] = 1.0f;
+        return;
+    }
+    switch (type) {
+    case 1: return decode_attribute<1>(p, stride, size, count, out);
+    case 2: return decode_attribute<2>(p, stride, size, count, out);
+    case 3: return decode_attribute<3>(p, stride, size, count, out);
+    case 4: return decode_attribute<4>(p, stride, size, count, out);
+    case 5: return decode_attribute<5>(p, stride, size, count, out);
+    case 7: return decode_attribute<7>(p, stride, size, count, out);
+    default: fatal("a vertex attribute of type %u, which the renderer doesn't take yet", type);
     }
 }
 
@@ -1026,7 +1055,7 @@ void renderer_draw(const Draw& d) {
         if (((format_word >> 4) & 0xf) == 0) fatal("the vertex program at %08x reads attribute %u, which the draw gives no array", vs.address, a);
         const VkDeviceSize at = vertex_at + VkDeviceSize{slot} * 16 * d.count;
         float* out = reinterpret_cast<float*>(arena_at(r, at));
-        for (uint32_t v = 0; v < d.count; ++v) attribute(format_word, guest_memory() + d.attribute_address[a] + (d.first + v) * stride, out + 4 * v);
+        decode_attributes(format_word, guest_memory() + d.attribute_address[a] + size_t{d.first} * stride, stride, d.count, out);
         if (d.logged && d.count) {
             const uint8_t* raw = guest_memory() + d.attribute_address[a] + d.first * stride;
             qilin::rt::log("(draw)   attribute %u format %08x: first vertex %g %g %g %g (bytes %02x %02x %02x %02x)", a, format_word, out[0], out[1], out[2], out[3], raw[0],

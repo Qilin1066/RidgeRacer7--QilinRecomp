@@ -8,6 +8,8 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <tuple>
 
 #include "kernel.hpp"
@@ -143,6 +145,8 @@ struct Stats {
     std::atomic<uint64_t> gpu_draw_ns{0}, gpu_copy_ns{0};  // the GPU's own time: the batch's commands, and its copies back
 };
 Stats g_stats;
+std::mutex g_flush_reasons_mutex;
+std::map<std::string, uint64_t> g_flush_reasons;  // flushes with work in them, by what asked for them
 using Clock = std::chrono::steady_clock;
 uint64_t since(Clock::time_point t) { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
 std::mutex g_present_mutex;
@@ -164,16 +168,21 @@ VkFormat surface_format(uint32_t format, uint32_t& bytes) {
 }
 
 // Guest memory to the image's bytes, and back: A8R8G8B8 is A, R, G, B in memory and R, G, B, A in the image; floats are big-endian.
+// (As words, on a little-endian host as load32 and store32 assume: A8R8G8B8 is a rotation by a byte, a float a byte swap.)
 void to_host(uint32_t format, const uint8_t* from, uint8_t* to, size_t pixels) {
     for (size_t i = 0; i < pixels; ++i, from += 4, to += 4) {
-        if (format == 8) to[0] = from[1], to[1] = from[2], to[2] = from[3], to[3] = from[0];
-        else to[0] = from[3], to[1] = from[2], to[2] = from[1], to[3] = from[0];
+        uint32_t w;
+        std::memcpy(&w, from, 4);
+        w = format == 8 ? std::rotr(w, 8) : std::byteswap(w);
+        std::memcpy(to, &w, 4);
     }
 }
 void to_guest(uint32_t format, const uint8_t* from, uint8_t* to, size_t pixels) {
     for (size_t i = 0; i < pixels; ++i, from += 4, to += 4) {
-        if (format == 8) to[0] = from[3], to[1] = from[0], to[2] = from[1], to[3] = from[2];
-        else to[0] = from[3], to[1] = from[2], to[2] = from[1], to[3] = from[0];
+        uint32_t w;
+        std::memcpy(&w, from, 4);
+        w = format == 8 ? std::rotl(w, 8) : std::byteswap(w);
+        std::memcpy(to, &w, 4);
     }
 }
 
@@ -575,13 +584,17 @@ void depth_to_host(const SurfaceEntry& s) {
     const size_t texels = size_t{s.desc.width} * s.desc.height;
     uint32_t* depth = static_cast<uint32_t*>(s.staging.mapped);
     uint8_t* stencil = static_cast<uint8_t*>(s.staging.mapped) + texels * 4;
-    for (uint32_t y = 0; y < s.desc.height; ++y)
+    for (uint32_t y = 0; y < s.desc.height; ++y) {
+        const uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
         for (uint32_t x = 0; x < s.desc.width; ++x) {
-            const uint32_t w = load32(s.desc.address + y * s.desc.pitch + 4 * x);
+            uint32_t w;
+            std::memcpy(&w, row + 4 * x, 4);
+            w = std::byteswap(w);
             const size_t i = size_t{y} * s.desc.width + x;
             depth[i] = unorm ? w >> 8 : std::bit_cast<uint32_t>(static_cast<float>(w >> 8) / 16777215.0f);
             stencil[i] = static_cast<uint8_t>(w);
         }
+    }
 }
 void surface_to_guest(const SurfaceEntry& s) {
     if (!s.depth) {
@@ -594,13 +607,17 @@ void surface_to_guest(const SurfaceEntry& s) {
     const size_t texels = size_t{s.desc.width} * s.desc.height;
     const uint32_t* depth = static_cast<const uint32_t*>(s.staging.mapped);
     const uint8_t* stencil = static_cast<const uint8_t*>(s.staging.mapped) + texels * 4;
-    for (uint32_t y = 0; y < s.desc.height; ++y)
+    for (uint32_t y = 0; y < s.desc.height; ++y) {
+        uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
         for (uint32_t x = 0; x < s.desc.width; ++x) {
             const size_t i = size_t{y} * s.desc.width + x;
             uint32_t d = depth[i] & 0xffffffu;
-            if (!unorm) d = static_cast<uint32_t>(std::lround(std::clamp(std::bit_cast<float>(depth[i]), 0.0f, 1.0f) * 16777215.0f));
-            store32(s.desc.address + y * s.desc.pitch + 4 * x, (d << 8) | stencil[i]);
+            // (Rounded half away from zero, as lround, on a non-negative float below 2^24: adding a half is exact in a double.)
+            if (!unorm) d = static_cast<uint32_t>(static_cast<double>(std::clamp(std::bit_cast<float>(depth[i]), 0.0f, 1.0f) * 16777215.0f) + 0.5);
+            const uint32_t w = std::byteswap((d << 8) | stencil[i]);
+            std::memcpy(row + 4 * x, &w, 4);
         }
+    }
 }
 
 // The surface from guest memory into its image, as a batch first draws to it, ready to draw to.
@@ -633,9 +650,13 @@ void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s) {
 }  // namespace
 
 // The batch: everything drawn since the last flush is submitted, waited for, and its surfaces written back to guest memory.
-void renderer_flush() {
+void renderer_flush(const char* why) {
     if (!g_renderer || !g_renderer->recording) return;
     const Clock::time_point flush_start = Clock::now();
+    {
+        const std::lock_guard lock(g_flush_reasons_mutex);
+        ++g_flush_reasons[why];
+    }
     Renderer& r = *g_renderer;
     const host::Gpu& gpu = *r.gpu;
     end_rendering(r);
@@ -725,6 +746,8 @@ void renderer_report() {
                    static_cast<unsigned long long>(g_stats.texture_bytes.load() >> 20), ms(g_stats.upload_ns), static_cast<unsigned long long>(g_stats.uploads.load()),
                    static_cast<unsigned long long>(g_stats.flushes.load()), ms(g_stats.flush_ns), ms(g_stats.wait_ns), ms(g_stats.writeback_ns),
                    ms(g_stats.gpu_draw_ns), ms(g_stats.gpu_copy_ns));
+    const std::lock_guard lock(g_flush_reasons_mutex);
+    for (const auto& [why, count] : g_flush_reasons) qilin::rt::log("renderer: %llu flushes for %s", static_cast<unsigned long long>(count), why.c_str());
 }
 
 void renderer_draw(const Draw& d) {
@@ -838,7 +861,7 @@ void renderer_draw(const Draw& d) {
         if (overlaps(d.depth.address, surface_bytes(d.depth), d.color.address, surface_bytes(d.color))) fatal("a draw's depth surface overlaps its colour surface");
     }
     if (touched_overlap(r, d.color.address, surface_bytes(d.color), &target) || (depth && touched_overlap(r, d.depth.address, surface_bytes(d.depth), depth)))
-        renderer_flush();
+        renderer_flush("a surface overlapping one drawn");
 
     // The textures the fragment program samples, read from guest memory: after the batch is written back, if they
     // overlap a surface drawn in it (a picture drawn and then sampled).
@@ -885,7 +908,7 @@ void renderer_draw(const Draw& d) {
             up.sampler = sampler_for(u, fields, (t.format >> 16) & 0xffff);
         }
         if (!overlap) break;
-        renderer_flush();
+        renderer_flush("a texture drawn in the batch");
     }
     for (Upload& up : uploads) {
         if (!up.decode) continue;
@@ -905,7 +928,7 @@ void renderer_draw(const Draw& d) {
     for (const Upload& up : uploads) needed += up.decode ? up.texels.rgba.size() + r.align : 0;
     if (needed > r.arena.size) {
         // A draw larger than the arena: the batch is written back and the arena made big enough (a power of two).
-        renderer_flush();
+        renderer_flush("a draw larger than the arena");
         VkDeviceSize size = r.arena.size;
         while (size < needed) size *= 2;
         r.arena.destroy(gpu);
@@ -917,7 +940,7 @@ void renderer_draw(const Draw& d) {
                        static_cast<unsigned long long>(size >> 20), static_cast<unsigned long long>(needed >> 20), d.count, d.first, d.indexed ? "indexed" : "arrays",
                        d.indices.size(), attributes, texels >> 20);
     }
-    if (r.recording && (r.arena_used + needed > r.arena.size || r.sets_used + 2 > kMostSets)) renderer_flush();
+    if (r.recording && (r.arena_used + needed > r.arena.size || r.sets_used + 2 > kMostSets)) renderer_flush("a full batch");
     VkCommandBuffer cmd = r.cmd;
     if (!r.recording) {
         host::check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");

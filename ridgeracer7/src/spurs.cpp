@@ -211,15 +211,17 @@ void start_task(uint32_t taskset, uint32_t id) {
     setup.port_queue = port_queue;
     setup.exited = [taskset, id](uint32_t) {
         if (spurs_log()) qilin::rt::log("(spurs) taskset %08x task %u ends", taskset, id);
+        // The task's bits and this runtime's record of it change together (under both locks, as watch_atomic_put takes
+        // them): otherwise a task made again with the same id in between would be missed, or taken for this one.
+        const std::lock_guard lock(g_mutex);
+        Taskset& t = g_tasksets.at(taskset);
         {
             const std::lock_guard atomic(spu_atomic_mutex());
             for (const uint32_t mask : {kRunning, kPending, kEnabled, kSignalled, kWaiting}) set_task_bit(taskset, mask, id, false);
+            --t.running;
+            t.started &= ~(1u << id);
             spu_atomic_changed().notify_all();
         }
-        const std::lock_guard lock(g_mutex);
-        Taskset& t = g_tasksets.at(taskset);
-        --t.running;
-        t.started &= ~(1u << id);
         g_changed.notify_all();
     };
     // The kernel's wait: a task not yet signalled is waiting, not running, until it is (cellSpursSendSignal in the tasks sets
@@ -253,6 +255,8 @@ void watch_atomic_put(uint32_t line) {
         for (uint32_t id = 0; id < 32; ++id)
             if (task_bit(line, kPending, id) && !(it->second.started & (1u << id))) {
                 if (!task_bit(line, kEnabled, id)) qilin::rt::fatal("taskset %08x: task %u marked to run, and not enabled", line, id);
+                // Taken here, under the lock: two SPUs' puts to the line at once would otherwise both start it.
+                it->second.started |= 1u << id;
                 fresh |= 1u << id;
             }
     }

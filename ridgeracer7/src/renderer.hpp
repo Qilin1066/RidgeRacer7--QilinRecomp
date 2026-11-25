@@ -87,7 +87,8 @@ bool renderer_started();
 // guest memory. The RSX's thread flushes at every point where the game may look (rsx.cpp); the renderer itself when a
 // draw would read a surface drawn in the batch (a texture, or the same memory as another surface), or its batch is full.
 void renderer_draw(const Draw& d);
-void renderer_flush();
+// `why`: what asked for it, a short phrase (a timed run's report counts flushes by it).
+void renderer_flush(const char* why);
 // Where the renderer's time has gone (a development aid: logged when a timed run ends).
 void renderer_report();
 

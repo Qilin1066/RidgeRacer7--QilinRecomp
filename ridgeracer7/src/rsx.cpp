@@ -420,7 +420,7 @@ void clear(uint32_t mask, uint32_t at) {
         qilin::rt::log("(draw) clear %#x of surface offset %08x %ux%u, colour %08x, depth-stencil %08x at offset %08x | scissor %u,%u %ux%u", mask, state(0x0210),
                        state(0x0200) >> 16, state(0x0204) >> 16, state(0x1d90), state(0x1d8c), state(0x0214), state(0x08c0) & 0xffff, state(0x08c4) & 0xffff,
                        state(0x08c0) >> 16, state(0x08c4) >> 16);
-    renderer_flush();
+    renderer_flush("a clear");
     if (mask & ~0xf3u) fatal("CLEAR_SURFACE with bits %#x, which this runtime doesn't know (at offset %08x)", mask, at);
     const uint32_t format = state(0x0208);
     if (((format >> 8) & 0xf) != 1) fatal("a clear of a surface of type %u (not linear) (at offset %08x)", (format >> 8) & 0xf, at);
@@ -462,7 +462,7 @@ void clear(uint32_t mask, uint32_t at) {
 void flip(uint32_t id, uint32_t at) {
     if (draw_logged()) {
         qilin::rt::log("(draw) flip of display buffer %u", id);
-        renderer_flush();
+        renderer_flush("a logged flip");
         // Each surface drawn in the frame, as guest memory holds it, to surface-<address>.bmp (A8R8G8B8 ones).
         for (const auto& [address, sf] : g_logged_surfaces) {
             if (sf.format != 8 && sf.format != 0x100) continue;  // (0x100: a Z24S8 surface, its depth as grey)
@@ -491,7 +491,7 @@ void flip(uint32_t id, uint32_t at) {
     ++g_flips;
     if (!g_busy_frame && g_frame_draws > 300 && g_frame_main_memory) g_busy_frame = g_flips;
     g_frame_draws = 0, g_frame_main_memory = false;
-    renderer_flush();
+    renderer_flush("a flip");
     const DisplayBuffer b = display_buffer(id);
     if (!b.set) fatal("the RSX is to show display buffer %u, which the game never set (at offset %08x)", id, at);
     const VideoMode mode = video_mode();
@@ -545,12 +545,24 @@ std::string recent_transfers() {
     }
     return out;
 }
+// The words at a command offset, as they are now (for a stop's message): the newest jump's target, where the bad header is.
+std::string words_at(uint32_t offset, unsigned count) {
+    std::string out;
+    for (unsigned i = 0; i < count; ++i) {
+        const uint32_t address = rsx_io_address(offset + 4 * i);
+        char item[16];
+        std::snprintf(item, sizeof item, "%s%08x", i ? " " : "", address ? load32(address) : 0u);
+        out += address ? item : " (unmapped)";
+        if (!address) break;
+    }
+    return out;
+}
 
 // One method with one argument.
 void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     if (is_state(method)) {
         r.state[method / 4] = argument;
-        if (method == 0xa30c) renderer_flush();  // an inline transfer begins (inline_word)
+        if (method == 0xa30c) renderer_flush("an inline transfer");  // an inline transfer begins (inline_word)
         return;
     }
     if (method >= 0xa400 && method < 0xa600) {  // NV308A COLOR: an inline transfer's words
@@ -570,7 +582,7 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     switch (method) {
     // (Before every label, reference or wait, everything drawn so far is written back to guest memory: renderer.hpp.)
     case 0x0050:  // NV406E_SET_REFERENCE: the game's own mark of how far the RSX has got, readable beside put and get
-        renderer_flush();
+        renderer_flush("a reference");
         store32(rsx_setup().control + 8, argument);
         return;
     case 0x0100:  // NO_OPERATION
@@ -581,20 +593,20 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
         r.label = argument;
         return;
     case 0x006c:  // NV406E_SEMAPHORE_RELEASE: write it
-        renderer_flush();
+        renderer_flush("a semaphore release");
         store32(label_address(r.label, at), argument);
         return;
     case 0x0068:  // NV406E_SEMAPHORE_ACQUIRE: wait until the game has made it this value
-        renderer_flush();
+        renderer_flush("a semaphore wait");
         for (const uint32_t address = label_address(r.label, at); load32(address) != argument;) std::this_thread::yield();
         return;
     case 0x1d70:  // BACK_END_WRITE_SEMAPHORE_RELEASE: write the label at SET_SEMAPHORE_OFFSET once everything drawn so far is in the surface.
-        renderer_flush();
+        renderer_flush("a back-end semaphore");
         // The chip writes the argument's red and blue bytes exchanged (the game's library exchanges them first, so the label reads as meant).
         store32(label_address(r.state[0x1d6c / 4], at), (argument & 0xff00ff00u) | ((argument & 0xff) << 16) | ((argument >> 16) & 0xff));
         return;
     case 0x1d74:  // TEXTURE_READ_SEMAPHORE_RELEASE: the same label, as given, once every texture read so far is done
-        renderer_flush();
+        renderer_flush("a texture-read semaphore");
         store32(label_address(r.state[0x1d6c / 4], at), argument);
         return;
     case kMethodWaitFlip:  // (the runtime's own) wait until the last flip has been shown: a flip is shown at once here
@@ -645,8 +657,10 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
             if (method == kMethodFlip || std::chrono::steady_clock::now() > g_survey_ends) end_survey();
             return;
         }
-        fatal("the RSX is given method %04x (argument %08x, at offset %08x), which this runtime doesn't provide yet; its last jumps, newest first: %s", method, argument, at,
-              recent_transfers().c_str());
+        const uint32_t target = g_transfer_count ? g_transfers[(g_transfer_count - 1) % g_transfers.size()].second : 0;
+        fatal("the RSX is given method %04x (argument %08x, at offset %08x), which this runtime doesn't provide yet; its last jumps, newest first: %s; "
+              "now at the newest jump's target: %s; before the header: %s",
+              method, argument, at, recent_transfers().c_str(), words_at(target, 8).c_str(), words_at(at >= 32 ? at - 32 : 0, 8).c_str());
     }
 }
 
@@ -678,7 +692,7 @@ void serve() {
             // results through a label, a wait or a flip, which flush at once; this is for one that watches get.)
             if (idle == 0) idle_since = std::chrono::steady_clock::now(), idle_flushed = false;
             if (!idle_flushed && std::chrono::steady_clock::now() - idle_since > std::chrono::milliseconds(2)) {
-                renderer_flush();
+                renderer_flush("the RSX idle");
                 idle_flushed = true;
             }
             if (g_survey && std::chrono::steady_clock::now() > g_survey_ends) end_survey();
@@ -697,7 +711,7 @@ void serve() {
             next = header & 0x1ffffffcu;
             if (next != r.get) note_transfer(r.get, next);
             if (next == r.get) {  // to itself: the game's way of holding the RSX here until it writes over it
-                renderer_flush();
+                renderer_flush("a jump to itself");
                 if (g_survey && std::chrono::steady_clock::now() > g_survey_ends) end_survey();
                 std::this_thread::yield();
                 continue;

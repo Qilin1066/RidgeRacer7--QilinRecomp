@@ -89,6 +89,10 @@ bool renderer_started();
 void renderer_draw(const Draw& d);
 // `why`: what asked for it, a short phrase (a timed run's report counts flushes by it).
 void renderer_flush(const char* why);
+// The RSX is about to write these guest bytes itself (an inline transfer): the batch is flushed first only if a surface
+// drawn in it overlaps them (so the bytes land after what was drawn); otherwise textures the batch has read from them
+// are read again at their next use.
+void renderer_guest_written(uint32_t address, uint64_t bytes, const char* why);
 // Where the renderer's time has gone (a development aid: logged when a timed run ends).
 void renderer_report();
 

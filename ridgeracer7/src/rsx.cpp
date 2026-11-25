@@ -508,8 +508,8 @@ void flip(uint32_t id, uint32_t at) {
 }
 
 // NV308A's image from the CPU: words given in the command stream (COLOR, 0xa400 on) written into the 2D surface from POINT,
-// a row of SIZE_IN's width at a time; a transfer's sizes come before its words, and the renderer's batch is written back
-// then, so the words land in guest memory after everything drawn before. Fields as PSL1GHT's headers name them (it puts
+// a row of SIZE_IN's width at a time. At its first word the renderer is told which bytes it covers: its batch is written
+// back first if it drew there, so the words land in guest memory after everything drawn before (renderer_guest_written). Fields as PSL1GHT's headers name them (it puts
 // the object on subchannel 5 too, and calls the set-up rsxSetTransferImage's inline form). Only 32-bit surface formats
 // (Y32, A8R8G8B8) are taken: one word a pixel.
 void inline_word(uint32_t index, uint32_t word, uint32_t at) {
@@ -522,8 +522,10 @@ void inline_word(uint32_t index, uint32_t word, uint32_t at) {
     if (width && index >= width * height && index < ((width * height + 1) & ~1u)) return;
     if (!width || index >= width * height) fatal("an inline transfer's word %u, past its %u by %u (at offset %08x)", index, width, height, at);
     const uint32_t x = (point & 0xffff) + index % width, y = (point >> 16) + index / width;
-    const uint32_t dest = guest_address(surface_location(state(0x6188)), state(0x630c), "an inline transfer's surface");
-    store32(dest + y * (state(0x6304) >> 16) + x * 4, word);
+    const uint32_t dest = guest_address(surface_location(state(0x6188)), state(0x630c), "an inline transfer's surface"), pitch = state(0x6304) >> 16;
+    if (index == 0)
+        renderer_guest_written(dest + (point >> 16) * pitch + (point & 0xffff) * 4, uint64_t{height - 1} * pitch + uint64_t{width} * 4, "an inline transfer");
+    store32(dest + y * pitch + x * 4, word);
 }
 
 // The RSX's last jumps, calls and returns (from, to), for the report of a stop.
@@ -562,7 +564,6 @@ std::string words_at(uint32_t offset, unsigned count) {
 void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     if (is_state(method)) {
         r.state[method / 4] = argument;
-        if (method == 0xa30c) renderer_flush("an inline transfer");  // an inline transfer begins (inline_word)
         return;
     }
     if (method >= 0xa400 && method < 0xa600) {  // NV308A COLOR: an inline transfer's words

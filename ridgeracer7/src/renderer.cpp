@@ -85,6 +85,8 @@ struct CachedTexture {
     uint64_t hash = 0;
     uint64_t used = 0;  // the batch it was last used in
     uint64_t checked = UINT64_MAX;  // the batch its hash was last taken in
+    uint32_t address = 0;           // and the guest bytes hashed then
+    uint64_t bytes = 0;
 };
 
 // A hash of guest bytes (not for security: to see that a texture has changed), in four lanes of eight bytes the CPU can
@@ -738,6 +740,18 @@ void renderer_flush(const char* why) {
 }
 
 
+void renderer_guest_written(uint32_t address, uint64_t bytes, const char* why) {
+    if (!g_renderer || !g_renderer->recording) return;
+    Renderer& r = *g_renderer;
+    if (touched_overlap(r, address, bytes, nullptr)) {
+        renderer_flush(why);
+        return;
+    }
+    // Textures already hashed in this batch are hashed again at their next use, if these bytes are theirs.
+    for (auto& [key, cached] : r.textures)
+        if (cached.checked == r.flushes && overlaps(address, bytes, cached.address, cached.bytes)) cached.checked = UINT64_MAX;
+}
+
 void renderer_report() {
     const auto ms = [](const std::atomic<uint64_t>& ns) { return static_cast<double>(ns.load()) / 1e6; };
     qilin::rt::log("renderer: %llu draws (%.0f ms, of which textures %.0f ms: %llu decoded, %llu MB; surfaces from guest memory %.0f ms, %llu times), "
@@ -899,6 +913,7 @@ void renderer_draw(const Draw& d) {
                 up.decode = !up.cached->image.image || up.cached->hash != hash;
                 up.cached->hash = hash;
                 up.cached->checked = r.flushes;
+                up.cached->address = t.address, up.cached->bytes = bytes;
             } else {
                 up.decode = false;
             }

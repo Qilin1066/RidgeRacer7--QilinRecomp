@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
@@ -38,7 +39,20 @@ thread_local Where* t_where = nullptr;
 thread_local const Cpu* t_cpu = nullptr;
 thread_local int t_native_depth = 0;  // native calls the thread is inside (more than one: a handler called the game back)
 std::mutex g_where_mutex;
-std::deque<Where> g_where;  // one for each guest thread there has been
+std::deque<Where> g_where;  // one for each guest thread there is, and those ended not yet reused
+std::vector<Where*> g_spare;  // ended ones, to be reused (the game starts SPURS tasks every frame: each a guest thread)
+
+// A thread's record made ready for another guest thread (under g_where_mutex, while no thread writes it).
+void reset_where(Where& w, uint32_t id) {
+    w.thread = id;
+    w.what.store(nullptr, std::memory_order_relaxed);
+    w.number.store(0, std::memory_order_relaxed);
+    w.from.store(0, std::memory_order_relaxed);
+    w.calls.store(0, std::memory_order_relaxed);
+    std::fill(std::begin(w.past), std::end(w.past), PastCall{});
+    w.cpu.store(nullptr, std::memory_order_relaxed);
+    w.ended.store(false, std::memory_order_relaxed);
+}
 
 }  // namespace
 
@@ -55,14 +69,26 @@ void set_current_thread(uint32_t id) {
     t_thread = id;
     static_cast<void>(&t_end_on_exit);  // (made, so that it is destroyed with the thread)
     const std::lock_guard lock(g_where_mutex);
-    if (t_where) t_where->ended.store(true, std::memory_order_relaxed);  // (a host thread that becomes another guest thread)
-    t_where = &g_where.emplace_back();
-    t_where->thread = id;
+    // A host thread that becomes another guest thread (a SPURS task's kept host thread) keeps its record; a new one
+    // takes an ended thread's if there is one. Only the thread itself writes its record outside the lock.
+    if (!t_where) {
+        if (g_spare.empty()) {
+            t_where = &g_where.emplace_back();
+        } else {
+            t_where = g_spare.back();
+            g_spare.pop_back();
+        }
+    }
+    reset_where(*t_where, id);
 }
 
 EndOnExit::~EndOnExit() {
     const std::lock_guard lock(g_where_mutex);
-    if (t_where) t_where->cpu.store(nullptr, std::memory_order_relaxed), t_where->ended.store(true, std::memory_order_relaxed);
+    if (!t_where) return;
+    t_where->cpu.store(nullptr, std::memory_order_relaxed);
+    t_where->ended.store(true, std::memory_order_relaxed);
+    g_spare.push_back(t_where);
+    t_where = nullptr;
 }
 
 void thread_enters(const char* what, uint32_t number, uint32_t from) {

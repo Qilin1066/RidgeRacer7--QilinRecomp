@@ -159,10 +159,10 @@ public:
 
     uint8_t* data() const { return bytes_.get(); }
     bool empty() const { return !bytes_; }
-    // A zeroed local store in place of the one held, if any.
+    // All zeroes again: the one held, zeroed (so it stays where it was, as a thread group started again has it), or one had.
     void renew() {
-        give_back(std::move(bytes_));
-        bytes_ = take();
+        if (bytes_) std::memset(bytes_.get(), 0, kSpuLocalStore);
+        else bytes_ = take();
     }
 
 private:

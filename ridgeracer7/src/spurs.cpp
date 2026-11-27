@@ -69,6 +69,10 @@ void set_task_bit(uint32_t taskset, uint32_t mask, uint32_t id, bool on) {
     b = on ? static_cast<uint8_t>(b | bit) : static_cast<uint8_t>(b & ~bit);
 }
 std::condition_variable g_changed;  // a task exited (under g_mutex)
+// An SPU program's atomic put to a taskset's line (watch_atomic_put), with spu_atomic_mutex: what a task waiting to be
+// signalled waits for, since only such a put sets its signalled bit. (Not spu_atomic_changed, which every atomic put to
+// any line wakes: every waiting task would wake for each.)
+std::condition_variable g_taskset_put;
 
 // An event flag. It lives in the game's memory in the SDK's layout, since the game's SPU tasks change it themselves, with the
 // SDK's code linked into them (seen in LightBlurFrameMove_r.elf at 0x46d8: an atomic update of the 128-byte line, then an
@@ -210,6 +214,7 @@ void watch_atomic_put(uint32_t line) {
         const std::lock_guard lock(g_mutex);
         const auto it = g_tasksets.find(line);
         if (it == g_tasksets.end()) return;
+        g_taskset_put.notify_all();  // (the put is done: a waiter has seen it, or waits and is woken)
         const std::lock_guard atomic(spu_atomic_mutex());
         for (uint32_t id = 0; id < 32; ++id)
             if (task_bit(line, kPending, id) && !(it->second.started & (1u << id))) {
@@ -481,7 +486,7 @@ void spurs_task_wait_signal(const SpuTaskSetup& task) {
         set_task_bit(taskset, kRunning, id, false);
         set_task_bit(taskset, kWaiting, id, true);
         spu_atomic_changed().notify_all();
-        spu_atomic_changed().wait(atomic, [&] { return task_bit(taskset, kSignalled, id); });
+        g_taskset_put.wait(atomic, [&] { return task_bit(taskset, kSignalled, id); });
         set_task_bit(taskset, kWaiting, id, false);
         set_task_bit(taskset, kRunning, id, true);
         if (spurs_log()) qilin::rt::log("(spurs) taskset %08x task %u is signalled", taskset, id);

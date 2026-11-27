@@ -66,6 +66,8 @@ struct Draw {
     // (SET_FLAT_SHADE_OP).
     bool flat = false, flat_first = false;
     bool two_sided = false;  // back faces take the vertex program's back colours (SET_TWO_SIDE_LIGHT_EN)
+    // The user clip planes (SET_USER_CLIP_PLANE_CONTROL): plane n's test in bits 4n to 4n + 3, 0 off, 1 LT, 2 GE.
+    uint32_t clip_planes = 0;
     // The alpha test, for the fragment program (rsx_spirv.cpp): {reference, scale, -, -}, {less, equal, greater, -} passing.
     std::array<float, 8> alpha_test{0, 0, 0, 0, 1, 1, 1, 0};
     std::array<TextureUnit, 16> textures{};

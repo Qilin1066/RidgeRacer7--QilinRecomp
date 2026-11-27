@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -106,6 +108,22 @@ bool has_built_in(const std::vector<uint32_t>& spirv, uint32_t built_in) {
     return false;
 }
 
+// A vertex program of MOVs from v[0], one an instruction: to each output register given, with its mask (x = 8).
+CgProgram vertex_writing(std::initializer_list<std::pair<uint32_t, uint32_t>> writes) {
+    const uint32_t s0 = 2u | (0x1bu << 8);  // v[...], swizzle xyzw
+    CgProgram vp;
+    vp.vertex = true;
+    vp.header = {2, 0, 1, 1, 0, 0};
+    size_t i = 0;
+    for (const auto& [dest, mask] : writes) {
+        const bool last = ++i == writes.size();
+        const uint32_t w[4] = {(1u << 30) | (0x3fu << 15) | (7u << 10) | (0x1bu << 2), (uint32_t{kVecMov} << 22) | (s0 >> 9), (s0 & 0x1ff) << 23,
+                               (mask << 13) | (dest << 2) | (last ? 1u : 0u)};
+        for (const uint32_t v : w) put_be32(vp.microcode, v);
+    }
+    return vp;
+}
+
 void test_two_sided() {
     // The two-sided form: the back colour at location 3 (BFC0) for COL0, 4 (BFC1) for COL1, and FrontFacing to choose.
     const auto plain = translate(fragment_reading(1));
@@ -125,7 +143,38 @@ void test_two_sided() {
     // A program reading no colour: nothing to choose.
     const auto tex = translate(fragment_reading(4), Variant{.two_sided = true});
     CHECK(tex && !has_built_in(tex->spirv, 17));
+    // A vertex program writing a colour and its back colour: outputs 1 and 3 (for a pipeline with the two-sided forms).
+    const auto back = translate(vertex_writing({{0, 0xf}, {1, 0xf}, {3, 0xf}}));
+    CHECK(back && back->outputs == 0xbu);
+    if (back) write_out("vs_back", back->spirv);
+    if (const auto tex0 = translate(fragment_reading(4))) write_out("fs_tex0", tex0->spirv);
     CHECK(variant_number(Variant{.flat = true, .two_sided = true}) == 3 && variant_of(false, 2).two_sided && !variant_of(false, 2).flat);
+}
+
+bool has_capability(const std::vector<uint32_t>& spirv, uint32_t capability) {
+    for (const auto& in : instructions(spirv))
+        if ((in[0] & 0xffff) == 17 && in.size() == 2 && in[1] == capability) return true;
+    return false;
+}
+
+void test_clip() {
+    // Plane 0's distance is FOGC's y, plane 5's PSZ's w: what the program writes of them is its clip planes.
+    const CgProgram vp = vertex_writing({{0, 0xf}, {5, 0x4}, {6, 0x1}, {7, 0xf}});
+    const auto plain = translate(vp);
+    const auto clip = translate(vp, Variant{.clip = true});
+    CHECK(plain && clip);
+    if (!plain || !clip) return;
+    write_out("vs_clip_plain", plain->spirv);
+    write_out("vs_clip", clip->spirv);
+    CHECK(plain->clip_planes == ((1u << 0) | (1u << 5)) && clip->clip_planes == plain->clip_planes);
+    CHECK(translate(vertex_writing({{0, 0xf}, {5, 0x8}}))->clip_planes == 0);  // FOGC's x is the fog, no plane's
+    CHECK(translate(vertex_writing({{0, 0xf}, {5, 0x3}}))->clip_planes == 0x6);
+    // The clip form: ClipDistance (its capability and built-in), and a test for each plane as specialisation constants 0 to 5.
+    CHECK(!has_capability(plain->spirv, 32) && !has_built_in(plain->spirv, 3) && decorated(plain->spirv, 1).empty());
+    CHECK(has_capability(clip->spirv, 32) && has_built_in(clip->spirv, 3) && decorated(clip->spirv, 1).size() == 6);
+    // Forms that don't apply are refused.
+    CHECK(!translate(vp, Variant{.flat = true}) && !translate(fragment_reading(1), Variant{.clip = true}));
+    CHECK(variant_number(Variant{.clip = true}) == 1 && variant_of(true, 1).clip && !variant_of(true, 2).clip && !variant_of(false, 1).clip);
 }
 
 }  // namespace
@@ -133,6 +182,7 @@ void test_two_sided() {
 int main() {
     test_flat();
     test_two_sided();
+    test_clip();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

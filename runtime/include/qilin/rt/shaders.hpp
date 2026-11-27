@@ -22,10 +22,11 @@ struct TranslatedShader {
     const uint32_t* constant_slots;  // a fragment program's inline constants: each one's offset in its microcode, in bytes
     size_t constant_slot_count;
     // Its forms for draw state the plain one can't serve, by number (rsx_spirv.hpp's Variant: 0 is the plain one, `spirv`;
-    // a fragment program's 1 has flat colours, 2 two-sided ones, 3 both), each null where the program has none (it needs
-    // none, or nothing draws with it).
+    // a fragment program's 1 has flat colours, 2 two-sided ones, 3 both; a vertex program's 1 writes clip distances), each
+    // null where the program has none (it needs none, or nothing draws with it).
     const uint32_t* variant_spirv[4];
     size_t variant_words[4];
+    uint32_t clip_planes;  // a vertex program's: the user clip planes whose distances it writes (bit n for plane n)
 };
 
 extern const TranslatedShader kTranslatedShaders[];

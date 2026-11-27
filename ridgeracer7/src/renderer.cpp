@@ -160,7 +160,7 @@ struct WordsHash {
     }
 };
 // A pipeline's key: the programs and every piece of state that goes into it (pipeline_for), as words.
-using PipelineKey = std::array<uint32_t, 43>;
+using PipelineKey = std::array<uint32_t, 44>;
 
 struct Renderer {
     host::Gpu* gpu = nullptr;
@@ -493,13 +493,14 @@ VkPrimitiveTopology vulkan_topology(Topology t) {
 // The forms of a draw's programs (shaders.hpp) its state asks for.
 struct Forms {
     unsigned vertex = 0, fragment = 0;
+    std::array<int32_t, 6> clip{};  // the clip form's: each plane's test (specialisation constants 0 to 5)
 };
 
 VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, const qilin::rt::TranslatedShader& fs, const Forms& forms, VkFormat format,
                         VkPrimitiveTopology topology, const Rasterisation& rasterising) {
     const PipelineKey key{static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs) >> 32),
                               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs) >> 32),
-                              forms.vertex | (forms.fragment << 8),
+                              forms.vertex | (forms.fragment << 8), d.clip_planes,
                               static_cast<uint32_t>(format), static_cast<uint32_t>(topology), d.color_mask, d.blend, d.blend_src, d.blend_dst, d.blend_equation,
                               d.depth_test, d.depth_write, d.depth_func, d.cull, d.cull_face, d.front_face, rasterising.depth_bias, d.depth_surface, d.stencil_test,
                               d.stencil_front.func, d.stencil_front.ref, d.stencil_front.func_mask, d.stencil_front.write_mask, d.stencil_front.fail, d.stencil_front.zfail,
@@ -511,6 +512,11 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
     if (p) return p;
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = module_of(vs, forms.vertex), stages[0].pName = "main";
+    // The clip form's planes' tests, as its specialisation constants.
+    std::array<VkSpecializationMapEntry, 6> clip_entries{};
+    for (uint32_t n = 0; n < 6; ++n) clip_entries[n] = {n, n * 4, 4};
+    const VkSpecializationInfo clip_info{6, clip_entries.data(), sizeof forms.clip, forms.clip.data()};
+    if (forms.vertex == 1) stages[0].pSpecializationInfo = &clip_info;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = module_of(fs, forms.fragment), stages[1].pName = "main";
     std::vector<VkVertexInputBindingDescription> bindings;
     std::vector<VkVertexInputAttributeDescription> attributes;
@@ -1279,6 +1285,18 @@ void renderer_draw(const Draw& d) {
                 fatal("a draw with two-sided colours, and the vertex program at %08x writes no back colour BFC%u for the fragment program's COL%u", vs.address, c, c);
         if (!fs.variant_spirv[forms.fragment])
             fatal("a draw with two-sided colours, and the fragment program at %08x has no two-sided form: translate the shaders again (qilin shaders)", fs.address);
+    }
+    // User clip planes: the vertex program in its clip form, which writes each plane's distance as its test has it. A plane
+    // whose distance the program doesn't write is refused (what the RSX clips by then isn't known here).
+    if (d.clip_planes) {
+        for (unsigned n = 0; n < 6; ++n) {
+            forms.clip[n] = static_cast<int32_t>((d.clip_planes >> (4 * n)) & 0xf);
+            if (forms.clip[n] && !(vs.clip_planes & (1u << n)))
+                fatal("a draw with user clip plane %u, whose distance the vertex program at %08x doesn't write", n, vs.address);
+        }
+        if (!gpu.clip_distance) fatal("a draw with user clip planes, which this GPU can't (shaderClipDistance)");
+        forms.vertex = 1;
+        if (!vs.variant_spirv[1]) fatal("a draw with user clip planes, and the vertex program at %08x has no clip form: translate the shaders again (qilin shaders)", vs.address);
     }
     static std::vector<uint32_t> made;  // the lists assemble() makes (kept: only the RSX's thread draws)
     const auto assembly = assemble(d.primitive, order, d.indexed, provoking, made);

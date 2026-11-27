@@ -267,10 +267,14 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
     }
     // A logic operation (SET_LOGIC_OP_ENABLE, SET_LOGIC_OP: OpenGL's), which replaces blending.
     if (state(0x0374)) d.logic = true, d.logic_op = state(0x0378);
-    // State this renderer doesn't take, refused by name rather than ignored: user clip planes, polygon stipple.
+    // State this renderer doesn't take, refused by name rather than ignored: polygon stipple (Vulkan has none).
     // Two-sided colours (SET_TWO_SIDE_LIGHT_EN): on back faces the vertex program's back colours.
     d.two_sided = state(0x142c) != 0;
-    if (state(0x1478)) fatal("a draw with user clip planes (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x1478), at);
+    // User clip planes (SET_USER_CLIP_PLANE_CONTROL: a plane's test in each of the low six nibbles, 0 off, 1 LT, 2 GE).
+    d.clip_planes = state(0x1478);
+    for (unsigned n = 0; n < 8; ++n)
+        if (const uint32_t test = (d.clip_planes >> (4 * n)) & 0xf; test > 2 || (n >= 6 && test))
+            fatal("a draw with user clip plane %u's test %u, which the renderer doesn't know (at offset %08x)", n, test, at);
     if (state(0x147c)) fatal("a draw with polygon stipple, which the renderer doesn't take yet (at offset %08x)", at);
     // The alpha test (SET_ALPHA_FUNC: OpenGL's NEVER 0x200 to ALWAYS 0x207, bit 0 less, bit 1 equal, bit 2 greater; SET_ALPHA_REF):
     // on 8-bit surfaces the reference's low byte against the alpha as stored. *Its reference on a float surface isn't known here.*

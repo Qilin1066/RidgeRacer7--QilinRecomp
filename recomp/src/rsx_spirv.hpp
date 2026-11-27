@@ -36,12 +36,19 @@ namespace qilin::rsx {
 //   fragment programs: 1 flat colours (COL0 and COL1, and the back colours, not interpolated: each primitive's provoking
 //     vertex's, which the renderer puts first), for SET_SHADE_MODE FLAT; 2 two-sided colours (on a back face COL0 and COL1
 //     are the vertex program's back colours, BFC0 and BFC1 at locations 3 and 4), for SET_TWO_SIDE_LIGHT_EN; 3 both;
+//   vertex programs: 1 clip distances (ClipDistance[6], for SET_USER_CLIP_PLANE_CONTROL: plane n's distance is the
+//     program's output FOGC's y, z, w for planes 0 to 2 and PSZ's for 3 to 5, *a stated reading of NV40's, as Mesa's
+//     driver writes them*; each plane's test is specialisation constant n, 0 off, 1 kept where its distance is below 0
+//     (LT), 2 where it is 0 or more (GE): the pipeline's state, so one module serves every combination).
 struct Variant {
     bool flat = false;
     bool two_sided = false;
+    bool clip = false;
 };
-constexpr unsigned variant_number(const Variant& v) { return (v.flat ? 1u : 0u) | (v.two_sided ? 2u : 0u); }
-constexpr Variant variant_of(bool vertex, unsigned number) { return Variant{!vertex && (number & 1) != 0, !vertex && (number & 2) != 0}; }
+constexpr unsigned variant_number(const Variant& v) { return (v.flat || v.clip ? 1u : 0u) | (v.two_sided ? 2u : 0u); }
+constexpr Variant variant_of(bool vertex, unsigned number) {
+    return vertex ? Variant{false, false, number == 1} : Variant{(number & 1) != 0, (number & 2) != 0, false};
+}
 constexpr unsigned kVariants = 4;  // numbers 0 (the plain form) to 3
 
 struct Translation {
@@ -49,6 +56,7 @@ struct Translation {
     uint32_t inputs = 0;   // vertex: attributes read; fragment: input registers read (bit n for input n)
     uint32_t outputs = 0;  // vertex: output registers written; fragment: colour targets written (bit 0 to 3)
     uint32_t textures = 0, cube_textures = 0;  // fragment: units sampled, and which of them are cubes
+    uint32_t clip_planes = 0;                  // vertex: the user clip planes whose distances it writes (bit n for plane n)
     std::vector<uint32_t> constant_slots;      // fragment: each inline constant's offset in the microcode, in bytes
 };
 

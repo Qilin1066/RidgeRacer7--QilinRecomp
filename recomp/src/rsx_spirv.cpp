@@ -90,7 +90,7 @@ struct Common {
 
 class VertexTranslator : Common {
 public:
-    explicit VertexTranslator(const CgProgram& p) {
+    VertexTranslator(const CgProgram& p, const Variant& variant) : variant_(variant) {
         for (size_t i = 0; i + 16 <= p.microcode.size(); i += 16) {
             uint32_t w[4];
             for (unsigned k = 0; k < 4; ++k) w[k] = read_be32(p.microcode.data() + i + 4 * k);
@@ -120,6 +120,14 @@ public:
                 if (in.src[k].type == VpRegister::input) inputs_ |= 1u << in.input;
             if (in.vec_op && in.vec_op != kVecArl && in.vec_result && in.vec_mask) outputs_ |= 1u << in.dest;
             if (in.sca_op && in.sca_op != kScaBra && in.sca_result && in.sca_mask) outputs_ |= 1u << in.dest;
+            // The clip planes' distances it writes: FOGC's (5) y, z, w for planes 0 to 2, PSZ's (6) for 3 to 5 (x = 8 in a mask).
+            if (in.dest == 5 || in.dest == 6) {
+                unsigned mask = 0;
+                if (in.vec_op && in.vec_op != kVecArl && in.vec_result) mask |= in.vec_mask;
+                if (in.sca_op && in.sca_op != kScaBra && in.sca_result) mask |= in.sca_mask;
+                for (unsigned c = 1; c < 4; ++c)
+                    if (mask & (8u >> c)) clip_planes_ |= 1u << ((in.dest - 5) * 3 + c - 1);
+            }
         }
         // The interface.
         for (unsigned a = 0; a < 16; ++a)
@@ -159,6 +167,13 @@ public:
                 m.decorate(output_vars_[o], kDecorationLocation, {o});
                 interface_.push_back(output_vars_[o]);
             }
+        if (variant_.clip) {
+            m.capability(kCapabilityClipDistance);
+            clip_distance_ = m.variable(kStorageOutput, m.type_array(f32, 6));
+            m.decorate(clip_distance_, kDecorationBuiltIn, {kBuiltInClipDistance});
+            interface_.push_back(clip_distance_);
+            for (unsigned n = 0; n < 6; ++n) clip_modes_[n] = m.spec_constant_int(n, 0);
+        }
 
         const uint32_t fn = m.begin_function(m.type_void(), m.type_function(m.type_void()));
         m.label(m.id());
@@ -237,6 +252,19 @@ public:
             m.emit(OpStore, {position_, clip});
         }
         if (point_size_) m.emit(OpStore, {point_size_, x(m.op(OpLoad, vec4, {outputs_local_[kPointSize]}))});
+        // The clip distances: plane n's as its test has it (kept where the distance written is 0 or more): GE the distance, LT
+        // its negation (*a distance of exactly 0 is then kept: a stated difference*), off 1.
+        if (clip_distance_) {
+            const uint32_t ptr = m.type_pointer(kStorageOutput, f32);
+            const uint32_t lt = m.constant_int(1), ge = m.constant_int(2);
+            for (unsigned n = 0; n < 6; ++n) {
+                const uint32_t reg = m.op(OpLoad, vec4, {outputs_local_[n < 3 ? 5 : 6]});
+                const uint32_t d = m.op(OpCompositeExtract, f32, {reg, n % 3 + 1});
+                const uint32_t is_ge = m.op(OpIEqual, b, {clip_modes_[n], ge}), is_lt = m.op(OpIEqual, b, {clip_modes_[n], lt});
+                const uint32_t value = m.op(OpSelect, f32, {is_ge, d, m.op(OpSelect, f32, {is_lt, m.op(OpFNegate, f32, {d}), one})});
+                m.emit(OpStore, {m.op(OpAccessChain, ptr, {clip_distance_, m.constant_int(static_cast<int32_t>(n))}), value});
+            }
+        }
         for (unsigned o = 1; o < 17; ++o)
             if (output_vars_[o]) m.emit(OpStore, {output_vars_[o], m.op(OpLoad, vec4, {outputs_local_[o]})});
         m.emit(OpReturn, {});
@@ -246,6 +274,7 @@ public:
         out.spirv = m.words();
         out.inputs = inputs_;
         out.outputs = outputs_;
+        out.clip_planes = clip_planes_;
         return out;
     }
 
@@ -347,8 +376,11 @@ private:
         }
     }
 
+    Variant variant_;
     std::vector<VpInsn> insns_;
-    uint32_t inputs_ = 0, outputs_ = 0;
+    uint32_t inputs_ = 0, outputs_ = 0, clip_planes_ = 0;
+    uint32_t clip_distance_ = 0;
+    std::array<uint32_t, 6> clip_modes_{};  // the clip form's specialisation constants, one a plane
     std::array<uint32_t, 16> attributes_{};
     std::array<uint32_t, 17> output_vars_{}, outputs_local_{};
     std::array<uint32_t, 32> temps_{};
@@ -706,8 +738,9 @@ std::expected<Translation, std::string> translate(const CgProgram& program, cons
     try {
         if (program.vertex) {
             if (variant.flat || variant.two_sided) refuse("a flat or two-sided form of a vertex program");
-            return VertexTranslator(program).run();
+            return VertexTranslator(program, variant).run();
         }
+        if (variant.clip) refuse("a clip form of a fragment program");
         return FragmentTranslator(program, variant).run();
     } catch (const Failure& f) {
         return std::unexpected(std::format("the {} program at {:#x}: {}", program.vertex ? "vertex" : "fragment", program.address, f.why));

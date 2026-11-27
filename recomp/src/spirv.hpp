@@ -23,7 +23,7 @@ enum Op : uint16_t {
     OpName = 5, OpExtInstImport = 11, OpExtInst = 12, OpMemoryModel = 14, OpEntryPoint = 15, OpExecutionMode = 16, OpCapability = 17,
     OpTypeVoid = 19, OpTypeBool = 20, OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23, OpTypeImage = 25, OpTypeSampledImage = 27,
     OpTypeArray = 28, OpTypeStruct = 30, OpTypePointer = 32, OpTypeFunction = 33, OpConstantTrue = 41, OpConstantFalse = 42,
-    OpConstant = 43, OpConstantComposite = 44, OpFunction = 54, OpFunctionEnd = 56, OpVariable = 59, OpLoad = 61, OpStore = 62,
+    OpConstant = 43, OpConstantComposite = 44, OpSpecConstant = 50, OpFunction = 54, OpFunctionEnd = 56, OpVariable = 59, OpLoad = 61, OpStore = 62,
     OpAccessChain = 65, OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80,
     OpCompositeExtract = 81, OpImageSampleImplicitLod = 87, OpConvertFToS = 110, OpConvertSToF = 111, OpQuantizeToF16 = 116,
     OpFNegate = 127, OpIAdd = 128, OpFAdd = 129, OpFSub = 131, OpFMul = 133, OpFDiv = 136, OpVectorTimesScalar = 142, OpDot = 148,
@@ -34,14 +34,14 @@ enum Op : uint16_t {
 };
 // Enumerants.
 enum : uint32_t {
-    kCapabilityShader = 1,
+    kCapabilityShader = 1, kCapabilityClipDistance = 32,
     kAddressingLogical = 0, kMemoryModelGlsl450 = 1,
     kExecutionVertex = 0, kExecutionFragment = 4,
     kModeOriginUpperLeft = 7, kModeDepthReplacing = 12,
     kStorageUniformConstant = 0, kStorageInput = 1, kStorageUniform = 2, kStorageOutput = 3, kStorageFunction = 7, kStoragePushConstant = 9,
-    kDecorationBlock = 2, kDecorationArrayStride = 6, kDecorationBuiltIn = 11, kDecorationNoPerspective = 13, kDecorationFlat = 14,
+    kDecorationSpecId = 1, kDecorationBlock = 2, kDecorationArrayStride = 6, kDecorationBuiltIn = 11, kDecorationNoPerspective = 13, kDecorationFlat = 14,
     kDecorationCentroid = 16, kDecorationLocation = 30, kDecorationBinding = 33, kDecorationDescriptorSet = 34, kDecorationOffset = 35,
-    kBuiltInPosition = 0, kBuiltInPointSize = 1, kBuiltInFragCoord = 15, kBuiltInFrontFacing = 17, kBuiltInFragDepth = 22,
+    kBuiltInPosition = 0, kBuiltInPointSize = 1, kBuiltInClipDistance = 3, kBuiltInFragCoord = 15, kBuiltInFrontFacing = 17, kBuiltInFragDepth = 22,
     kDim2D = 1, kDimCube = 3,
     kFunctionControlNone = 0, kSelectionControlNone = 0, kLoopControlNone = 0,
 };
@@ -78,6 +78,10 @@ public:
     uint32_t constant_bool(bool value);
     uint32_t constant_vec4(float x, float y, float z, float w);
     uint32_t constant_composite(uint32_t type, std::initializer_list<uint32_t> parts);
+    // A specialisation constant (a 32-bit signed integer) with its SpecId: one of its own, never shared.
+    uint32_t spec_constant_int(uint32_t spec_id, int32_t default_value);
+    // A capability beyond Shader, declared once.
+    void capability(uint32_t c);
 
     // Globals, names, decorations, the entry point.
     uint32_t variable(uint32_t storage, uint32_t type);  // a global; its type is pointed to in that storage
@@ -108,7 +112,7 @@ private:
     static std::vector<uint32_t> text(std::string_view s);  // a literal string, as words
 
     uint32_t next_ = 1, glsl_ = 0;
-    std::vector<uint32_t> entries_, modes_, debug_, annotations_, globals_, function_head_, function_locals_, function_body_, functions_;
+    std::vector<uint32_t> capabilities_, entries_, modes_, debug_, annotations_, globals_, function_head_, function_locals_, function_body_, functions_;
     std::map<std::vector<uint32_t>, uint32_t> cache_;
     bool in_function_ = false, first_block_ = false;
 };

@@ -744,13 +744,14 @@ int cmd_shaders(const Args& a) {
         }
         ++translated;
         // The forms it needs: a fragment program that reads a colour, a flat one, and two-sided ones where a vertex program
-        // writes a back colour.
+        // writes a back colour; a vertex program that writes a clip plane's distance, a clip one.
         std::array<std::string, rsx::kVariants> variant_names{std::format("kSpirv{}", modules.size())};
         std::string variant_text;
         for (unsigned n = 1; n < rsx::kVariants; ++n) {
             const rsx::Variant v = rsx::variant_of(p->vertex, n);
             // (A number whose form isn't defined yet comes back as another's.)
-            const bool wanted = rsx::variant_number(v) == n && !p->vertex && (t->inputs & 6) && (!v.two_sided || back_colours);
+            const bool wanted = rsx::variant_number(v) == n &&
+                                (p->vertex ? v.clip && t->clip_planes : (t->inputs & 6) && (!v.two_sided || back_colours));
             if (!wanted) continue;
             const auto form = rsx::translate(*p, v);
             if (!form) throw Failure{std::format("{} (its form {})", form.error(), n)};
@@ -768,9 +769,9 @@ int cmd_shaders(const Args& a) {
                 forms += std::format("{}{}", n ? ", " : "", variant_names[n].empty() ? "nullptr" : variant_names[n]);
                 sizes += std::format("{}{}", n ? ", " : "", variant_names[n].empty() ? "0" : std::format("std::size({})", variant_names[n]));
             }
-            table += std::format("    {{0x{:016x}ull, {}, 0x{:08x}u, kSpirv{}, std::size(kSpirv{}), 0x{:x}u, 0x{:x}u, 0x{:x}u, 0x{:x}u, {}, {}, {{{}}}, {{{}}}}},\n", rsx::program_key(*p),
+            table += std::format("    {{0x{:016x}ull, {}, 0x{:08x}u, kSpirv{}, std::size(kSpirv{}), 0x{:x}u, 0x{:x}u, 0x{:x}u, 0x{:x}u, {}, {}, {{{}}}, {{{}}}, 0x{:x}u}},\n", rsx::program_key(*p),
                                  p->vertex ? "true" : "false", s.address, modules.size() - 1, modules.size() - 1, t->inputs, t->outputs, t->textures, t->cube_textures,
-                                 slots.empty() ? "nullptr" : std::format("kSlots{}", modules.size() - 1), t->constant_slots.size(), forms, sizes);
+                                 slots.empty() ? "nullptr" : std::format("kSlots{}", modules.size() - 1), t->constant_slots.size(), forms, sizes, t->clip_planes);
         }
     }
     std::println("translated to SPIR-V: {} of {}, with {} other forms for draw state", translated, programs->size(), variants);

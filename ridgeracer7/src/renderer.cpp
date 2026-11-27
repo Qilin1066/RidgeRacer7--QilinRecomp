@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <span>
 #include <string>
+#include <string_view>
 #include <tuple>
 
 #include "kernel.hpp"
@@ -223,7 +224,26 @@ struct Renderer {
     // constants are at `constants_version`.
     VkDeviceSize constants_at = 0;
     uint64_t constants_batch = UINT64_MAX, constants_version = 0;
-    uint32_t sets_used = 0;
+    uint32_t sets_used = 0;  // texture sets taken from the batch's pool
+    // Set 0, the constant blocks: one a batch, on its arena, each draw's blocks found by dynamic offsets (begin_batch).
+    VkDescriptorSet constants_set = VK_NULL_HANDLE;
+    VkDeviceSize fragment_range = 16;  // binding 1's range: the most inline constants any translated program has
+    // What the batch's command buffer has bound (begin_batch forgets it), so that a draw like the one before sets nothing
+    // again: the pipeline, set 0's offsets, set 1 and the textures it holds, the viewport, the scissor, the push constants.
+    struct Bound {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        std::array<uint32_t, 2> constant_offsets{UINT32_MAX, UINT32_MAX};
+        VkDescriptorSet textures = VK_NULL_HANDLE;
+        uint32_t texture_count = 0;
+        std::array<uint32_t, 16> units{};
+        std::array<VkImageView, 16> views{};
+        std::array<VkSampler, 16> samplers{};
+        bool have_viewport = false;
+        VkViewport viewport{};
+        VkRect2D scissor{};
+        bool have_push = false;
+        std::array<float, 8> vertex_push{}, fragment_push{};
+    } bound;
     std::unordered_map<std::array<uint32_t, 6>, CachedTexture, WordsHash> textures;  // by address, format, size, pitch, remap and cube
     std::vector<SurfaceEntry*> touched;     // the surfaces it draws to
     SurfaceEntry* rendering = nullptr;      // the surface a rendering instance is open on
@@ -231,8 +251,7 @@ struct Renderer {
     VkFormat depth_format = VK_FORMAT_UNDEFINED;  // for Z24S8: D32_SFLOAT_S8_UINT, or D24_UNORM_S8_UINT where the GPU lacks it
     uint64_t draws = 0, flushes = 0;
     VkQueryPool timestamps = VK_NULL_HANDLE;  // three a batch: its start, before its copies back, its end
-    std::map<std::vector<uint32_t>, VkSampler> samplers;  // by the fields they're made from
-    host::Buffer dummy;  // bound where a program has no inline constants
+    std::unordered_map<std::array<uint32_t, 12>, VkSampler, WordsHash> samplers;  // by the fields they're made from (sampler_for)
 };
 Renderer* g_renderer = nullptr;
 
@@ -246,7 +265,7 @@ struct Stats {
 };
 Stats g_stats;
 std::mutex g_flush_reasons_mutex;
-std::map<std::string, uint64_t> g_flush_reasons;  // flushes with work in them, by what asked for them
+std::map<std::string, uint64_t, std::less<>> g_flush_reasons;  // flushes with work in them, by what asked for them (found without a string made)
 using Clock = std::chrono::steady_clock;
 uint64_t since(Clock::time_point t) { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
 
@@ -424,8 +443,8 @@ VkSamplerAddressMode address_mode(uint32_t mode) {
 
 // A texture unit's sampler, made once for each set of fields.
 VkSampler sampler_for(uint32_t unit, const SamplerFields& s, uint32_t levels) {
-    const std::vector<uint32_t> key{s.mag, s.min, s.mip, s.wrap[0], s.wrap[1], s.wrap[2], std::bit_cast<uint32_t>(s.bias), std::bit_cast<uint32_t>(s.min_lod),
-                                    std::bit_cast<uint32_t>(s.max_lod), s.anisotropy, s.border, levels > 1};
+    const std::array<uint32_t, 12> key{s.mag, s.min, s.mip, s.wrap[0], s.wrap[1], s.wrap[2], std::bit_cast<uint32_t>(s.bias), std::bit_cast<uint32_t>(s.min_lod),
+                                       std::bit_cast<uint32_t>(s.max_lod), s.anisotropy, s.border, levels > 1};
     VkSampler& sampler = g_renderer->samplers[key];
     if (sampler) return sampler;
     VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -633,7 +652,7 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
     // The layout every translated program fits (rsx_spirv.hpp): set 0 the constant blocks, set 1 sixteen textures, 32 bytes of push constants.
     VkDescriptorSetLayoutBinding constants[2] = {};
     for (uint32_t i = 0; i < 2; ++i) {
-        constants[i].binding = i, constants[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, constants[i].descriptorCount = 1;
+        constants[i].binding = i, constants[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, constants[i].descriptorCount = 1;
         constants[i].stageFlags = i == 0 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutBinding textures[16] = {};
@@ -650,12 +669,17 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout.setLayoutCount = 2, layout.pSetLayouts = r->sets, layout.pushConstantRangeCount = 2, layout.pPushConstantRanges = push;
     host::check(vkCreatePipelineLayout(gpu.device, &layout, nullptr, &r->layout), "vkCreatePipelineLayout");
-    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * kMostSets}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 * kMostSets}};
+    // (A batch's pool: its one set 0, and its texture sets.)
+    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 * kMostSets}};
     VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dp.maxSets = kMostSets, dp.poolSizeCount = 2, dp.pPoolSizes = sizes;
+    dp.maxSets = kMostSets + 1, dp.poolSizeCount = 2, dp.pPoolSizes = sizes;
     for (Renderer::Batch& b : r->batches) host::check(vkCreateDescriptorPool(gpu.device, &dp, nullptr, &b.descriptors), "vkCreateDescriptorPool");
     for (size_t i = 0; i < qilin::rt::kTranslatedShaderCount; ++i) r->shaders[qilin::rt::kTranslatedShaders[i].key] = &qilin::rt::kTranslatedShaders[i];
-    r->dummy = host::Buffer::host_visible(gpu, 16, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    // Set 0's binding 1 is as large as the most inline constants any program has (each draw's are taken that large).
+    for (size_t i = 0; i < qilin::rt::kTranslatedShaderCount; ++i)
+        r->fragment_range = std::max<VkDeviceSize>(r->fragment_range, qilin::rt::kTranslatedShaders[i].constant_slot_count * 16);
+    if (r->fragment_range > gpu.properties.limits.maxUniformBufferRange)
+        fatal("a fragment program has %llu bytes of inline constants, more than this GPU's uniform blocks take", static_cast<unsigned long long>(r->fragment_range));
     for (Renderer::Batch& b : r->batches)
         b.arena = host::Buffer::host_visible(gpu, kArenaBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                                                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -1039,6 +1063,18 @@ void finish_batch_numbered(Renderer& r, uint64_t number) {
     if (b.number == number) finish_batch(r, b);
 }
 
+// Set 0 of the batch: its arena's vertex constants (468 vec4) and a fragment program's inline constants, each block at the
+// draw's dynamic offset (the arena keeps room past each for the range: renderer_draw).
+void write_constants_set(Renderer& r) {
+    const VkDescriptorBufferInfo infos[2] = {{r.arena.buffer, 0, kVertexConstants * 16}, {r.arena.buffer, 0, r.fragment_range}};
+    VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    for (uint32_t i = 0; i < 2; ++i) {
+        writes[i].dstSet = r.constants_set, writes[i].dstBinding = i, writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, writes[i].pBufferInfo = &infos[i];
+    }
+    vkUpdateDescriptorSets(r.gpu->device, 2, writes, 0, nullptr);
+}
+
 // The batch's command buffer, begun if this is its first command, with this batch's own arena, descriptor pool and
 // timestamps (waited for, if the batch that last had them is still in flight).
 void begin_batch(Renderer& r) {
@@ -1048,6 +1084,11 @@ void begin_batch(Renderer& r) {
     host::check(vkResetDescriptorPool(r.gpu->device, b.descriptors, 0), "vkResetDescriptorPool");
     r.cmd = b.cmd, r.fence = b.fence, r.descriptors = b.descriptors, r.arena = b.arena, r.timestamps = b.timestamps;
     r.sets_used = 0, r.arena_used = 0;
+    r.bound = {};
+    VkDescriptorSetAllocateInfo ds{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ds.descriptorPool = r.descriptors, ds.descriptorSetCount = 1, ds.pSetLayouts = &r.sets[0];
+    host::check(vkAllocateDescriptorSets(r.gpu->device, &ds, &r.constants_set), "vkAllocateDescriptorSets");
+    write_constants_set(r);
     host::check(vkResetCommandBuffer(r.cmd, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1066,7 +1107,8 @@ void renderer_flush(const char* why) {
     const Clock::time_point flush_start = Clock::now();
     {
         const std::lock_guard lock(g_flush_reasons_mutex);
-        ++g_flush_reasons[why];
+        if (const auto it = g_flush_reasons.find(std::string_view(why)); it != g_flush_reasons.end()) ++it->second;
+        else g_flush_reasons.emplace(why, 1);
     }
     Renderer& r = *g_renderer;
     const host::Gpu& gpu = *r.gpu;
@@ -1412,10 +1454,10 @@ void renderer_draw(const Draw& d) {
     bool any_decoded = false;  // (or copied from a surface: either is done outside a rendering instance)
     for (const Upload& up : uploads) any_decoded = any_decoded || up.decode || up.surface;
 
-    // What the draw takes from the arena, and two descriptor sets: if the batch hasn't room, it is flushed first.
-    uint32_t attributes = 0;
-    for (uint32_t a = 0; a < 16; ++a) attributes += (vs.inputs >> a) & 1;
-    VkDeviceSize needed = r.align * 8 + VkDeviceSize{16} * attributes * d.count + index_list.size() * 4 + kVertexConstants * 16 + fs.constant_slot_count * 16;
+    // What the draw takes from the arena (a fragment program's inline constants as much as set 0's range), and a descriptor
+    // set: if the batch hasn't room, it is flushed first.
+    const uint32_t attributes = static_cast<uint32_t>(std::popcount(vs.inputs & 0xffffu));
+    VkDeviceSize needed = r.align * 8 + VkDeviceSize{16} * attributes * d.count + index_list.size() * 4 + kVertexConstants * 16 + r.fragment_range;
     for (const Upload& up : uploads) needed += up.decode ? up.texels.rgba.size() + r.align : 0;
     begin_batch(r);
     if (needed > r.arena.size) {
@@ -1425,18 +1467,20 @@ void renderer_draw(const Draw& d) {
         begin_batch(r);
         VkDeviceSize size = r.arena.size;
         while (size < needed) size *= 2;
+        if (size > UINT32_MAX) fatal("a draw of %llu MB, past what set 0's dynamic offsets reach", static_cast<unsigned long long>(needed >> 20));
         host::Buffer& arena = r.batches[r.flushes % kBatchesInFlight].arena;
         arena.destroy(gpu);
         arena = host::Buffer::host_visible(gpu, size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         r.arena = arena;
+        write_constants_set(r);  // (on the new arena: nothing in the batch has used it yet)
         size_t texels = 0;
         for (const Upload& up : uploads) texels += up.decode ? up.texels.rgba.size() : 0;
         qilin::rt::log("the renderer's arena grows to %llu MB for a draw of %llu MB: %u vertices from %u (%s, %zu indices), %u attributes, %zu MB of texels",
                        static_cast<unsigned long long>(size >> 20), static_cast<unsigned long long>(needed >> 20), d.count, d.first, d.indexed ? "indexed" : "arrays",
                        d.indices.size(), attributes, texels >> 20);
     }
-    if (r.arena_used + needed > r.arena.size || r.sets_used + 2 > kMostSets) {
+    if (r.arena_used + needed > r.arena.size || r.sets_used + 1 > kMostSets) {
         renderer_flush("a full batch");
         begin_batch(r);
     }
@@ -1482,7 +1526,7 @@ void renderer_draw(const Draw& d) {
     const VkDeviceSize vertex_constants_at = r.constants_at;
     VkDeviceSize fragment_constants_at = 0;
     if (fs.constant_slot_count) {
-        fragment_constants_at = arena_take(r, fs.constant_slot_count * 16);
+        fragment_constants_at = arena_take(r, r.fragment_range);  // (set 0's range past its offset is in the arena)
         for (size_t i = 0; i < fs.constant_slot_count; ++i)
             for (unsigned c = 0; c < 4; ++c) {
                 const uint8_t* p = d.fragment_program.data() + fs.constant_slots[i] + 4 * c;
@@ -1495,40 +1539,20 @@ void renderer_draw(const Draw& d) {
                 qilin::rt::log("(draw)   fragment constant %zu (at byte %u): %g %g %g %g", i, static_cast<unsigned>(fs.constant_slots[i]), v[0], v[1], v[2], v[3]);
             }
     }
-    // Their descriptors.
-    VkDescriptorSet set0;
-    VkDescriptorSetAllocateInfo ds{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    ds.descriptorPool = r.descriptors, ds.descriptorSetCount = 1, ds.pSetLayouts = &r.sets[0];
-    host::check(vkAllocateDescriptorSets(gpu.device, &ds, &set0), "vkAllocateDescriptorSets");
-    ++r.sets_used;
-    const VkDescriptorBufferInfo infos[2] = {{r.arena.buffer, vertex_constants_at, kVertexConstants * 16},
-                                             {fs.constant_slot_count ? r.arena.buffer : r.dummy.buffer, fragment_constants_at, fs.constant_slot_count ? fs.constant_slot_count * 16 : VK_WHOLE_SIZE}};
-    VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-    for (uint32_t i = 0; i < 2; ++i) {
-        writes[i].dstSet = set0, writes[i].dstBinding = i, writes[i].descriptorCount = 1, writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[i].pBufferInfo = &infos[i];
-    }
-    vkUpdateDescriptorSets(gpu.device, 2, writes, 0, nullptr);
+    // Set 0's offsets: the batch's set, at the draw's blocks.
+    const std::array<uint32_t, 2> constant_offsets{static_cast<uint32_t>(vertex_constants_at), static_cast<uint32_t>(fragment_constants_at)};
 
     // The textures' uploads, and the surface's own when it is first drawn in this batch: outside a rendering instance.
     const bool first_touch = !target.touched, depth_first_touch = depth && !depth->touched;
     if (any_decoded || first_touch || depth_first_touch || r.rendering != &target || r.rendering_depth != depth) end_rendering(r);
-    VkDescriptorSet set1 = VK_NULL_HANDLE;
+    // (At most 16 textures: one for each unit.)
+    std::array<VkDescriptorImageInfo, 16> images{};
     if (!uploads.empty()) {
-        ds.pSetLayouts = &r.sets[1];
-        host::check(vkAllocateDescriptorSets(gpu.device, &ds, &set1), "vkAllocateDescriptorSets");
-        ++r.sets_used;
-        // (At most 16 textures: one for each unit.)
-        std::array<VkDescriptorImageInfo, 16> images{};
-        std::array<VkWriteDescriptorSet, 16> texture_writes{};
-        texture_writes.fill({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
         for (size_t i = 0; i < uploads.size(); ++i) {
             Upload& up = uploads[i];
             host::Image& image = up.cached->image;
             if (!image.image) image = texture_image(gpu, up.texels);
             images[i] = {up.sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            texture_writes[i].dstSet = set1, texture_writes[i].dstBinding = up.unit, texture_writes[i].descriptorCount = 1;
-            texture_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_writes[i].pImageInfo = &images[i];
             if (up.surface) {
                 // The surface's image into the texture's. (A surface drawn in this batch is a colour attachment until its
                 // flush; one waiting to be written back is as its flush left it.)
@@ -1548,7 +1572,8 @@ void renderer_draw(const Draw& d) {
             const VkDeviceSize at = arena_take(r, up.texels.rgba.size());
             std::memcpy(arena_at(r, at), up.texels.rgba.data(), up.texels.rgba.size());
             transition_texture(cmd, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            std::vector<VkBufferImageCopy> levels(size_t{up.texels.levels} * up.texels.faces);
+            static std::vector<VkBufferImageCopy> levels;  // (kept between draws: only the RSX's thread draws)
+            levels.assign(size_t{up.texels.levels} * up.texels.faces, VkBufferImageCopy{});
             for (uint32_t face = 0; face < up.texels.faces; ++face)
                 for (uint32_t l = 0; l < up.texels.levels; ++l) {
                     VkBufferImageCopy& c = levels[size_t{face} * up.texels.levels + l];
@@ -1559,7 +1584,28 @@ void renderer_draw(const Draw& d) {
             vkCmdCopyBufferToImage(cmd, r.arena.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(levels.size()), levels.data());
             transition_texture(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
+    }
+    // Set 1, the textures: the set bound already if it holds the same images and samplers at the same units (new texels
+    // in the same image are ordered by its upload's barriers), else one of the batch's own.
+    Renderer::Bound& bound = r.bound;
+    bool same_textures = !uploads.empty() && bound.textures && bound.texture_count == uploads.size();
+    for (size_t i = 0; same_textures && i < uploads.size(); ++i)
+        same_textures = bound.units[i] == uploads[i].unit && bound.views[i] == images[i].imageView && bound.samplers[i] == images[i].sampler;
+    VkDescriptorSet set1 = VK_NULL_HANDLE;
+    if (!uploads.empty() && !same_textures) {
+        VkDescriptorSetAllocateInfo ds{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ds.descriptorPool = r.descriptors, ds.descriptorSetCount = 1, ds.pSetLayouts = &r.sets[1];
+        host::check(vkAllocateDescriptorSets(gpu.device, &ds, &set1), "vkAllocateDescriptorSets");
+        ++r.sets_used;
+        std::array<VkWriteDescriptorSet, 16> texture_writes{};
+        for (size_t i = 0; i < uploads.size(); ++i) {
+            texture_writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            texture_writes[i].dstSet = set1, texture_writes[i].dstBinding = uploads[i].unit, texture_writes[i].descriptorCount = 1;
+            texture_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_writes[i].pImageInfo = &images[i];
+            bound.units[i] = uploads[i].unit, bound.views[i] = images[i].imageView, bound.samplers[i] = images[i].sampler;
+        }
         vkUpdateDescriptorSets(gpu.device, static_cast<uint32_t>(uploads.size()), texture_writes.data(), 0, nullptr);
+        bound.texture_count = static_cast<uint32_t>(uploads.size());
     }
     // The surfaces from guest memory, as the batch begins with them, and a rendering instance on them.
     open_rendering(r, &target, depth, false, false);
@@ -1568,17 +1614,41 @@ void renderer_draw(const Draw& d) {
     const WindowMapping window = window_mapping(d);
     const VkRect2D scissor{{static_cast<int32_t>(window.x0), static_cast<int32_t>(window.y0)}, {window.x1 - window.x0, window.y1 - window.y0}};
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_for(d, vs, fs, forms, format, vulkan_topology(assembly->topology), *raster));
+    // What the draw binds and sets, where it differs from what the command buffer has.
+    if (const VkPipeline pipeline = pipeline_for(d, vs, fs, forms, format, vulkan_topology(assembly->topology), *raster); pipeline != bound.pipeline)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline), bound.pipeline = pipeline;
     const VkViewport viewport{0, 0, static_cast<float>(d.color.width), static_cast<float>(d.color.height), 0.0f, 1.0f};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdPushConstants(cmd, r.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof window.push, window.push.data());
-    vkCmdPushConstants(cmd, r.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 32, sizeof d.alpha_test, d.alpha_test.data());
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.layout, 0, 1, &set0, 0, nullptr);
-    if (set1) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.layout, 1, 1, &set1, 0, nullptr);
-    // One binding for each attribute read, at its own number (the pipeline's bindings are the attributes' numbers).
-    for (uint32_t a = 0, slot = 0; a < 16; ++a)
-        if (vs.inputs & (1u << a)) vkCmdBindVertexBuffers(cmd, a, 1, &r.arena.buffer, &offsets[slot]), ++slot;
+    if (!bound.have_viewport || bound.viewport.width != viewport.width || bound.viewport.height != viewport.height) {
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        bound.viewport = viewport;
+    }
+    if (!bound.have_viewport || bound.scissor.offset.x != scissor.offset.x || bound.scissor.offset.y != scissor.offset.y ||
+        bound.scissor.extent.width != scissor.extent.width || bound.scissor.extent.height != scissor.extent.height) {
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        bound.scissor = scissor;
+    }
+    bound.have_viewport = true;
+    if (!bound.have_push || bound.vertex_push != window.push) vkCmdPushConstants(cmd, r.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof window.push, window.push.data());
+    if (!bound.have_push || bound.fragment_push != d.alpha_test)
+        vkCmdPushConstants(cmd, r.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 32, sizeof d.alpha_test, d.alpha_test.data());
+    bound.have_push = true, bound.vertex_push = window.push, bound.fragment_push = d.alpha_test;
+    if (constant_offsets != bound.constant_offsets) {
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.layout, 0, 1, &r.constants_set, 2, constant_offsets.data());
+        bound.constant_offsets = constant_offsets;
+    }
+    if (set1) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.layout, 1, 1, &set1, 0, nullptr), bound.textures = set1;
+    // The attributes read, each at its own binding number (the pipeline's bindings are the attributes' numbers), in one call
+    // over the run from the first read to the last (a binding between them the pipeline doesn't read is given the first).
+    if (const uint32_t read = vs.inputs & 0xffffu) {
+        const uint32_t first = static_cast<uint32_t>(std::countr_zero(read)), last = 31u - static_cast<uint32_t>(std::countl_zero(read));
+        std::array<VkBuffer, 16> buffers{};
+        std::array<VkDeviceSize, 16> at{};
+        for (uint32_t a = first, slot = 0; a <= last; ++a) {
+            buffers[a - first] = r.arena.buffer;
+            at[a - first] = (read & (1u << a)) ? offsets[slot++] : offsets[0];
+        }
+        vkCmdBindVertexBuffers(cmd, first, last - first + 1, buffers.data(), at.data());
+    }
     if (indexed) {
         if (!index_list.empty()) {
             vkCmdBindIndexBuffer(cmd, r.arena.buffer, index_at, VK_INDEX_TYPE_UINT32);

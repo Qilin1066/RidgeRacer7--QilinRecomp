@@ -96,20 +96,20 @@ uint32_t swizzled(uint32_t x, uint32_t y, uint32_t lw, uint32_t lh) {
 
 }  // namespace
 
-std::string texture_extent(const TextureUnit& t, size_t& guest_bytes) {
+std::expected<size_t, std::string> texture_extent(const TextureUnit& t) {
     const uint32_t f = (t.format >> 8) & 0x1f;
     const bool linear = (t.format >> 13) & 1;
-    if ((t.format & 3) != 1 && (t.format & 3) != 2) return what("a texture in location %u", t.format & 3);
-    if (((t.format >> 4) & 0xf) != 2) return what("a texture of %u dimensions", (t.format >> 4) & 0xf);
-    if ((t.format >> 14) & 1) return "unnormalised texture coordinates";
-    if (!unit_bytes(f)) return what("texture format %u", f);
+    if ((t.format & 3) != 1 && (t.format & 3) != 2) return std::unexpected(what("a texture in location %u", t.format & 3));
+    if (((t.format >> 4) & 0xf) != 2) return std::unexpected(what("a texture of %u dimensions", (t.format >> 4) & 0xf));
+    if ((t.format >> 14) & 1) return std::unexpected(std::string("unnormalised texture coordinates"));
+    if (!unit_bytes(f)) return std::unexpected(what("texture format %u", f));
     const bool cube = (t.format & 4) != 0;
-    if (cube && (t.rect >> 16) != (t.rect & 0xffff)) return "a cube map that isn't square";
+    if (cube && (t.rect >> 16) != (t.rect & 0xffff)) return std::unexpected(std::string("a cube map that isn't square"));
     const uint32_t width = t.rect >> 16, height = t.rect & 0xffff, levels = (t.format >> 16) & 0xffff, depth = t.control3 >> 20, pitch = t.control3 & 0xfffff;
-    if (!width || !height || !levels) return what("a texture with no texels (%08x)", t.rect);
-    if (depth != 1) return what("a texture of depth %u", depth);
-    if (linear && !compressed(f) && levels > 1) return "a linear texture with mipmaps";
-    if (!linear && !compressed(f) && !(std::has_single_bit(width) && std::has_single_bit(height))) return "a swizzled texture whose sides aren't powers of two";
+    if (!width || !height || !levels) return std::unexpected(what("a texture with no texels (%08x)", t.rect));
+    if (depth != 1) return std::unexpected(what("a texture of depth %u", depth));
+    if (linear && !compressed(f) && levels > 1) return std::unexpected(std::string("a linear texture with mipmaps"));
+    if (!linear && !compressed(f) && !(std::has_single_bit(width) && std::has_single_bit(height))) return std::unexpected(std::string("a swizzled texture whose sides aren't powers of two"));
     size_t at = 0;
     for (uint32_t face = 0; face < (cube ? 6u : 1u); ++face) {
         at = (at + 127) & ~size_t{127};  // a cube map's faces each begin on 128 bytes (*a stated reading*)
@@ -118,16 +118,15 @@ std::string texture_extent(const TextureUnit& t, size_t& guest_bytes) {
             if (compressed(f)) {
                 const uint32_t bh = (h + 3) / 4, row = (w + 3) / 4 * unit_bytes(f);
                 const uint32_t stride = linear && pitch && l == 0 ? pitch : row;
-                if (stride < row) return what("a compressed texture's pitch %u", pitch);
+                if (stride < row) return std::unexpected(what("a compressed texture's pitch %u", pitch));
                 at += size_t{stride} * bh;
             } else {
-                if (linear && pitch < w * unit_bytes(f)) return what("a linear texture's pitch %u", pitch);
+                if (linear && pitch < w * unit_bytes(f)) return std::unexpected(what("a linear texture's pitch %u", pitch));
                 at += linear ? size_t{pitch} * h : size_t{w} * h * unit_bytes(f);
             }
         }
     }
-    guest_bytes = at;
-    return {};
+    return at;
 }
 
 bool texture_is_plain_argb(const TextureUnit& t) {
@@ -140,8 +139,8 @@ bool texture_is_plain_argb(const TextureUnit& t) {
     return (t.remap >> 16) == 0;
 }
 
-std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& out) {
-    if (size_t bytes = 0; !texture_extent(t, bytes).empty()) return texture_extent(t, bytes);
+std::expected<Texels, std::string> decode_texture(const TextureUnit& t, const uint8_t* memory) {
+    if (const auto extent = texture_extent(t); !extent) return std::unexpected(extent.error());
     const uint32_t f = (t.format >> 8) & 0x1f;
     const bool linear = (t.format >> 13) & 1;
     // (Checked by texture_extent.)
@@ -150,11 +149,11 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
     uint32_t source[4], kind[4];
     for (unsigned c = 0; c < 4; ++c) source[c] = (t.remap >> (2 * c)) & 3, kind[c] = (t.remap >> (8 + 2 * c)) & 3;
     for (unsigned c = 0; c < 4; ++c)
-        if (kind[c] == 3) return what("texture remap %08x", t.remap);
-    if (t.remap >> 17) return what("texture remap %08x", t.remap);
+        if (kind[c] == 3) return std::unexpected(what("texture remap %08x", t.remap));
+    if (t.remap >> 17) return std::unexpected(what("texture remap %08x", t.remap));
     if (f == kB8)
         for (unsigned c = 0; c < 4; ++c)
-            if (kind[c] == 2 && source[c] != 3) return what("a B8 texture's remap %08x, which reads a channel other than B", t.remap);
+            if (kind[c] == 2 && source[c] != 3) return std::unexpected(what("a B8 texture's remap %08x, which reads a channel other than B", t.remap));
     // Each channel out (R, G, B, A, as the image holds them) as an index into {A, R, G, B, 0, 255}: output R is the remap's
     // channel 1, G 2, B 3, A 0.
     std::array<uint8_t, 4> pick{};
@@ -165,7 +164,7 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
     const bool as_stored = pick == std::array<uint8_t, 4>{1, 2, 3, 0};  // R, G, B, A as they are
 
     const uint32_t faces = (t.format & 4) ? 6 : 1;
-    out = {width, height, levels, faces, {}, {}};
+    Texels out{width, height, levels, faces, {}, {}};
     size_t at = 0;  // in guest memory, from the texture's start
     for (uint32_t face = 0; face < faces; ++face) {
     if (faces > 1) at = (at + 127) & ~size_t{127};
@@ -184,7 +183,7 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
         if (compressed(f)) {
             const uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, row = bw * unit_bytes(f);
             const uint32_t stride = linear && pitch && l == 0 ? pitch : row;
-            if (stride < row) return what("a compressed texture's pitch %u", pitch);
+            if (stride < row) return std::unexpected(what("a compressed texture's pitch %u", pitch));
             for (uint32_t by = 0; by < bh; ++by)
                 for (uint32_t bx = 0; bx < bw; ++bx) {
                     uint8_t argb[16][4] = {};
@@ -197,7 +196,7 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
             at += size_t{stride} * bh;
         } else {
             const uint32_t bytes = unit_bytes(f);
-            if (linear && pitch < w * bytes) return what("a linear texture's pitch %u", pitch);
+            if (linear && pitch < w * bytes) return std::unexpected(what("a linear texture's pitch %u", pitch));
             const uint32_t lw = static_cast<uint32_t>(std::countr_zero(w)), lh = static_cast<uint32_t>(std::countr_zero(h));
             // A texel's place in guest memory, as a column's part and a row's: swizzled, x's bits and y's never share a
             // place, so the offset of (x, y) is that of (x, 0) plus that of (0, y).
@@ -228,24 +227,24 @@ std::string decode_texture(const TextureUnit& t, const uint8_t* memory, Texels& 
     }
     }
     out.guest_bytes = at;
-    return {};
+    return out;
 }
 
-std::string decode_sampler(const TextureUnit& t, SamplerFields& out) {
-    out = {};
+std::expected<SamplerFields, std::string> decode_sampler(const TextureUnit& t) {
+    SamplerFields out;
     // The wrap word: S, T, R at bits 0, 8, 16; gamma at 20 and the depth comparison at 28 (only for depth formats).
     for (unsigned i = 0; i < 3; ++i) {
         const uint32_t mode = (t.wrap >> (8 * i)) & 0xf;
-        if (mode < 1 || mode > 4) return what("texture wrap mode %u", mode);
+        if (mode < 1 || mode > 4) return std::unexpected(what("texture wrap mode %u", mode));
         out.wrap[i] = mode;
     }
-    if (t.wrap & 0x0ff0f0f0u) return what("texture wrap word %08x (gamma, or fields not known here)", t.wrap);
+    if (t.wrap & 0x0ff0f0f0u) return std::unexpected(what("texture wrap word %08x (gamma, or fields not known here)", t.wrap));
     // The filter word: the LOD bias (bits 0 to 12, signed, 8 bits of fraction: *a stated reading*), the convolution
     // (13, 14: used only by the convolution filters), min (16 to 19), mag (24 to 27).
     const uint32_t min = (t.filter >> 16) & 0xf, mag = (t.filter >> 24) & 0xf;
-    if (t.filter & 0xf0f08000u) return what("texture filter word %08x (fields not known here)", t.filter);
-    if (mag != 1 && mag != 2) return what("texture magnification filter %u", mag);
-    if (min < 1 || min > 6) return what("texture minification filter %u", min);
+    if (t.filter & 0xf0f08000u) return std::unexpected(what("texture filter word %08x (fields not known here)", t.filter));
+    if (mag != 1 && mag != 2) return std::unexpected(what("texture magnification filter %u", mag));
+    if (min < 1 || min > 6) return std::unexpected(what("texture minification filter %u", min));
     out.mag = mag - 1;
     out.min = (min == 2 || min == 4 || min == 6) ? 1 : 0;
     out.mip = min <= 2 ? 0 : (min == 3 || min == 4) ? 1 : 2;
@@ -257,9 +256,9 @@ std::string decode_sampler(const TextureUnit& t, SamplerFields& out) {
     out.max_lod = static_cast<float>((t.control0 >> 7) & 0xfff) / 256.0f;
     static constexpr uint32_t kAnisotropy[8] = {1, 2, 4, 6, 8, 10, 12, 16};
     out.anisotropy = kAnisotropy[(t.control0 >> 4) & 7];
-    if (t.control0 & 0xf) return what("texture control word %08x (fields not known here)", t.control0);
+    if (t.control0 & 0xf) return std::unexpected(what("texture control word %08x (fields not known here)", t.control0));
     out.border = t.border;
-    return {};
+    return out;
 }
 
 }  // namespace rr7

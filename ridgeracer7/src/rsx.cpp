@@ -426,8 +426,10 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
                 qilin::rt::log("(draw)   texture %u at %08x format %08x size %ux%u remap %08x", u, t.address, t.format, t.rect >> 16, t.rect & 0xffff, t.remap);
                 // Each texture once, decoded as the renderer decodes it (its first level), to texture-<address>.bmp.
                 static std::map<uint32_t, bool> written;
-                Texels tx;
-                if (!written[t.address] && decode_texture(t, guest_memory(), tx).empty()) {
+                std::expected<Texels, std::string> decoded = std::unexpected(std::string("written already"));
+                if (!written[t.address]) decoded = decode_texture(t, guest_memory());
+                if (decoded) {
+                    const Texels& tx = *decoded;
                     written[t.address] = true;
                     char name[64];
                     std::snprintf(name, sizeof name, "texture-%08x.bmp", t.address);

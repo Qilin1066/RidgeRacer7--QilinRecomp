@@ -50,11 +50,10 @@ TextureUnit unit(uint32_t format_byte, uint32_t width, uint32_t height, uint32_t
 }
 
 Texels decode(const TextureUnit& t, const std::vector<uint8_t>& memory) {
-    Texels out;
-    const std::string why = rr7::decode_texture(t, memory.data(), out);
-    if (!why.empty()) std::fprintf(stderr, "decode_texture: %s\n", why.c_str());
-    CHECK(why.empty());
-    return out;
+    auto out = rr7::decode_texture(t, memory.data());
+    if (!out) std::fprintf(stderr, "decode_texture: %s\n", out.error().c_str());
+    CHECK(out.has_value());
+    return out ? std::move(*out) : Texels{};
 }
 Rgba texel(const Texels& t, uint32_t x, uint32_t y) {
     const size_t at = (size_t{y} * t.width + x) * 4;
@@ -87,8 +86,7 @@ void test_a8r8g8b8() {
     // The kinds: output A one, output R zero, G and B their inputs.
     CHECK(texel(decode(unit(kA8R8G8B8 | kLinear, 2, 1, 8, 0xa1e4), memory), 0, 0) == (Rgba{0x00, 0x33, 0x44, 0xff}));
     // A kind of 3 is no kind: refused.
-    Texels refused;
-    CHECK(!rr7::decode_texture(unit(kA8R8G8B8 | kLinear, 2, 1, 8, 0xeae4), memory.data(), refused).empty());
+    CHECK(!rr7::decode_texture(unit(kA8R8G8B8 | kLinear, 2, 1, 8, 0xeae4), memory.data()));
 }
 
 void test_sixteen_bits() {
@@ -127,8 +125,7 @@ void test_b8() {
     CHECK(texel(all, 1, 0) == (Rgba{0xc3, 0xc3, 0xc3, 0xc3}));
     CHECK(texel(decode(unit(kB8 | kLinear, 2, 1, 2, 0xa9ff), memory), 1, 0) == (Rgba{0xc3, 0xc3, 0xc3, 0xff}));
     // A remap that reads another input of it is refused (Mesa's driver reads only B: what the others hold isn't known here).
-    Texels refused;
-    CHECK(!rr7::decode_texture(unit(kB8 | kLinear, 2, 1, 2, kIdentity), memory.data(), refused).empty());
+    CHECK(!rr7::decode_texture(unit(kB8 | kLinear, 2, 1, 2, kIdentity), memory.data()));
 }
 
 void test_dxt() {
@@ -205,12 +202,18 @@ void test_surfaces_as_textures() {
 
 void test_format_word() {
     // The format byte's LN (0x20) is the linear layout and UN (0x40) unnormalised coordinates (refused); bits 8-12 the format.
-    size_t bytes = 0;
-    CHECK(rr7::texture_extent(unit(kA8R8G8B8 | kLinear, 4, 4, 16, kIdentity), bytes).empty() && bytes == 64);
-    CHECK(rr7::texture_extent(unit(kA8R8G8B8, 4, 4, 0, kIdentity), bytes).empty() && bytes == 64);
-    CHECK(!rr7::texture_extent(unit(kA8R8G8B8 | kLinear | 0x40, 4, 4, 16, kIdentity), bytes).empty());
-    CHECK(!rr7::texture_extent(unit(0x8b /* G8B8 */, 4, 4, 0, kIdentity), bytes).empty());
-    CHECK(rr7::texture_extent(unit(kDxt1, 8, 8, 0, kIdentity), bytes).empty() && bytes == 32);
+    CHECK(rr7::texture_extent(unit(kA8R8G8B8 | kLinear, 4, 4, 16, kIdentity)) == 64u);
+    CHECK(rr7::texture_extent(unit(kA8R8G8B8, 4, 4, 0, kIdentity)) == 64u);
+    CHECK(!rr7::texture_extent(unit(kA8R8G8B8 | kLinear | 0x40, 4, 4, 16, kIdentity)));
+    CHECK(!rr7::texture_extent(unit(0x8b /* G8B8 */, 4, 4, 0, kIdentity)));
+    CHECK(rr7::texture_extent(unit(kDxt1, 8, 8, 0, kIdentity)) == 32u);
+    // A sampler's fields: the filters, mip mode and wrap (wrap 1 to 4; filters 1 nearest, 2 linear, and min's mip modes).
+    TextureUnit sampled = unit(kA8R8G8B8, 4, 4, 0, kIdentity);
+    sampled.wrap = 0x030201, sampled.filter = (2u << 24) | (6u << 16);
+    const auto fields = rr7::decode_sampler(sampled);
+    CHECK(fields && fields->mag == 1 && fields->min == 1 && fields->mip == 2 && fields->wrap == (std::array<uint32_t, 3>{1, 2, 3}));
+    sampled.wrap = 0x050505;
+    CHECK(!rr7::decode_sampler(sampled));
 }
 
 void test_attributes() {

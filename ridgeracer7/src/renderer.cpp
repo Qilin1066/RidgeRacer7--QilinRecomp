@@ -1140,9 +1140,9 @@ void renderer_draw(const Draw& d) {
             if (!(fs.textures & (1u << u))) continue;
             const TextureUnit& t = d.textures[u];
             if (!t.enabled()) fatal("the fragment program at %08x samples texture %u, which is not enabled", fs.address, u);
-            size_t bytes = 0;
-            if (const std::string why = texture_extent(t, bytes); !why.empty())
-                fatal("texture %u (at %08x, format %08x): %s, which the renderer doesn't take yet", u, t.address, t.format, why.c_str());
+            const auto extent = texture_extent(t);
+            if (!extent) fatal("texture %u (at %08x, format %08x): %s, which the renderer doesn't take yet", u, t.address, t.format, extent.error().c_str());
+            const size_t bytes = *extent;
             // A picture the renderer drew and holds (in this batch, or not yet written back): copied on the GPU.
             SurfaceEntry* surface = nullptr;
             if (texture_is_plain_argb(t)) {
@@ -1188,9 +1188,9 @@ void renderer_draw(const Draw& d) {
                 up.decode = false;
             }
             up.cached->used = r.flushes;
-            SamplerFields fields;
-            if (const std::string why = decode_sampler(t, fields); !why.empty()) fatal("texture %u: %s, which the renderer doesn't take yet", u, why.c_str());
-            up.sampler = r.cache.sampler(u, fields, (t.format >> 16) & 0xffff);
+            const auto fields = decode_sampler(t);
+            if (!fields) fatal("texture %u: %s, which the renderer doesn't take yet", u, fields.error().c_str());
+            up.sampler = r.cache.sampler(u, *fields, (t.format >> 16) & 0xffff);
         }
         if (!overlap) break;
         renderer_flush("a texture drawn in the batch");
@@ -1198,8 +1198,9 @@ void renderer_draw(const Draw& d) {
     for (Upload& up : uploads) {
         if (!up.decode) continue;
         const TextureUnit& t = d.textures[up.unit];
-        if (const std::string why = decode_texture(t, guest_memory(), up.texels); !why.empty())
-            fatal("texture %u (at %08x, format %08x): %s, which the renderer doesn't take yet", up.unit, t.address, t.format, why.c_str());
+        auto texels = decode_texture(t, guest_memory());
+        if (!texels) fatal("texture %u (at %08x, format %08x): %s, which the renderer doesn't take yet", up.unit, t.address, t.format, texels.error().c_str());
+        up.texels = std::move(*texels);
         ++g_stats.textures, g_stats.texture_bytes += up.texels.rgba.size();
     }
     g_stats.texture_ns += since(texture_start);

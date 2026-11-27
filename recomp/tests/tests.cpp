@@ -15,6 +15,7 @@
 #include "elf.hpp"
 #include "elf_builder.hpp"
 #include "import_names.hpp"
+#include "lift.hpp"
 #include "media.hpp"
 #include "ppu.hpp"
 #include "self.hpp"
@@ -390,6 +391,53 @@ void test_self() {
 
 // ---------------------------------------------------------------- the control-flow pass
 
+// A switch whose out-of-range index calls a function that never returns (`ble` over `bl abort; nop` into the table's
+// block): proven only when the pass knows that function doesn't return. `callee_words` is that function's code, at
+// f+0x60; `exiting` names import 0 sys_process_exit (its stub at kStub0).
+struct NoReturnCase {
+    bool proven = false;
+    bool callee_returns = true;
+    int rounds = 0;
+};
+constexpr uint32_t kSwitchAt = kText + 0x120, kCallee = kSwitchAt + 0x60;
+
+std::optional<NoReturnCase> switch_after_call(const std::vector<uint32_t>& callee_words, bool exiting) {
+    const uint32_t f = kSwitchAt;
+    const size_t at = kTextAt + 0x120;
+    const std::vector<uint32_t> words = {
+        0x2b830002,                          // cmpli cr7,0,r3,2
+        0x409d000c,                          // bc 4,4*cr7+gt,f+0x10: in range, to the table's block
+        0x48000001u | (kCallee - (f + 8)),   // bl callee
+        0x60000000,                          // nop
+        0x81628010, 0x78691788, 0x7c09582e, 0x7c0007b4, 0x7c005a14, 0x7c0903a6, 0x4e800420,  // the table's address, ..., bctr
+        0x0000000c, 0x00000010, 0x00000014,  // the table, at f+0x2c: to f+0x38, f+0x3c, f+0x40
+        0x4e800020, 0x4e800020, 0x4e800020,
+    };
+    Bytes p = make_elf();
+    put_segment(p, 0, 1, 5, kTextAt, kText, 0x200, 0x200, 0x10000);
+    put_section(p, 1, 1, 1, 6, kText, kTextAt, 0x200);
+    put_be32(p, kTextAt, 0x48000120);  // b f
+    for (size_t i = 0; i < words.size(); ++i) put_be32(p, at + 4 * i, words[i]);
+    for (size_t i = 0; i < callee_words.size(); ++i) put_be32(p, at + 0x60 + 4 * i, callee_words[i]);
+    put_be32(p, kDataAt + 16, f + 0x2c);
+    if (exiting) {
+        put_text(p, kTextAt + (kName - kText), std::string_view("sysPrxForUser\0", 14));
+        put_be32(p, kTextAt + (kIds - kText), import_id("sys_process_exit"));
+    }
+    const auto e = Elf::parse(std::move(p));
+    if (!e) return std::nullopt;
+    const auto c = Cfg::build(*e);
+    if (!c || !c->functions().contains(f) || c->functions().at(f).tables.size() != 1 || c->functions().at(f).tables[0].targets.size() != 3)
+        return std::nullopt;
+    NoReturnCase r;
+    r.proven = c->functions().at(f).tables[0].proven;
+    r.callee_returns = !c->no_return().contains(kCallee);
+    r.rounds = c->rounds();
+    return r;
+}
+
+uint32_t bl_from(uint32_t from, uint32_t to) { return 0x48000001u | ((to - from) & 0x03fffffcu); }
+
 void test_cfg() {
     // Unwinding tables: a CIE ("zR", addresses relative to themselves, 8 bytes) and two FDEs.
     Bytes eh(0x60);
@@ -534,6 +582,27 @@ void test_cfg() {
     std::vector<uint32_t> record = nops;
     record[3] = 0x7c632379;  // or. r3,r3,r4: writes cr0, not cr7
     CHECK(bound_proven(record) == true);
+
+    // Switches whose out-of-range index calls a function that never returns (switch_after_call).
+    const uint32_t callee = kCallee;
+    // A loop that never ends.
+    const auto spins = switch_after_call({0x48000000}, false);  // b .
+    CHECK(spins && spins->proven && !spins->callee_returns && spins->rounds == 3);
+    // A call of sys_process_exit, then what would follow if it returned.
+    const auto exits = switch_after_call({0x7c0802a6, bl_from(callee + 4, kStub0), 0x4e800020}, true);  // mflr r0; bl sys_process_exit; blr
+    CHECK(exits && exits->proven && !exits->callee_returns);
+    // The same import under another name may return: then so does the callee, and the bound isn't proven.
+    const auto other_import = switch_after_call({0x7c0802a6, bl_from(callee + 4, kStub0), 0x4e800020}, false);
+    CHECK(other_import && !other_import->proven && other_import->callee_returns);
+    // A function that returns on one path.
+    const auto returns = switch_after_call({0x2c030000, 0x4d820020, 0x48000000}, false);  // cmpwi r3,0; beqlr; b .
+    CHECK(returns && !returns->proven && returns->callee_returns);
+    // A jump through CTR might go anywhere: counted as a way back.
+    const auto jumps = switch_after_call({0x7c6903a6, 0x4e800420}, false);  // mtctr r3; bctr
+    CHECK(jumps && !jumps->proven && jumps->callee_returns);
+    // A call that doesn't return ends a path: a callee that only calls the loop never returns either.
+    const auto chain = switch_after_call({bl_from(callee, callee + 8), 0x4e800020, 0x48000000}, false);  // bl +8; blr; b .
+    CHECK(chain && chain->proven && !chain->callee_returns);
 }
 
 // ---------------------------------------------------------------- import names
@@ -1212,7 +1281,48 @@ void test_rsx_spirv() {
     CHECK(!refused.has_value() && refused.error().find("KIL") != std::string::npos);
 }
 
+// ---------------------------------------------------------------- the lifter and C++ exceptions
+// (The unwinding program in the differential test runs them; these hold the shapes the lifter takes and refuses.)
+
+void test_lift_exceptions() {
+    const auto input = [](std::vector<uint32_t> words, std::vector<uint32_t> pads = {}) {
+        LiftInput in;
+        in.start = 0x10000;
+        for (size_t i = 0; i < words.size(); ++i) in.insns.emplace_back(0x10000 + 4 * static_cast<uint32_t>(i), ppu::decode(words[i]));
+        in.landing_pads = std::move(pads);
+        in.is_function = [](uint32_t) { return false; };
+        return in;
+    };
+    const auto has = [](const std::string& text, std::string_view what) { return text.find(what) != std::string::npos; };
+    // __builtin_eh_return's epilogue, either operand order: a throw when the adjustment isn't 0.
+    for (const uint32_t add : {0x7c215214u, 0x7c2a0a14u}) {  // add r1,r1,r10; add r1,r10,r1
+        const Lifted l = lift(input({add, 0x4e800020}));
+        CHECK(l.ok && l.eh_returns == 1 && !l.catches && has(l.code, "if (r10 != 0ull)") && has(l.code, "eh_return(c)"));
+    }
+    // The stack pointer moved by a register anywhere else is a shape the lifter doesn't know: not lifted, by name.
+    const Lifted apart = lift(input({0x7c215214, 0x60000000, 0x4e800020}));  // a nop between the add and the return
+    CHECK(!apart.ok && has(apart.why, "__builtin_eh_return") && apart.why_at == 0x10000);
+    const Lifted conditional = lift(input({0x7c215214, 0x4d9e0020, 0x4e800020}));  // beqlr cr7
+    CHECK(!conditional.ok && has(conditional.why, "__builtin_eh_return"));
+    const Lifted record = lift(input({0x7c215215, 0x4e800020}));  // add. r1,r1,r10
+    CHECK(!record.ok && has(record.why, "__builtin_eh_return"));
+    const Lifted plain = lift(input({0x7c632214, 0x4e800020}));  // add r3,r3,r4: nothing to do with it
+    CHECK(plain.ok && plain.eh_returns == 0 && !has(plain.code, "eh_return"));
+    // A function with a landing pad: lifted twice, from its start and from its pads, under the runtime's try.
+    const Lifted pad = lift(input({0x38600001, 0x4e800020, 0x38600002, 0x4e800020}, {0x10008}));
+    CHECK(pad.ok && pad.catches && pad.eh_returns == 0);
+    CHECK(has(pad.code, "static void fn_00010000_start(Cpu& c)") && has(pad.code, "static void fn_00010000_pad(Cpu& c, uint32_t pad)") &&
+          has(pad.code, "case 0x00010008u: goto L_00010008;") && has(pad.code, "kPads[] = {0x00010008u}") &&
+          has(pad.code, "run_with_landing_pads(c, &fn_00010000_start, &fn_00010000_pad, kPads)"));
+    const Lifted none = lift(input({0x38600001, 0x4e800020}));
+    CHECK(none.ok && !none.catches && !has(none.code, "run_with_landing_pads") && !has(none.code, "_pad"));
+    // A pad the function doesn't reach can't be entered: refused, not ignored.
+    const Lifted missing = lift(input({0x38600001, 0x4e800020}, {0x10008}));
+    CHECK(!missing.ok && has(missing.why, "landing pad") && missing.why_at == 0x10008);
+}
+
 int main() {
+    test_lift_exceptions();
     test_sha256();
     test_ppu();
     test_spu();

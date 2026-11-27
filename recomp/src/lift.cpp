@@ -127,7 +127,14 @@ public:
             if (const auto it = tables_.find(a); it != tables_.end())
                 for (const uint32_t t : it->second->targets) labels_.insert(t);
         }
-        for (const uint32_t pad : f_.landing_pads) labels_.insert(pad);
+        for (const uint32_t pad : f_.landing_pads) {
+            if (!present_.contains(pad)) {
+                out.why = std::format("a landing pad at {:08X} that the function doesn't reach", pad);
+                out.why_at = pad;
+                return out;
+            }
+            labels_.insert(pad);
+        }
         std::string body;
         for (size_t k = 0; k < f_.insns.size(); ++k) {
             const auto& [a, in] = f_.insns[k];
@@ -154,12 +161,39 @@ public:
                 }
             }
         }
-        out.code = expand(std::format("void {}(Cpu& c) {{\n{}{}}}\n", fn_name(f_.start), prologue(), body));
+        out.code = expand(f_.landing_pads.empty() ? std::format("void {}(Cpu& c) {{\n{}{}}}\n", fn_name(f_.start), prologue(), body) : entered_at_pads(body));
         out.ok = true;
+        out.catches = !f_.landing_pads.empty();
+        out.eh_returns = eh_returns_;
         return out;
     }
 
 private:
+    // A function with landing pads: the guest's unwinder "returns" into one of them from further down the stack (the
+    // eh_return epilogue below throws GuestUnwind). The function is lifted twice: `fn_X_start` entered at its start,
+    // as any function is, and `fn_X_pad`, which reads the registers and goes to a pad through a switch at its top, so
+    // that only what the pads reach is compiled in it. `fn_X` hands both to the runtime's run_with_landing_pads,
+    // whose try runs the second when an exception is for a pad of this activation's (cpu.hpp). The try is in the
+    // runtime, once, and neither body has more than one way in from outside: each compiles as a plain function does.
+    std::string entered_at_pads(const std::string& body) const {
+        std::string enter, pads;
+        for (const uint32_t pad : f_.landing_pads) {
+            enter += std::format(" case {}: goto L_{:08X};", hex32(pad), pad);
+            pads += std::format("{}{}", pads.empty() ? "" : ", ", hex32(pad));
+        }
+        const std::string name = fn_name(f_.start);
+        return std::format("static void {0}_start(Cpu& c) {{\n{1}{3}}}\n"
+                           "static void {0}_pad(Cpu& c, uint32_t pad) {{\n{1}    switch (pad) {{{2} default: c.hooks->trap(c, {5}, \"not a landing pad\"); return; }}\n{3}}}\n"
+                           "void {0}(Cpu& c) {{\n    static constexpr uint32_t kPads[] = {{{4}}};\n    run_with_landing_pads(c, &{0}_start, &{0}_pad, kPads);\n}}\n",
+                           name, prologue(), enter, body, pads, hex32(f_.start));
+    }
+
+    // The instruction at `a`, if the function has one there.
+    const Insn* at(uint32_t a) const {
+        const auto it = std::ranges::lower_bound(f_.insns, a, {}, &std::pair<uint32_t, Insn>::first);
+        return it != f_.insns.end() && it->first == a ? &it->second : nullptr;
+    }
+
     // Register uses, recorded as the body is emitted.
     std::string R(unsigned n) {
         gprs_.insert(n);
@@ -354,7 +388,25 @@ private:
         // ---------------------------------------------------------------- integer arithmetic
         case Op::addi: result(d, a ? R(a) + plus(in.simm()) : imm64(in.simm())); return true;
         case Op::addis: result(d, a ? std::format("{} + {}", R(a), imm64(int64_t{in.simm()} << 16)) : imm64(int64_t{in.simm()} << 16)); return true;
-        case Op::add: result(d, std::format("{} + {}", R(a), R(b))); return true;
+        case Op::add:
+            if (d == 1 && (a == 1) != (b == 1)) {
+                // The stack pointer moved by a register: only __builtin_eh_return's epilogue does this, and only as
+                // `add r1,r1,rX` straight before the return. It is the guest's unwinder installing a landing pad's
+                // context: LR is the pad and rX how much further up the stack its frame is; rX is 0 when the function
+                // returns normally. Anything else is a shape this lifter doesn't know, and the function isn't lifted.
+                const Insn* next = at(pc + 4);
+                if (record_form || !next || next->op != Op::bclr || next->lk() || (next->rd() & 0x14) != 0x14) {
+                    error_ = "the stack pointer moved by a register, not as __builtin_eh_return's epilogue (add r1,r1,rX; blr)";
+                    return false;
+                }
+                const std::string by = R(a == 1 ? b : a);
+                LR();  // (synced for eh_return, which reads the pad from it)
+                ++eh_returns_;
+                line(std::format("{0} = {0} + {1}; if ({1} != 0ull) {{ {2} eh_return(c); }}", R(1), by, sync_out()));
+                return true;
+            }
+            result(d, std::format("{} + {}", R(a), R(b)));
+            return true;
         case Op::subf: result(d, std::format("{} - {}", R(b), R(a))); return true;
         case Op::neg: result(d, std::format("0ull - {}", R(a))); return true;
         case Op::addic: carry(R(a), imm64(in.simm()), "0u"); return true;
@@ -746,6 +798,7 @@ private:
     std::set<unsigned> gprs_, crs_, fprs_, vrs_;
     std::set<std::string> specials_;
     std::string error_;
+    unsigned eh_returns_ = 0;
 };
 
 }  // namespace

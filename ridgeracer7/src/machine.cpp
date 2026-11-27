@@ -145,10 +145,20 @@ void exit_process(int code) {
 
 const qilin::rt::CpuHooks& guest_hooks() { return kHooks; }
 
+// Runs lifted code for the runtime. A C++ exception of the game's that no lifted function on the way took (its
+// landing pad's frame isn't on this stack, cpu.hpp) stops the game here, by name.
+static void run_lifted(Cpu& c, qilin::rt::GuestFn fn, uint32_t code) {
+    try {
+        fn(c);
+    } catch (const qilin::rt::GuestUnwind& e) {
+        fatal("the game's unwinder sent an exception to the landing pad %08x in the frame at %08x, and no lifted function under %08x took it (that frame isn't on this stack)", e.pad, e.sp, code);
+    }
+}
+
 void call_guest(Cpu& c, uint32_t code) {
     const qilin::rt::GuestFn fn = find_function(code);
     if (!fn) fatal("%08x is to be run, and is not among the lifted functions", code);
-    fn(c);
+    run_lifted(c, fn, code);
 }
 
 TlsImage tls_image() { return g_machine->tls; }
@@ -275,7 +285,7 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
     set_current_cpu(&cpu);
     const qilin::rt::GuestFn entry = find_function(elf.entry_code());
     if (!entry) fatal("the program's entry point %08x is not among the lifted functions", elf.entry_code());
-    entry(cpu);
+    run_lifted(cpu, entry, elf.entry_code());
     log("the entry point returned");
     exit_process(static_cast<int>(cpu.r[3]));
 }

@@ -106,6 +106,7 @@ qilin_tool(qilin_recomp)
 add_library(qilin_rt STATIC
     runtime/src/memory.cpp
     runtime/src/report.cpp
+    runtime/src/unwind.cpp
 )
 target_include_directories(qilin_rt PUBLIC runtime/include)
 target_link_libraries(qilin_rt PRIVATE qilin_warnings)

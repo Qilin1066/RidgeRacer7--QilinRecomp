@@ -21,7 +21,9 @@
 //      and from each of its landing pads. A switch is
 //      recognised by its idiom (below) and its table read. A branch out of
 //      the function is a tail call, and its target a start if it wasn't one.
-//      Repeat until no new start turns up.
+//      Repeat until no new start turns up, and the functions known never to
+//      return (found after each round) stop changing: the code after a call
+//      of one is entered by nothing, which proves some switches' bounds.
 //   3. Account for every word: code some function reaches, a jump table's
 //      entry, padding (zero or `nop`, unreached), dead (instructions straight
 //      after a trap that always fires, up to the function's end: the
@@ -98,6 +100,7 @@ struct Function {
     std::vector<JumpTable> tables;
     std::vector<SystemCall> system_calls;
     std::vector<uint32_t> landing_pads;    // where the unwinder may enter it
+    std::vector<uint32_t> pads_beyond;     // its exception table's pads past its bound, which the lifter can't enter it at
     std::vector<uint32_t> indirect_calls;  // bctrl, blrl
     std::vector<uint32_t> indirect_tails;  // bctr that isn't a switch
     std::vector<uint32_t> bad;             // reached a word that doesn't decode, or left the code
@@ -121,6 +124,9 @@ public:
     size_t unwind_ranges() const { return unwind_.size(); }
     size_t exception_tables() const { return pads_.size(); }
     int rounds() const { return rounds_; }
+    // The functions that never return to their caller: every path from their start and their landing pads ends in a
+    // call of one that doesn't (sys_process_exit and sys_ppu_thread_exit to begin with), a trap, or a loop.
+    const std::set<uint32_t>& no_return() const { return no_return_; }
     // A text report: counts, the system calls made, and everything that needs looking at.
     std::string summary() const;
     // The decoded word at a code address (invalid outside the code).
@@ -135,6 +141,8 @@ private:
     bool in_code(uint32_t a) const;
     uint32_t bound_of(uint32_t start) const;
     void number_system_calls(Function& f) const;
+    bool may_return(const Function& f, const std::set<uint32_t>& returning) const;
+    std::set<uint32_t> find_no_return() const;
     void add_start(uint32_t a, Origin o);
     void account();
 
@@ -148,6 +156,8 @@ private:
     std::map<uint32_t, std::vector<uint32_t>> pads_;  // a function's landing pads
     std::map<uint32_t, Origin> starts_;
     std::map<uint32_t, const ImportFunction*> stubs_;
+    std::set<uint32_t> exit_stubs_;  // the stubs of the imports that end the process or the thread
+    std::set<uint32_t> no_return_;   // found after each round, used by the next
     std::map<uint32_t, Function> functions_;
     Coverage coverage_;
     int rounds_ = 0;

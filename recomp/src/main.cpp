@@ -909,12 +909,18 @@ int cmd_lift(const Args& a) {
         uint32_t first = 0;
     };
     std::vector<Reason> reasons;
-    size_t lifted = 0, words = 0, lifted_words = 0;
+    size_t lifted = 0, words = 0, lifted_words = 0, catching = 0, pads = 0, eh_returns = 0, unwinders = 0;
     std::vector<std::string> code;
     std::string declarations, stubs, table;
     for (const auto& [start, f] : cfg->functions()) {
         if (a.out) table += std::format("    {{0x{:08X}u, &{}}},\n", start, fn_name(start));
         words += f.words;
+        pads += f.landing_pads.size();
+        // A landing pad must be entered in the lifted function that has it, which a start inside the guest's function
+        // (cutting it in two) would prevent: not a case this game has.
+        if (!f.pads_beyond.empty())
+            throw Failure{std::format("the function at {:#x} ends at {:#x}, before its landing pad at {:#x}: the lifter can't enter it there", start, f.bound,
+                                      f.pads_beyond[0])};
         LiftInput input = lift_input(*cfg, f);
         input.keep_pc = a.keep_pc;
         input.keep_registers = a.keep_registers;
@@ -922,6 +928,9 @@ int cmd_lift(const Args& a) {
         if (l.ok) {
             ++lifted;
             lifted_words += f.words;
+            catching += l.catches;
+            eh_returns += l.eh_returns;
+            unwinders += l.eh_returns > 0;
             if (a.out) {
                 code.push_back(l.code);
                 declarations += std::format("void {}(Cpu& c);\n", fn_name(start));
@@ -941,6 +950,14 @@ int cmd_lift(const Args& a) {
     }
     std::ranges::sort(reasons, [](const Reason& x, const Reason& y) { return x.functions > y.functions; });
     std::println("{} of {} functions lifted ({} of {} instructions)", lifted, cfg->functions().size(), lifted_words, words);
+    std::println("C++ exceptions: {} functions with {} landing pads, each enterable at its pads; {} __builtin_eh_return epilogues in {} functions (the unwinder)",
+                 catching, pads, eh_returns, unwinders);
+    // Landing pads with no epilogue to reach them: the unwinder's shape isn't the one the lifter knows, and a throw
+    // would go on as a plain return. Stop rather than lift a program whose exceptions can't work.
+    if (pads && !eh_returns)
+        throw Failure{std::format("the program has {} landing pads but no __builtin_eh_return epilogue (add r1,r1,rX; blr): its unwinder has a shape the lifter "
+                                  "doesn't know",
+                                  pads)};
     std::println("not lifted, by the first instruction outside the slice:");
     for (size_t i = 0; i < reasons.size() && i < 40; ++i)
         std::println("  {:6}  {} (first at {:#x})", reasons[i].functions, reasons[i].why, reasons[i].first);

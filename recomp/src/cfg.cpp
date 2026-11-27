@@ -4,6 +4,7 @@
 #include <format>
 
 #include "bytes.hpp"
+#include "import_names.hpp"
 #include "syscall_names.hpp"
 
 namespace qilin {
@@ -323,6 +324,9 @@ std::optional<std::string> Cfg::prepare() {
             if (f.stub && in_code(f.initial)) {
                 stubs_[f.initial] = &f;
                 add_start(f.initial, Origin::Stub);
+                // What never returns to its caller, by the system's definition: the process's end and the thread's.
+                const std::string_view name = import_name(library.name, f.id);
+                if (name == "sys_process_exit" || name == "sys_ppu_thread_exit") exit_stubs_.insert(f.initial);
             }
 
     // Every direct call's target.
@@ -435,8 +439,9 @@ bool Cfg::read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out
     }
     // ... or the switch is a block of its own, entered only by `ble crN` after the compare (or a `b` straight after `bgt crN`).
     const Insn before = insn(head - 4);
-    // Nothing falls into `head` from above: an unconditional jump, or another switch's table (each word up to `head` an
-    // offset to a target in this function, straight after an unconditional bctr).
+    // Nothing falls into `head` from above: an unconditional jump, a call of a function that never returns (the
+    // previous round's no_return_: the out-of-range index's `abort()`), or another switch's table (each word up to
+    // `head` an offset to a target in this function, straight after an unconditional bctr).
     const auto after_table = [&]() {
         for (uint32_t x = head - 4; x > start && x + 4 * 512 >= head; x -= 4) {
             const Insn in = insn(x);
@@ -452,7 +457,7 @@ bool Cfg::read_table(uint32_t at, uint32_t start, uint32_t bound, JumpTable& out
         return false;
     };
     const bool own_block = head > start && ((!before.lk() && (before.op == Op::b || ((before.op == Op::bclr || before.op == Op::bcctr || before.op == Op::bc) && (before.rd() & 0x14) == 0x14))) ||
-                                            after_table());
+                                            (before.op == Op::b && before.lk() && no_return_.contains(before.branch_target(head - 4))) || after_table());
     if (!checked && own_block) {
         bool agreed = true;
         for (uint32_t from = start; from < bound && agreed; from += 4) {
@@ -498,12 +503,16 @@ Function Cfg::explore(uint32_t start, Origin origin, std::vector<uint32_t>& foun
     if (const auto stub = stubs_.find(start); stub != stubs_.end()) f.stub = stub->second;
     f.end = start;
     std::vector<uint32_t> work{start};
-    if (const auto pads = pads_.find(start); pads != pads_.end())
-        for (const uint32_t pad : pads->second)
-            if (pad < f.bound) {  // (a start inside the function may have cut it short: its other part has the rest)
+    if (const auto pads = pads_.find(start); pads != pads_.end()) {
+        for (const uint32_t pad : pads->second) {
+            if (pad < f.bound) {
                 f.landing_pads.push_back(pad);
                 work.push_back(pad);
+            } else {
+                f.pads_beyond.push_back(pad);  // (a start inside the function cut it short: the pad is in its other part)
             }
+        }
+    }
     const auto leave = [&](uint32_t to) {  // a branch, not a call, to `to`
         if (to >= start && to < f.bound) {
             work.push_back(to);
@@ -678,8 +687,96 @@ void Cfg::run() {
                 add_start(to, Origin::TailCall);
                 changed = true;
             }
+        if (!changed) {
+            // The functions found so far that never return: another round if that changed (a switch's bound may
+            // now be proven, and a table's size with it).
+            std::set<uint32_t> no_return = find_no_return();
+            changed = no_return != no_return_;
+            no_return_ = std::move(no_return);
+        }
         if (!changed || rounds_ == 64) break;
     }
+}
+
+// Can the function return to its caller, if the ones in `returning` are the functions that can? From its start and
+// its landing pads (an exception caught there may end in a return), along everything but what follows a call of a
+// function not in `returning`. What isn't known (a jump through a register, the end of the function, a tail call out
+// of the code) counts as a way back.
+bool Cfg::may_return(const Function& f, const std::set<uint32_t>& returning) const {
+    if (f.stub) return !exit_stubs_.contains(f.start);
+    if (!f.bad.empty()) return true;
+    const auto returns = [&](uint32_t callee) { return !functions_.contains(callee) || returning.contains(callee); };
+    std::set<uint32_t> seen;
+    std::vector<uint32_t> work{f.start};
+    work.insert(work.end(), f.landing_pads.begin(), f.landing_pads.end());
+    while (!work.empty()) {
+        const uint32_t pc = work.back();
+        work.pop_back();
+        if (pc < f.start || pc >= f.bound) {  // a branch out of the function: a tail call, or the next function run into
+            if (returns(pc)) return true;
+            continue;
+        }
+        if (!seen.insert(pc).second) continue;
+        const Insn in = insn(pc);
+        if (!in.valid() || kind_[(pc - lo_) / 4] != kCode) return true;
+        const bool always = (in.rd() & 0x14) == 0x14;
+        switch (in.op) {
+        case Op::b:
+            if (in.lk()) {
+                if (returns(in.branch_target(pc))) work.push_back(pc + 4);
+            } else {
+                work.push_back(in.branch_target(pc));
+            }
+            break;
+        case Op::bc:
+            if (in.lk()) {  // a conditional call: the way past it when not taken, and when the callee returns
+                work.push_back(pc + 4);
+            } else {
+                work.push_back(in.branch_target(pc));
+                if (!always) work.push_back(pc + 4);
+            }
+            break;
+        case Op::bclr:
+            if (!in.lk()) return true;  // a return (conditional or not)
+            work.push_back(pc + 4);     // a call through LR
+            break;
+        case Op::bcctr:
+            if (in.lk()) {
+                work.push_back(pc + 4);  // a call through CTR
+                break;
+            }
+            if (const auto table = std::ranges::find(f.tables, pc, &JumpTable::at); table != f.tables.end()) {
+                work.insert(work.end(), table->targets.begin(), table->targets.end());
+            } else {
+                return true;  // a jump through CTR to who knows where
+            }
+            if (!always) work.push_back(pc + 4);
+            break;
+        case Op::tw: case Op::td: case Op::twi: case Op::tdi:
+            if (in.rd() != 31) work.push_back(pc + 4);
+            break;
+        default: work.push_back(pc + 4);
+        }
+    }
+    return false;
+}
+
+// The least set of functions that can return, grown until nothing more joins it: what is never in it never returns
+// (and a group of functions that return only through each other never does either: they recurse forever).
+std::set<uint32_t> Cfg::find_no_return() const {
+    std::set<uint32_t> returning;
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (const auto& [start, f] : functions_)
+            if (!returning.contains(start) && may_return(f, returning)) {
+                returning.insert(start);
+                grew = true;
+            }
+    }
+    std::set<uint32_t> never;
+    for (const auto& [start, f] : functions_)
+        if (!returning.contains(start)) never.insert(start);
+    return never;
 }
 
 void Cfg::account() {
@@ -728,7 +825,7 @@ std::string Cfg::summary() const {
     std::string out;
     const auto line = [&](std::string text) { out += text + "\n"; };
     size_t by_origin[6] = {}, pads = 0, unwind = 0, tables = 0, proven = 0, entries = 0, apart = 0, calls = 0, indirect_calls = 0, runs_off = 0,
-           runs_off_unknown = 0, sites = 0, numbered = 0;
+           runs_off_unknown = 0, sites = 0, numbered = 0, pads_beyond = 0;
     std::vector<uint32_t> bad, tails, open_ended;
     std::vector<std::pair<uint32_t, uint32_t>> unproven;
     std::map<uint32_t, size_t> numbers;
@@ -736,6 +833,7 @@ std::string Cfg::summary() const {
         ++by_origin[static_cast<size_t>(f.origin)];
         unwind += f.unwind;
         pads += f.landing_pads.size();
+        pads_beyond += f.pads_beyond.size();
         calls += f.calls.size();
         indirect_calls += f.indirect_calls.size();
         if (f.runs_off) {
@@ -771,7 +869,7 @@ std::string Cfg::summary() const {
         if (by_origin[o]) line(std::format("  {:6} from {}", by_origin[o], origin_name(static_cast<Origin>(o))));
     line(std::format("the program's tables: {} descriptors, {} unwinding entries, {} import stubs; TOC {:#x}", descriptors_, unwind_.size(),
                      stubs_.size(), toc_));
-    line(std::format("{} functions have an exception table; {} landing pads", pads_.size(), pads));
+    line(std::format("{} functions have an exception table; {} landing pads, {} of them past their function's bound", pads_.size(), pads + pads_beyond, pads_beyond));
     line(std::format("{} direct call sites' targets, {} indirect calls", calls, indirect_calls));
     line(std::format("{} switches with {} entries; the size of {} is the bound the code checks; {} have their table elsewhere than straight after the bctr",
                      tables, entries, proven, apart));
@@ -781,6 +879,8 @@ std::string Cfg::summary() const {
         line(std::format("  sized by where their targets begin ({}):{}{}", unproven.size(), text, unproven.size() > 24 ? " ..." : ""));
     }
     line(std::format("{} indirect jumps that are not switches, outside the import stubs:{}", tails.size(), some(tails)));
+    line(std::format("{} functions never return (every way through ends in a call of one that doesn't, sys_process_exit or sys_ppu_thread_exit to begin with, a trap or a loop):{}",
+                     no_return_.size(), some(std::vector<uint32_t>(no_return_.begin(), no_return_.end()))));
     line(std::format("{} functions reach their end without a return or jump (a call that doesn't return, or the next function); {} of them have no unwinding entry to say where they end; their last instructions:{}",
                      runs_off, runs_off_unknown, some(open_ended)));
     line(std::format("{} system call sites; the number is known at {}: {} different calls", sites, numbered, numbers.size()));

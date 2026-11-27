@@ -254,11 +254,21 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         d.stencil_front = side(0x0328);
         d.stencil_back = state(0x0348) ? side(0x0348) : d.stencil_front;
     }
-    // State this renderer doesn't take, refused by name rather than ignored: flat shading, two-sided vertex colours, user clip
-    // planes, polygon stipple.
-    if (state(0x0368) == 0x1d00) fatal("a draw with flat shading, which the renderer doesn't take yet (at offset %08x)", at);
+    // Flat shading (SET_SHADE_MODE: OpenGL's FLAT 0x1D00, SMOOTH 0x1D01, 0 as the system leaves it), with the provoking vertex
+    // SET_FLAT_SHADE_OP gives: 0 a primitive's last, OpenGL's convention, 1 its first (*a stated reading*: NV40's FLATSHADE_FIRST,
+    // as Mesa's driver names the method).
+    if (const uint32_t shade = state(0x0368); shade == 0x1d00) {
+        d.flat = true;
+        const uint32_t op = state(0x1450);
+        if (op > 1) fatal("a draw with flat shading by %#x (SET_FLAT_SHADE_OP), which the renderer doesn't know (at offset %08x)", op, at);
+        d.flat_first = op == 1;
+    } else if (shade != 0 && shade != 0x1d01) {
+        fatal("a draw with shade mode %#x, which the renderer doesn't know (at offset %08x)", shade, at);
+    }
     // A logic operation (SET_LOGIC_OP_ENABLE, SET_LOGIC_OP: OpenGL's), which replaces blending.
     if (state(0x0374)) d.logic = true, d.logic_op = state(0x0378);
+    // State this renderer doesn't take, refused by name rather than ignored: two-sided vertex colours, user clip planes, polygon
+    // stipple.
     if (state(0x142c)) fatal("a draw with two-sided vertex colours, which the renderer doesn't take yet (at offset %08x)", at);
     if (state(0x1478)) fatal("a draw with user clip planes (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x1478), at);
     if (state(0x147c)) fatal("a draw with polygon stipple, which the renderer doesn't take yet (at offset %08x)", at);

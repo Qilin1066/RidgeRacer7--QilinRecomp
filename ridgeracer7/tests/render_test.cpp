@@ -355,6 +355,48 @@ void test_logic_op() {
     CHECK(!rr7::logic_op(0x14ff) && !rr7::logic_op(0x1510) && !rr7::logic_op(0));
 }
 
+// A triangle that is the other's vertices in the same cyclic order: the same winding.
+bool same_winding(const uint32_t* a, const uint32_t* b) {
+    for (unsigned r = 0; r < 3; ++r)
+        if (a[0] == b[r] && a[1] == b[(r + 1) % 3] && a[2] == b[(r + 2) % 3]) return true;
+    return false;
+}
+
+void test_provoking() {
+    using rr7::assemble, rr7::Provoking, rr7::Topology;
+    Indices made;
+    // OpenGL's last-vertex convention (SET_FLAT_SHADE_OP 0): each primitive's last vertex first, its winding kept.
+    CHECK(assemble(5, iota(6), false, Provoking::last, made) && made == (Indices{2, 0, 1, 5, 3, 4}));
+    CHECK(assemble(6, iota(5), false, Provoking::last, made) && made == (Indices{2, 0, 1, 3, 2, 1, 4, 2, 3}));
+    CHECK(assemble(7, iota(4), false, Provoking::last, made) && made == (Indices{2, 0, 1, 3, 0, 2}));
+    CHECK(assemble(8, iota(4), false, Provoking::last, made) && made == (Indices{3, 0, 1, 3, 1, 2}));
+    CHECK(assemble(9, iota(4), false, Provoking::last, made) && made == (Indices{3, 2, 0, 3, 0, 1}));
+    CHECK(assemble(10, iota(4), false, Provoking::last, made) && made == (Indices{0, 1, 2, 0, 2, 3}));  // a polygon's is its first
+    const auto lines = assemble(2, iota(4), false, Provoking::last, made);
+    CHECK(lines && lines->topology == Topology::lines && made == (Indices{1, 0, 3, 2}));
+    const auto strip = assemble(4, iota(3), false, Provoking::last, made);
+    CHECK(strip && strip->topology == Topology::lines && made == (Indices{1, 0, 2, 1}));
+    // The first-vertex convention (1): a strip's triangle's first, a fan triangle's second, a quad's first.
+    CHECK(assemble(6, iota(5), false, Provoking::first, made) && made == (Indices{0, 1, 2, 1, 3, 2, 2, 3, 4}));
+    CHECK(assemble(7, iota(4), false, Provoking::first, made) && made == (Indices{1, 2, 0, 2, 3, 0}));
+    CHECK(assemble(8, iota(4), false, Provoking::first, made) && made == (Indices{0, 1, 2, 0, 2, 3}));
+    // Over longer strips and fans, either way, every triangle keeps the winding the smooth one has.
+    for (const uint32_t primitive : {5u, 6u, 7u})
+        for (const Provoking p : {Provoking::first, Provoking::last}) {
+            Indices smooth;
+            CHECK(assemble(primitive, iota(14), false, Provoking::any, smooth));
+            if (smooth.empty()) {  // (drawn as they are: made here as Vulkan would take them)
+                CHECK(assemble(primitive, Indices{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, rr7::kRestart}, true, Provoking::any, smooth));
+            }
+            CHECK(assemble(primitive, iota(14), false, p, made) && made.size() == smooth.size());
+            bool kept = made.size() == smooth.size();
+            for (size_t t = 0; kept && t + 3 <= made.size(); t += 3) kept = same_winding(&made[t], &smooth[t]);
+            CHECK(kept);
+        }
+    // With restarts, each piece's own.
+    CHECK(assemble(5, Indices{0, 1, 2, rr7::kRestart, 3, 4, 5}, true, Provoking::last, made) && made == (Indices{2, 0, 1, 5, 3, 4}));
+}
+
 }  // namespace
 
 int main() {
@@ -371,6 +413,7 @@ int main() {
     test_rasterisation();
     test_window();
     test_logic_op();
+    test_provoking();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

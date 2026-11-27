@@ -8,6 +8,7 @@
 // Built only with the lifted code (-DQILIN_GEN_DIR), as the shaders are
 // derived from the game. Exit 0 if all were taken, 1 otherwise, 77 if
 // there is no Vulkan 1.3 device.
+#include <array>
 #include <cstdio>
 #include <vector>
 
@@ -18,10 +19,11 @@ using namespace qilin;
 
 namespace {
 
-VkShaderModule module_of(const host::Gpu& gpu, const rt::TranslatedShader& s) {
+// A program's module in one of its forms (shaders.hpp: 0 the plain one).
+VkShaderModule module_of(const host::Gpu& gpu, const rt::TranslatedShader& s, unsigned form = 0) {
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    info.codeSize = s.spirv_words * 4;
-    info.pCode = s.spirv;
+    info.codeSize = (form ? s.variant_words[form] : s.spirv_words) * 4;
+    info.pCode = form ? s.variant_spirv[form] : s.spirv;
     VkShaderModule m = VK_NULL_HANDLE;
     if (vkCreateShaderModule(gpu.device, &info, nullptr, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
     return m;
@@ -73,6 +75,20 @@ int main() {
             ++bad_modules;
         }
     }
+    // Their other forms for draw state (rsx_spirv.hpp's Variant), where they have them.
+    std::vector<std::array<VkShaderModule, 4>> forms(rt::kTranslatedShaderCount);
+    size_t form_count = 0;
+    for (size_t i = 0; i < rt::kTranslatedShaderCount; ++i)
+        for (unsigned n = 1; n < 4; ++n) {
+            const rt::TranslatedShader& s = rt::kTranslatedShaders[i];
+            if (!s.variant_spirv[n]) continue;
+            ++form_count;
+            forms[i][n] = module_of(gpu, s, n);
+            if (!forms[i][n]) {
+                std::printf("  the driver refuses the module of the %s program at %08x in its form %u\n", s.vertex ? "vertex" : "fragment", s.address, n);
+                ++bad_modules;
+            }
+        }
     // A fragment program's inputs at their locations: COL0 1, COL1 2, FOGC 5, TEXn 7 + n (rsx_spirv.hpp).
     const auto fragment_needs = [](uint32_t inputs) {
         static constexpr unsigned kLocation[14] = {0, 1, 2, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
@@ -81,10 +97,11 @@ int main() {
             if (inputs & (1u << n)) outputs |= 1u << kLocation[n];
         return outputs;
     };
-    const auto pipeline = [&](size_t v, size_t f) {
+    // A pipeline of vertex program v and fragment program f, in the forms given (0 the plain ones).
+    const auto pipeline = [&](size_t v, size_t f, unsigned v_form, unsigned f_form) {
         VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = modules[v], stages[0].pName = "main";
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = modules[f], stages[1].pName = "main";
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = v_form ? forms[v][v_form] : modules[v], stages[0].pName = "main";
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = f_form ? forms[f][f_form] : modules[f], stages[1].pName = "main";
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
         for (uint32_t a = 0; a < 16; ++a)
@@ -145,15 +162,23 @@ int main() {
             std::printf("  no partner for the %s program at %08x\n", s.vertex ? "vertex" : "fragment", s.address);
             continue;
         }
-        ++pipelines;
-        if (!(s.vertex ? pipeline(i, partner) : pipeline(partner, i))) {
-            std::printf("  the driver refuses a pipeline with the %s program at %08x\n", s.vertex ? "vertex" : "fragment", s.address);
-            ++bad_pipelines;
+        // The program in each of its forms, with its partner in its plain one.
+        for (unsigned n = 0; n < 4; ++n) {
+            if (n && !forms[i][n]) continue;
+            ++pipelines;
+            if (!(s.vertex ? pipeline(i, partner, n, 0) : pipeline(partner, i, 0, n))) {
+                std::printf("  the driver refuses a pipeline with the %s program at %08x in its form %u\n", s.vertex ? "vertex" : "fragment", s.address, n);
+                ++bad_pipelines;
+            }
         }
     }
-    std::printf("shader check: %zu modules, %zu refused; %zu pipelines, %zu refused\n", rt::kTranslatedShaderCount, bad_modules, pipelines, bad_pipelines);
+    std::printf("shader check: %zu modules and %zu other forms, %zu refused; %zu pipelines, %zu refused\n", rt::kTranslatedShaderCount, form_count, bad_modules,
+                pipelines, bad_pipelines);
     for (VkShaderModule m : modules)
         if (m) vkDestroyShaderModule(gpu.device, m, nullptr);
+    for (const auto& f : forms)
+        for (VkShaderModule m : f)
+            if (m) vkDestroyShaderModule(gpu.device, m, nullptr);
     vkDestroyPipelineLayout(gpu.device, layout, nullptr);
     vkDestroyDescriptorSetLayout(gpu.device, sets[0], nullptr);
     vkDestroyDescriptorSetLayout(gpu.device, sets[1], nullptr);

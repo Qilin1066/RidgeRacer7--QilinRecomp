@@ -160,7 +160,7 @@ struct WordsHash {
     }
 };
 // A pipeline's key: the programs and every piece of state that goes into it (pipeline_for), as words.
-using PipelineKey = std::array<uint32_t, 42>;
+using PipelineKey = std::array<uint32_t, 43>;
 
 struct Renderer {
     host::Gpu* gpu = nullptr;
@@ -197,7 +197,7 @@ struct Renderer {
         const qilin::rt::TranslatedShader* shader = nullptr;
     };
     std::array<ShaderMemo, 8> recent_shaders[2];  // [0] fragment, [1] vertex
-    std::map<const qilin::rt::TranslatedShader*, VkShaderModule> modules;
+    std::unordered_map<const qilin::rt::TranslatedShader*, std::array<VkShaderModule, 4>> modules;  // by program, then its form (shaders.hpp)
     std::unordered_map<PipelineKey, VkPipeline, WordsHash> pipelines;
     // By address, format (a depth surface's with 0x100) and pitch, the last 0: one image for a piece of memory drawn as
     // surfaces of several sizes (a small pass drawn in the corner of a large buffer: the game sets a smaller clip), as
@@ -334,12 +334,14 @@ const qilin::rt::TranslatedShader& find_shader_keyed(const std::vector<uint8_t>&
     return *it->second;
 }
 
-VkShaderModule module_of(const qilin::rt::TranslatedShader& s) {
-    auto& m = g_renderer->modules[&s];
+// A program's module in one of its forms (shaders.hpp: 0 the plain one), made the first time it is drawn with.
+VkShaderModule module_of(const qilin::rt::TranslatedShader& s, unsigned form) {
+    auto& m = g_renderer->modules[&s][form];
     if (!m) {
         VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        info.codeSize = s.spirv_words * 4;
-        info.pCode = s.spirv;
+        info.codeSize = (form ? s.variant_words[form] : s.spirv_words) * 4;
+        info.pCode = form ? s.variant_spirv[form] : s.spirv;
+        if (!info.pCode) fatal("the %s program at %08x has no form %u", s.vertex ? "vertex" : "fragment", s.address, form);
         host::check(vkCreateShaderModule(g_renderer->gpu->device, &info, nullptr, &m), "vkCreateShaderModule");
     }
     return m;
@@ -488,10 +490,16 @@ VkPrimitiveTopology vulkan_topology(Topology t) {
     return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
 
-VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, const qilin::rt::TranslatedShader& fs, VkFormat format, VkPrimitiveTopology topology,
-                        const Rasterisation& rasterising) {
+// The forms of a draw's programs (shaders.hpp) its state asks for.
+struct Forms {
+    unsigned vertex = 0, fragment = 0;
+};
+
+VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, const qilin::rt::TranslatedShader& fs, const Forms& forms, VkFormat format,
+                        VkPrimitiveTopology topology, const Rasterisation& rasterising) {
     const PipelineKey key{static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs) >> 32),
                               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs) >> 32),
+                              forms.vertex | (forms.fragment << 8),
                               static_cast<uint32_t>(format), static_cast<uint32_t>(topology), d.color_mask, d.blend, d.blend_src, d.blend_dst, d.blend_equation,
                               d.depth_test, d.depth_write, d.depth_func, d.cull, d.cull_face, d.front_face, rasterising.depth_bias, d.depth_surface, d.stencil_test,
                               d.stencil_front.func, d.stencil_front.ref, d.stencil_front.func_mask, d.stencil_front.write_mask, d.stencil_front.fail, d.stencil_front.zfail,
@@ -502,8 +510,8 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
     auto& p = g_renderer->pipelines[key];
     if (p) return p;
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = module_of(vs), stages[0].pName = "main";
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = module_of(fs), stages[1].pName = "main";
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = module_of(vs, forms.vertex), stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = module_of(fs, forms.fragment), stages[1].pName = "main";
     std::vector<VkVertexInputBindingDescription> bindings;
     std::vector<VkVertexInputAttributeDescription> attributes;
     for (uint32_t a = 0; a < 16; ++a)
@@ -1253,8 +1261,17 @@ void renderer_draw(const Draw& d) {
         std::iota(sequence.begin() + static_cast<std::ptrdiff_t>(had), sequence.end(), static_cast<uint32_t>(had));
     }
     const std::span<const uint32_t> order = d.indexed ? std::span<const uint32_t>(d.indices) : std::span<const uint32_t>(sequence.data(), d.count);
+    // Flat shading: a fragment program that reads a colour in its flat form, every primitive made into a list with the RSX's
+    // provoking vertex first (Vulkan's is the first).
+    Forms forms;
+    Provoking provoking = Provoking::any;
+    if (d.flat && (fs.inputs & 6)) {
+        forms.fragment |= 1, provoking = d.flat_first ? Provoking::first : Provoking::last;
+        if (!fs.variant_spirv[forms.fragment])
+            fatal("a draw with flat shading, and the fragment program at %08x has no flat form: translate the shaders again (qilin shaders)", fs.address);
+    }
     static std::vector<uint32_t> made;  // the lists assemble() makes (kept: only the RSX's thread draws)
-    const auto assembly = assemble(d.primitive, order, d.indexed, Provoking::any, made);
+    const auto assembly = assemble(d.primitive, order, d.indexed, provoking, made);
     if (!assembly) fatal("%s", assembly.error().c_str());
     const bool indexed = assembly->indexed;
     // What the GPU is given: the lists made here, or the game's own indices as they are.
@@ -1521,7 +1538,7 @@ void renderer_draw(const Draw& d) {
     const WindowMapping window = window_mapping(d);
     const VkRect2D scissor{{static_cast<int32_t>(window.x0), static_cast<int32_t>(window.y0)}, {window.x1 - window.x0, window.y1 - window.y0}};
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_for(d, vs, fs, format, vulkan_topology(assembly->topology), *raster));
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_for(d, vs, fs, forms, format, vulkan_topology(assembly->topology), *raster));
     const VkViewport viewport{0, 0, static_cast<float>(d.color.width), static_cast<float>(d.color.height), 0.0f, 1.0f};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);

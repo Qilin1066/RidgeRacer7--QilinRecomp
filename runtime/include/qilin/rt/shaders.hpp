@@ -21,6 +21,11 @@ struct TranslatedShader {
     uint32_t inputs, outputs, textures, cube_textures;
     const uint32_t* constant_slots;  // a fragment program's inline constants: each one's offset in its microcode, in bytes
     size_t constant_slot_count;
+    // Its forms for draw state the plain one can't serve, by number (rsx_spirv.hpp's Variant: 0 is the plain one, `spirv`;
+    // a fragment program's 1 has flat colours), each null where the program has none (it needs none, or nothing draws
+    // with it).
+    const uint32_t* variant_spirv[4];
+    size_t variant_words[4];
 };
 
 extern const TranslatedShader kTranslatedShaders[];

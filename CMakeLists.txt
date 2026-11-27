@@ -133,6 +133,11 @@ add_executable(ridgeracer7_render_test ridgeracer7/tests/render_test.cpp ridgera
 target_include_directories(ridgeracer7_render_test PRIVATE ridgeracer7/src)
 target_link_libraries(ridgeracer7_render_test PRIVATE qilin_warnings)
 add_test(NAME ridgeracer7_render_test COMMAND ridgeracer7_render_test)
+# The translated programs' other forms for draw state (rsx_spirv.hpp's Variant), on synthetic programs.
+add_executable(ridgeracer7_shader_forms_test ridgeracer7/tests/shader_forms_test.cpp)
+target_link_libraries(ridgeracer7_shader_forms_test PRIVATE qilin_recomp qilin_warnings)
+qilin_tool(ridgeracer7_shader_forms_test)
+add_test(NAME ridgeracer7_shader_forms_test COMMAND ridgeracer7_shader_forms_test)
 add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_game qilin_recomp qilin_warnings)
 qilin_tool(qilin_tests)

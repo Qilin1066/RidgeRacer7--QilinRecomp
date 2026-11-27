@@ -52,6 +52,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - Polygons drawn as lines or points (Vulkan's polygon mode, with `fillModeNonSolid`, which the host layer now turns on where the GPU has it), with polygon offset by the mode's own enable; primitive restart for points and lines. Primitives are assembled by a tested pure function (`render_state.cpp`); a draw whose pieces were all too short for a triangle no longer hands the GPU restart indices.
 - The window offset (`SET_WINDOW_OFFSET`): the window's origin on the surface, moving the viewport and the scissor alike (*a stated reading*), instead of a stop.
 - Logic operations, as Vulkan's (in place of blending), where the GPU has `logicOp`; instead of a stop.
+- Flat shading: a fragment program that reads a colour has a flat form, translated at build time beside the plain one (`qilin shaders` now writes a program's other forms for draw state; `validate_shaders.py` and `ridgeracer7_shader_check` take them too: 28, all passing), and primitives are made into lists with the RSX's provoking vertex first (its last, OpenGL's convention, or its first by `SET_FLAT_SHADE_OP`), their windings kept. `ridgeracer7_shader_forms_test` holds what each form declares.
 
 ### Changed
 - README rewritten to the layout shared by the QilinRecomp projects: what works and how to build and play it, without the development history.

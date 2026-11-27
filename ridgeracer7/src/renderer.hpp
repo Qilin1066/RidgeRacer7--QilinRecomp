@@ -62,6 +62,9 @@ struct Draw {
     uint32_t logic_op = 0;   // OpenGL's CLEAR 0x1500 to SET 0x150F (SET_LOGIC_OP)
     bool cull = false;
     uint32_t cull_face = 0, front_face = 0;
+    // Flat shading (SET_SHADE_MODE), and whether a primitive's first vertex gives its colour rather than its last
+    // (SET_FLAT_SHADE_OP).
+    bool flat = false, flat_first = false;
     // The alpha test, for the fragment program (rsx_spirv.cpp): {reference, scale, -, -}, {less, equal, greater, -} passing.
     std::array<float, 8> alpha_test{0, 0, 0, 0, 1, 1, 1, 0};
     std::array<TextureUnit, 16> textures{};

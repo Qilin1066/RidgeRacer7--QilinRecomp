@@ -361,7 +361,7 @@ private:
 
 class FragmentTranslator : Common {
 public:
-    explicit FragmentTranslator(const CgProgram& p) : p_(p), insns_(decode_fp(p.microcode)) {}
+    FragmentTranslator(const CgProgram& p, const Variant& variant) : p_(p), variant_(variant), insns_(decode_fp(p.microcode)) {}
 
     Translation run() {
         Translation out;
@@ -412,7 +412,9 @@ public:
             if (inputs_ & (1u << n)) {
                 input_vars_[n] = m.variable(kStorageInput, vec4);
                 m.decorate(input_vars_[n], kDecorationLocation, {kLocation[n]});
-                if (no_perspective & (1u << n)) m.decorate(input_vars_[n], kDecorationNoPerspective);
+                // (Flat, a colour isn't interpolated at all: with or without perspective is moot.)
+                if (variant_.flat && (n == 1 || n == 2)) m.decorate(input_vars_[n], kDecorationFlat);
+                else if (no_perspective & (1u << n)) m.decorate(input_vars_[n], kDecorationNoPerspective);
                 interface_.push_back(input_vars_[n]);
             }
         size_t slots = 0;
@@ -637,6 +639,7 @@ private:
     }
 
     const CgProgram& p_;
+    Variant variant_;
     std::vector<FpInsn> insns_;
     uint32_t inputs_ = 0, outputs_ = 0, textures_ = 0, cubes_ = 0, constants_ = 0, cc_ = 0, push_ = 0;
 
@@ -674,10 +677,13 @@ private:
 
 }  // namespace
 
-std::expected<Translation, std::string> translate(const CgProgram& program) {
+std::expected<Translation, std::string> translate(const CgProgram& program, const Variant& variant) {
     try {
-        if (program.vertex) return VertexTranslator(program).run();
-        return FragmentTranslator(program).run();
+        if (program.vertex) {
+            if (variant.flat) refuse("a flat form of a vertex program");
+            return VertexTranslator(program).run();
+        }
+        return FragmentTranslator(program, variant).run();
     } catch (const Failure& f) {
         return std::unexpected(std::format("the {} program at {:#x}: {}", program.vertex ? "vertex" : "fragment", program.address, f.why));
     }

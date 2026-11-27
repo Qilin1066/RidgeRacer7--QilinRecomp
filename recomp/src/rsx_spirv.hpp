@@ -11,7 +11,8 @@
 //   - outputs: o[POS] as the position, o[PSZ] as the point size, every other output register n written at location n.
 //     A component of an output the program doesn't write is (0, 0, 0, 1)'s: *a stated choice*.
 // Fragment programs
-//   - inputs: COL0 at location 1, COL1 at 2, FOGC at 5, TEXn at 7 + n (the vertex outputs' numbers);
+//   - inputs: COL0 at location 1, COL1 at 2, FOGC at 5, TEXn at 7 + n (the vertex outputs' numbers); COL0 and COL1 flat in
+//     the flat form (Variant);
 //   - inline constants: set 0, binding 1, a uniform block of vec4, one for each constant slot in the order they come
 //     (`constant_slots` says where each is in the microcode, for the renderer to read the game's values from it);
 //   - textures: set 1, binding n for texture unit n: a 2D or cube sampler, as the program's Cg parameters say;
@@ -30,6 +31,17 @@
 
 namespace qilin::rsx {
 
+// A program's forms for draw state its plain translation can't serve, each a module of its own made at build time (a
+// decoration or a built-in can't be changed by the renderer). They are numbered for the shader table (shaders.hpp):
+//   fragment programs: 1 flat colours (COL0 and COL1, and the back colours, not interpolated: each primitive's provoking
+//     vertex's, which the renderer puts first), for SET_SHADE_MODE FLAT;
+struct Variant {
+    bool flat = false;
+};
+constexpr unsigned variant_number(const Variant& v) { return v.flat ? 1u : 0u; }
+constexpr Variant variant_of(bool vertex, unsigned number) { return Variant{!vertex && (number & 1) != 0}; }
+constexpr unsigned kVariants = 4;  // numbers 0 (the plain form) to 3
+
 struct Translation {
     std::vector<uint32_t> spirv;
     uint32_t inputs = 0;   // vertex: attributes read; fragment: input registers read (bit n for input n)
@@ -38,7 +50,7 @@ struct Translation {
     std::vector<uint32_t> constant_slots;      // fragment: each inline constant's offset in the microcode, in bytes
 };
 
-std::expected<Translation, std::string> translate(const CgProgram& program);
+std::expected<Translation, std::string> translate(const CgProgram& program, const Variant& variant = {});
 
 // The key the renderer finds a translated program by: a hash (64-bit FNV-1a) of its microcode, with a fragment
 // program's inline constants left out (the game patches them; their values come to the shader another way).

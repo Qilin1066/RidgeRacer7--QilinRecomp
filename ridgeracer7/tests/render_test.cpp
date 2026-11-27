@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "render_formats.hpp"
+#include "render_state.hpp"
 #include "textures.hpp"
 
 namespace {
@@ -243,6 +244,87 @@ void test_depth() {
     CHECK(rr7::depth_to_host(0x123456, true) == 0x123456 && rr7::depth_to_guest(0xab123456u, true) == 0x123456);
 }
 
+
+using Indices = std::vector<uint32_t>;
+Indices iota(uint32_t n) {
+    Indices v(n);
+    for (uint32_t i = 0; i < n; ++i) v[i] = i;
+    return v;
+}
+
+void test_assembly() {
+    using rr7::assemble, rr7::Provoking, rr7::Topology, rr7::kRestart;
+    Indices made;
+    // What Vulkan has is drawn as it is: triangles, strips, lines, points.
+    {
+        const Indices order = iota(6);
+        const auto a = assemble(5, order, false, Provoking::any, made);
+        CHECK(a && a->topology == Topology::triangles && !a->indexed && !a->made);
+        const auto strip = assemble(6, order, true, Provoking::any, made);
+        CHECK(strip && strip->topology == Topology::triangle_strip && strip->indexed && !strip->made);
+    }
+    // Quads, quad strips, fans and polygons as triangles: (a, b, c), (a, c, d); (v, v + 1, v + 3), (v, v + 3, v + 2); about the first.
+    {
+        const auto q = assemble(8, iota(8), false, Provoking::any, made);
+        CHECK(q && q->topology == Topology::triangles && q->indexed && q->made && made == (Indices{0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7}));
+        CHECK(assemble(9, iota(6), false, Provoking::any, made) && made == (Indices{0, 1, 3, 0, 3, 2, 2, 3, 5, 2, 5, 4}));
+        CHECK(assemble(7, iota(5), false, Provoking::any, made) && made == (Indices{0, 1, 2, 0, 2, 3, 0, 3, 4}));
+        CHECK(assemble(10, iota(5), false, Provoking::any, made) && made == (Indices{0, 1, 2, 0, 2, 3, 0, 3, 4}));
+    }
+    // Primitive restart: each piece its own primitive, a strip's triangles keeping their alternate windings.
+    {
+        const Indices order{0, 1, 2, 3, kRestart, 4, 5, 6};
+        const auto a = assemble(6, order, true, Provoking::any, made);
+        CHECK(a && a->topology == Topology::triangles && a->made && made == (Indices{0, 1, 2, 2, 1, 3, 4, 5, 6}));
+        // Pieces too short for a triangle make nothing (and never hand the GPU a restart index).
+        const auto none = assemble(5, Indices{0, 1, kRestart, 2}, true, Provoking::any, made);
+        CHECK(none && none->made && made.empty());
+        // Lines and points with restarts: lists.
+        const auto lines = assemble(4, Indices{0, 1, 2, kRestart, 3, 4}, true, Provoking::any, made);
+        CHECK(lines && lines->topology == Topology::lines && made == (Indices{0, 1, 1, 2, 3, 4}));
+        const auto points = assemble(1, Indices{0, kRestart, 1}, true, Provoking::any, made);
+        CHECK(points && points->topology == Topology::points && made == (Indices{0, 1}));
+    }
+    // Line loops (3) and numbers past polygons aren't taken.
+    CHECK(!assemble(3, iota(4), false, Provoking::any, made));
+    CHECK(!assemble(11, iota(4), false, Provoking::any, made));
+}
+
+void test_rasterisation() {
+    using rr7::PolygonMode, rr7::PolygonState, rr7::rasterisation;
+    PolygonState s;
+    s.offset_fill = true;
+    // Filled (0 as the system leaves it, or FILL): polygon offset is the fill enable's.
+    auto r = rasterisation(5, s);
+    CHECK(r && r->mode == PolygonMode::fill && r->depth_bias);
+    // Both faces as lines: the line enable's.
+    s.front_mode = s.back_mode = 0x1b01;
+    r = rasterisation(6, s);
+    CHECK(r && r->mode == PolygonMode::line && !r->depth_bias);
+    s.offset_line = true;
+    CHECK(rasterisation(6, s) && rasterisation(6, s)->depth_bias);
+    // Points and lines aren't polygons.
+    r = rasterisation(2, s);
+    CHECK(r && r->mode == PolygonMode::fill && !r->depth_bias);
+    // Faces in different modes: refused while both are drawn, the drawn one's when the other is culled.
+    s.front_mode = 0x1b00, s.back_mode = 0x1b02;
+    CHECK(!rasterisation(5, s));
+    s.cull = true, s.cull_face = 0x405;
+    r = rasterisation(5, s);
+    CHECK(r && r->mode == PolygonMode::point);
+    s.cull_face = 0x404;
+    r = rasterisation(5, s);
+    CHECK(r && r->mode == PolygonMode::fill && r->depth_bias);
+    // Quads and polygons as lines or points (they would be drawn as triangles), and lines with the edge flag off.
+    s.cull = false, s.front_mode = s.back_mode = 0x1b01;
+    CHECK(!rasterisation(8, s) && !rasterisation(10, s) && rasterisation(7, s));
+    s.edge_flag = false;
+    CHECK(!rasterisation(5, s));
+    // A mode that isn't one.
+    s.front_mode = s.back_mode = 0x1b03;
+    CHECK(!rasterisation(5, s));
+}
+
 }  // namespace
 
 int main() {
@@ -255,6 +337,8 @@ int main() {
     test_format_word();
     test_attributes();
     test_depth();
+    test_assembly();
+    test_rasterisation();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

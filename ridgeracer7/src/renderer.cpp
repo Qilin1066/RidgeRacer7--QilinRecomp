@@ -18,6 +18,7 @@
 
 #include "kernel.hpp"
 #include "render_formats.hpp"
+#include "render_state.hpp"
 #include "machine.hpp"
 #include "qilin/host/vulkan.hpp"
 #include "qilin/rt/report.hpp"
@@ -159,7 +160,7 @@ struct WordsHash {
     }
 };
 // A pipeline's key: the programs and every piece of state that goes into it (pipeline_for), as words.
-using PipelineKey = std::array<uint32_t, 39>;
+using PipelineKey = std::array<uint32_t, 40>;
 
 struct Renderer {
     host::Gpu* gpu = nullptr;
@@ -474,16 +475,28 @@ VkStencilOpState stencil_state(const Draw::Stencil& s) {
     return v;
 }
 
-VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, const qilin::rt::TranslatedShader& fs, VkFormat format, VkPrimitiveTopology topology) {
+VkPrimitiveTopology vulkan_topology(Topology t) {
+    switch (t) {
+    case Topology::points: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case Topology::lines: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case Topology::line_strip: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case Topology::triangles: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case Topology::triangle_strip: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    }
+    return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+}
+
+VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, const qilin::rt::TranslatedShader& fs, VkFormat format, VkPrimitiveTopology topology,
+                        const Rasterisation& rasterising) {
     const PipelineKey key{static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&vs) >> 32),
                               static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs)), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&fs) >> 32),
                               static_cast<uint32_t>(format), static_cast<uint32_t>(topology), d.color_mask, d.blend, d.blend_src, d.blend_dst, d.blend_equation,
-                              d.depth_test, d.depth_write, d.depth_func, d.cull, d.cull_face, d.front_face, d.depth_bias, d.depth_surface, d.stencil_test,
+                              d.depth_test, d.depth_write, d.depth_func, d.cull, d.cull_face, d.front_face, rasterising.depth_bias, d.depth_surface, d.stencil_test,
                               d.stencil_front.func, d.stencil_front.ref, d.stencil_front.func_mask, d.stencil_front.write_mask, d.stencil_front.fail, d.stencil_front.zfail,
                               d.stencil_front.zpass, d.stencil_back.func, d.stencil_back.ref, d.stencil_back.func_mask, d.stencil_back.write_mask, d.stencil_back.fail,
                               d.stencil_back.zfail, d.stencil_back.zpass,
                               std::bit_cast<uint32_t>(d.bias_factor), std::bit_cast<uint32_t>(d.bias_units),
-                              d.depth_bounds, std::bit_cast<uint32_t>(d.bounds_min), std::bit_cast<uint32_t>(d.bounds_max)};
+                              d.depth_bounds, std::bit_cast<uint32_t>(d.bounds_min), std::bit_cast<uint32_t>(d.bounds_max), static_cast<uint32_t>(rasterising.mode)};
     auto& p = g_renderer->pipelines[key];
     if (p) return p;
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -506,7 +519,8 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
     VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     raster.lineWidth = 1.0f;
     raster.cullMode = VK_CULL_MODE_NONE;
-    if (d.depth_bias) raster.depthBiasEnable = VK_TRUE, raster.depthBiasSlopeFactor = d.bias_factor, raster.depthBiasConstantFactor = d.bias_units;
+    raster.polygonMode = rasterising.mode == PolygonMode::line ? VK_POLYGON_MODE_LINE : rasterising.mode == PolygonMode::point ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_FILL;
+    if (rasterising.depth_bias) raster.depthBiasEnable = VK_TRUE, raster.depthBiasSlopeFactor = d.bias_factor, raster.depthBiasConstantFactor = d.bias_units;
     // Culling (OpenGL's faces: front 0x404, back 0x405, both 0x408; windings: clockwise 0x900, anticlockwise 0x901). The
     // winding is in window coordinates, which count down from the top as Vulkan's framebuffer does (rsx.cpp: the window's
     // origin), so the RSX's anticlockwise is Vulkan's (*a stated reading, held to the picture*).
@@ -1219,11 +1233,9 @@ void renderer_draw(const Draw& d) {
     for (unsigned n = 1; n < 14; ++n)
         if ((fs.inputs & (1u << n)) && !(vs.outputs & (1u << kLocation[n])))
             fatal("the fragment program at %08x reads input %u, which the vertex program at %08x doesn't write", fs.address, n, vs.address);
-    // The primitive (the RSX's numbers: OpenGL's plus one). Those Vulkan lacks, or may lack (fans, on portability devices), are
-    // drawn as lists of triangles through indices: a quad (a, b, c, d) as (a, b, c) and (a, c, d), a fan's or polygon's
-    // triangles about its first vertex (*the diagonals are a stated choice*).
-    // The order the vertices are drawn in: the game's indices, or the vertices one after another.
-    // (Neither copied: the game's list as the draw holds it, or a list of 0, 1, 2... kept for that, grown as needed.)
+    // The primitive as Vulkan draws it (render_state.hpp), over the order the vertices are drawn in: the game's indices, or
+    // the vertices one after another. (Neither copied: the game's list as the draw holds it, or a list of 0, 1, 2... kept
+    // for that, grown as needed.)
     static std::vector<uint32_t> sequence;
     if (!d.indexed && sequence.size() < d.count) {
         const size_t had = sequence.size();
@@ -1231,57 +1243,15 @@ void renderer_draw(const Draw& d) {
         std::iota(sequence.begin() + static_cast<std::ptrdiff_t>(had), sequence.end(), static_cast<uint32_t>(had));
     }
     const std::span<const uint32_t> order = d.indexed ? std::span<const uint32_t>(d.indices) : std::span<const uint32_t>(sequence.data(), d.count);
-    const uint32_t n = static_cast<uint32_t>(order.size());
-    VkPrimitiveTopology topology;
-    static std::vector<uint32_t> indices;  // the triangles made here, when the primitive is one Vulkan lacks (kept: only the RSX's thread draws)
-    indices.clear();
-    bool indexed = d.indexed;
-    // With primitive restart, each piece between restarts is a primitive of its own: all made into a list of triangles (a
-    // strip's triangles keeping their alternate windings).
-    if (std::find(order.begin(), order.end(), kRestart) != order.end()) {
-        if (d.primitive < 5) fatal("primitive restart in a draw of primitive %u, which the renderer doesn't take yet", d.primitive);
-        topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, indexed = true;
-        for (size_t a = 0; a < order.size();) {
-            size_t b = a;
-            while (b < order.size() && order[b] != kRestart) ++b;
-            const uint32_t* s = order.data() + a;
-            const uint32_t m = static_cast<uint32_t>(b - a);
-            switch (d.primitive) {
-            case 5: indices.insert(indices.end(), s, s + m / 3 * 3); break;
-            case 6:
-                for (uint32_t v = 2; v < m; ++v)
-                    if (v % 2 == 0) indices.insert(indices.end(), {s[v - 2], s[v - 1], s[v]});
-                    else indices.insert(indices.end(), {s[v - 1], s[v - 2], s[v]});
-                break;
-            case 7: case 10: for (uint32_t v = 2; v < m; ++v) indices.insert(indices.end(), {s[0], s[v - 1], s[v]}); break;
-            case 8: for (uint32_t v = 0; v + 4 <= m; v += 4) indices.insert(indices.end(), {s[v], s[v + 1], s[v + 2], s[v], s[v + 2], s[v + 3]}); break;
-            case 9: for (uint32_t v = 0; v + 4 <= m; v += 2) indices.insert(indices.end(), {s[v], s[v + 1], s[v + 3], s[v], s[v + 3], s[v + 2]}); break;
-            default: fatal("a draw of primitive %u, which the renderer doesn't take yet", d.primitive);
-            }
-            a = b + 1;
-        }
-    } else switch (d.primitive) {
-    case 1: topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
-    case 2: topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
-    case 4: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
-    case 5: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
-    case 6: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
-    case 7: case 10:  // triangle fan, polygon
-        topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, indexed = true;
-        for (uint32_t v = 2; v < n; ++v) indices.insert(indices.end(), {order[0], order[v - 1], order[v]});
-        break;
-    case 8:  // quads
-        topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, indexed = true;
-        for (uint32_t v = 0; v + 4 <= n; v += 4) indices.insert(indices.end(), {order[v], order[v + 1], order[v + 2], order[v], order[v + 2], order[v + 3]});
-        break;
-    case 9:  // quad strip: quads (v, v + 1, v + 3, v + 2)
-        topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, indexed = true;
-        for (uint32_t v = 0; v + 4 <= n; v += 2) indices.insert(indices.end(), {order[v], order[v + 1], order[v + 3], order[v], order[v + 3], order[v + 2]});
-        break;
-    default: fatal("a draw of primitive %u, which the renderer doesn't take yet", d.primitive);
-    }
-    // What the GPU is given: the triangles made here, or the game's own indices as they are.
-    const std::span<const uint32_t> index_list = indexed && indices.empty() && d.primitive <= 6 ? order : std::span<const uint32_t>(indices);
+    static std::vector<uint32_t> made;  // the lists assemble() makes (kept: only the RSX's thread draws)
+    const auto assembly = assemble(d.primitive, order, d.indexed, Provoking::any, made);
+    if (!assembly) fatal("%s", assembly.error().c_str());
+    const bool indexed = assembly->indexed;
+    // What the GPU is given: the lists made here, or the game's own indices as they are.
+    const std::span<const uint32_t> index_list = assembly->made ? std::span<const uint32_t>(made) : indexed ? order : std::span<const uint32_t>();
+    const auto raster = rasterisation(d.primitive, {d.front_polygon_mode, d.back_polygon_mode, d.cull, d.cull_face, d.offset_point, d.offset_line, d.offset_fill, d.edge_flag});
+    if (!raster) fatal("a draw of %s, which the renderer doesn't take yet", raster.error().c_str());
+    if (raster->mode != PolygonMode::fill && !gpu.fill_non_solid) fatal("a draw of polygons as lines or points, which this GPU can't (fillModeNonSolid)");
     uint32_t pixel_bytes = 0;
     const VkFormat format = surface_format(d.color.format, pixel_bytes);
 
@@ -1562,7 +1532,7 @@ void renderer_draw(const Draw& d) {
         scissor = {{x0, y0}, {static_cast<uint32_t>(std::max(0, x1 - x0)), static_cast<uint32_t>(std::max(0, y1 - y0))}};
     }
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_for(d, vs, fs, format, topology));
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_for(d, vs, fs, format, vulkan_topology(assembly->topology), *raster));
     const VkViewport viewport{0, 0, width, height, 0.0f, 1.0f};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);

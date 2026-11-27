@@ -230,10 +230,14 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         d.depth.address = guest_address(surface_location(state(0x0198)), state(0x0214), "a depth surface");
         d.depth.width = state(0x0200) >> 16, d.depth.height = state(0x0204) >> 16;
     }
-    // Polygon offset for filled primitives (SET_POLY_OFFSET_FILL_ENABLE, SCALE_FACTOR, BIAS): Vulkan's depth bias, the slope
-    // factor and the constant. *With D32S8 a unit of bias follows the depth's exponent rather than 2^-24: a stated difference.*
-    if (state(0x0a60) || state(0x0a64)) fatal("a draw with polygon offset for points or lines, which the renderer doesn't take yet (at offset %08x)", at);
-    if (state(0x0a68)) d.depth_bias = true, d.bias_factor = state_float(0x0a78), d.bias_units = state_float(0x0a7c);
+    // Polygon offset (SET_POLY_OFFSET_POINT_ENABLE, LINE, FILL, SCALE_FACTOR, BIAS): Vulkan's depth bias, the slope factor and the
+    // constant, for polygons drawn in a mode whose enable is on (render_state.hpp). *With D32S8 a unit of bias follows the depth's
+    // exponent rather than 2^-24: a stated difference.*
+    d.offset_point = state(0x0a60) != 0, d.offset_line = state(0x0a64) != 0, d.offset_fill = state(0x0a68) != 0;
+    d.bias_factor = state_float(0x0a78), d.bias_units = state_float(0x0a7c);
+    // Polygons' modes (SET_FRONT_POLYGON_MODE, BACK_POLYGON_MODE) and the edge flag (SET_EDGE_FLAG), which a polygon drawn as lines
+    // needs on.
+    d.front_polygon_mode = state(0x1828), d.back_polygon_mode = state(0x182c), d.edge_flag = state(0x1454) != 0;
     // The stencil test (NV30/40's: Mesa's nv30-40_3d.xml.h): 0x328 on, 0x32c write mask, 0x330 function, 0x334 reference,
     // 0x338 function mask, 0x33c/0x340/0x344 the operations on failing, the depth test failing, passing; the back faces' at
     // 0x348 on (two-sided) to 0x364.
@@ -250,14 +254,12 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         d.stencil_back = state(0x0348) ? side(0x0348) : d.stencil_front;
     }
     // State this renderer doesn't take, refused by name rather than ignored: flat shading, logic operations, two-sided vertex
-    // colours, user clip planes, polygon stipple, and polygons drawn as points or lines.
+    // colours, user clip planes, polygon stipple.
     if (state(0x0368) == 0x1d00) fatal("a draw with flat shading, which the renderer doesn't take yet (at offset %08x)", at);
     if (state(0x0374)) fatal("a draw with a logic operation (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x0378), at);
     if (state(0x142c)) fatal("a draw with two-sided vertex colours, which the renderer doesn't take yet (at offset %08x)", at);
     if (state(0x1478)) fatal("a draw with user clip planes (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x1478), at);
     if (state(0x147c)) fatal("a draw with polygon stipple, which the renderer doesn't take yet (at offset %08x)", at);
-    for (const uint32_t mode : {state(0x1828), state(0x182c)})
-        if (mode && mode != 0x1b02) fatal("a draw with polygons drawn as %s, which the renderer doesn't take yet (at offset %08x)", mode == 0x1b00 ? "points" : "lines", at);
     // The alpha test (SET_ALPHA_FUNC: OpenGL's NEVER 0x200 to ALWAYS 0x207, bit 0 less, bit 1 equal, bit 2 greater; SET_ALPHA_REF):
     // on 8-bit surfaces the reference's low byte against the alpha as stored. *Its reference on a float surface isn't known here.*
     if (state(0x0304)) {
@@ -714,6 +716,8 @@ void serve() {
     // And the clear's rectangle (SET_CLEAR_RECT_HORIZONTAL, VERTICAL: origin and size) covering everything: the game never
     // sets it and clears with it, so the system's start-up must (*a stated choice*: 0 to 4095 each way, clipped to the surface).
     r.state[0x1d98 / 4] = r.state[0x1d9c / 4] = 0x0fff0000u;
+    // And the edge flag (SET_EDGE_FLAG) on, as OpenGL starts it (*a stated choice*: what the system leaves isn't known here).
+    r.state[0x1454 / 4] = 1;
     g_survey = std::getenv("RR7_RSX_SURVEY") != nullptr;
     g_trace = std::getenv("RR7_RSX_TRACE") != nullptr;
     g_survey_ends = std::chrono::steady_clock::now() + std::chrono::seconds(10);

@@ -74,8 +74,12 @@ struct Draw {
     };
     bool stencil_test = false;
     Stencil stencil_front, stencil_back;
-    bool depth_bias = false;  // polygon offset
+    // Polygons (render_state.hpp: rasterisation): their faces' modes (OpenGL's POINT 0x1B00, LINE 0x1B01, FILL 0x1B02), polygon
+    // offset's enable for each mode and its factor and units, the edge flag.
+    uint32_t front_polygon_mode = 0, back_polygon_mode = 0;
+    bool offset_point = false, offset_line = false, offset_fill = false;
     float bias_factor = 0, bias_units = 0;
+    bool edge_flag = true;
     // The depth bounds test: the depth already stored at the pixel against [min, max], as Vulkan's.
     bool depth_bounds = false;
     float bounds_min = 0, bounds_max = 1;

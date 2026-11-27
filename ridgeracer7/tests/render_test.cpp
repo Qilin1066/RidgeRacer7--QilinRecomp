@@ -325,6 +325,30 @@ void test_rasterisation() {
     CHECK(!rasterisation(5, s));
 }
 
+void test_window() {
+    rr7::Draw d;
+    d.color.width = 100, d.color.height = 50;
+    d.viewport_scale = {50, 25, 0.5f, 0}, d.viewport_offset = {50, 25, 0.5f, 0};
+    d.scissor_width = 100, d.scissor_height = 50, d.window_height = 50;
+    // A viewport covering the surface: clip x = x / 50 - 1 + ..., as the vertex programs take it.
+    rr7::WindowMapping w = rr7::window_mapping(d);
+    CHECK(w.push[0] == 1.0f && w.push[1] == 1.0f && w.push[2] == 0.0f && w.push[3] == 0.0f && w.push[4] == 0.5f && w.push[5] == 0.5f);
+    CHECK(w.x0 == 0 && w.y0 == 0 && w.x1 == 100 && w.y1 == 50);
+    // The window offset moves the viewport and the scissor alike, the scissor clipped to the surface.
+    d.window_offset_x = 10, d.window_offset_y = 4;
+    w = rr7::window_mapping(d);
+    CHECK(std::abs(w.push[2] - 0.2f) < 1e-6f && std::abs(w.push[3] - 0.16f) < 1e-6f);
+    CHECK(w.x0 == 10 && w.y0 == 4 && w.x1 == 100 && w.y1 == 50);
+    // Window y up from the bottom: the scissor's rows counted from the window's top, then moved.
+    d.origin_bottom = true, d.scissor_height = 20;
+    w = rr7::window_mapping(d);
+    CHECK(w.y0 == 34 && w.y1 == 50 && w.push[1] == -1.0f);
+    // A scissor wholly off the surface is empty.
+    d.origin_bottom = false, d.window_offset_x = 0, d.scissor_x = 200, d.scissor_width = 10;
+    w = rr7::window_mapping(d);
+    CHECK(w.x0 == 200 && w.x1 == 200);
+}
+
 }  // namespace
 
 int main() {
@@ -339,6 +363,7 @@ int main() {
     test_depth();
     test_assembly();
     test_rasterisation();
+    test_window();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

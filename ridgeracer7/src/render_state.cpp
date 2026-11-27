@@ -115,4 +115,30 @@ std::expected<Rasterisation, std::string> rasterisation(uint32_t primitive, cons
     return Rasterisation{mode, bias};
 }
 
+WindowMapping window_mapping(const Draw& d) {
+    WindowMapping w;
+    const float width = static_cast<float>(d.color.width), height = static_cast<float>(d.color.height);
+    const float ox = static_cast<float>(d.window_offset_x), oy = static_cast<float>(d.window_offset_y);
+    w.push[0] = d.viewport_scale[0] * 2.0f / width;
+    w.push[2] = (d.viewport_offset[0] + ox) * 2.0f / width - 1.0f;
+    if (d.origin_bottom) {
+        // The RSX's window y counts up from the bottom of a window `window_height` high; Vulkan's down from the top.
+        w.push[1] = -d.viewport_scale[1] * 2.0f / height;
+        w.push[3] = (static_cast<float>(d.window_height) - d.viewport_offset[1] + oy) * 2.0f / height - 1.0f;
+    } else {
+        w.push[1] = d.viewport_scale[1] * 2.0f / height;
+        w.push[3] = (d.viewport_offset[1] + oy) * 2.0f / height - 1.0f;
+    }
+    w.push[4] = d.viewport_scale[2], w.push[5] = d.viewport_offset[2];
+    // The scissor, in the same window coordinates, moved by the offset and clipped to the surface.
+    int64_t x0 = d.scissor_x, y0 = d.scissor_y;
+    if (d.origin_bottom) y0 = int64_t{d.window_height} - (int64_t{d.scissor_y} + d.scissor_height);
+    x0 += d.window_offset_x, y0 += d.window_offset_y;
+    const int64_t x1 = std::min<int64_t>(d.color.width, x0 + d.scissor_width), y1 = std::min<int64_t>(d.color.height, y0 + d.scissor_height);
+    x0 = std::max<int64_t>(0, x0), y0 = std::max<int64_t>(0, y0);
+    w.x0 = static_cast<uint32_t>(x0), w.y0 = static_cast<uint32_t>(y0);
+    w.x1 = static_cast<uint32_t>(std::max(x0, x1)), w.y1 = static_cast<uint32_t>(std::max(y0, y1));
+    return w;
+}
+
 }  // namespace rr7

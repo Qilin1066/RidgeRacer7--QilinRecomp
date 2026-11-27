@@ -1,5 +1,5 @@
-// The RSX's drawing state as the renderer gives it to Vulkan: how primitives are assembled, how polygons are rasterised.
-// Pure functions, tested without a GPU (ridgeracer7/tests/render_test.cpp); what Vulkan can't do the same way is refused
+// The RSX's drawing state as the renderer gives it to Vulkan: how primitives are assembled, how polygons are rasterised,
+// the window's place on the surface. Pure functions, tested without a GPU (ridgeracer7/tests/render_test.cpp); what Vulkan can't do the same way is refused
 // by name, never approximated.
 //
 // Runtime code: no std::format.
@@ -58,5 +58,16 @@ struct PolygonState {
     bool edge_flag = true;
 };
 std::expected<Rasterisation, std::string> rasterisation(uint32_t primitive, const PolygonState& s);
+
+// The window's place on the surface: the viewport as the translated vertex programs take it (rsx_spirv.hpp: clip_xy,
+// clip_z, for a Vulkan viewport covering the surface) and the scissor, in the surface's pixels, clipped to it. The RSX's
+// window coordinates (its scale and offset; y down from the top, or up from the bottom of a window `window_height` high)
+// are the surface's less the window offset (SET_WINDOW_OFFSET: *a stated reading, as on NVIDIA's chips, of the window's
+// origin on the surface: it moves the viewport and the scissor alike*).
+struct WindowMapping {
+    std::array<float, 8> push{};  // clip_xy, then clip_z
+    uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // the scissor: [x0, x1) by [y0, y1)
+};
+WindowMapping window_mapping(const Draw& d);
 
 }  // namespace rr7

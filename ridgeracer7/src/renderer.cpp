@@ -1507,36 +1507,15 @@ void renderer_draw(const Draw& d) {
     // The surfaces from guest memory, as the batch begins with them, and a rendering instance on them.
     open_rendering(r, &target, depth, false, false);
 
-    // The viewport, as the translated programs take it (rsx_spirv.hpp): the RSX's scale and offset give window coordinates
-    // in its convention, which this turns into Vulkan's clip space for a viewport covering the surface.
-    const float width = static_cast<float>(d.color.width), height = static_cast<float>(d.color.height);
-    float push[8];
-    push[0] = d.viewport_scale[0] * 2.0f / width;
-    push[2] = d.viewport_offset[0] * 2.0f / width - 1.0f;
-    if (d.origin_bottom) {
-        // The RSX's window y counts up from the bottom of a window `window_height` high; Vulkan's down from the top.
-        push[1] = -d.viewport_scale[1] * 2.0f / height;
-        push[3] = (static_cast<float>(d.window_height) - d.viewport_offset[1]) * 2.0f / height - 1.0f;
-    } else {
-        push[1] = d.viewport_scale[1] * 2.0f / height;
-        push[3] = d.viewport_offset[1] * 2.0f / height - 1.0f;
-    }
-    push[4] = d.viewport_scale[2], push[5] = d.viewport_offset[2], push[6] = push[7] = 0.0f;
-    // The scissor, in the same window coordinates.
-    VkRect2D scissor{{static_cast<int32_t>(d.scissor_x), static_cast<int32_t>(d.scissor_y)}, {d.scissor_width, d.scissor_height}};
-    if (d.origin_bottom) scissor.offset.y = static_cast<int32_t>(d.window_height) - static_cast<int32_t>(d.scissor_y + d.scissor_height);
-    {
-        const int32_t x0 = std::max(0, scissor.offset.x), y0 = std::max(0, scissor.offset.y);
-        const int32_t x1 = std::min(static_cast<int32_t>(d.color.width), scissor.offset.x + static_cast<int32_t>(scissor.extent.width));
-        const int32_t y1 = std::min(static_cast<int32_t>(d.color.height), scissor.offset.y + static_cast<int32_t>(scissor.extent.height));
-        scissor = {{x0, y0}, {static_cast<uint32_t>(std::max(0, x1 - x0)), static_cast<uint32_t>(std::max(0, y1 - y0))}};
-    }
+    // The viewport (as the translated programs take it) and the scissor, in the surface's pixels (render_state.hpp).
+    const WindowMapping window = window_mapping(d);
+    const VkRect2D scissor{{static_cast<int32_t>(window.x0), static_cast<int32_t>(window.y0)}, {window.x1 - window.x0, window.y1 - window.y0}};
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_for(d, vs, fs, format, vulkan_topology(assembly->topology), *raster));
-    const VkViewport viewport{0, 0, width, height, 0.0f, 1.0f};
+    const VkViewport viewport{0, 0, static_cast<float>(d.color.width), static_cast<float>(d.color.height), 0.0f, 1.0f};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdPushConstants(cmd, r.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof push, push);
+    vkCmdPushConstants(cmd, r.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof window.push, window.push.data());
     vkCmdPushConstants(cmd, r.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 32, sizeof d.alpha_test, d.alpha_test.data());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.layout, 0, 1, &set0, 0, nullptr);
     if (set1) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.layout, 1, 1, &set1, 0, nullptr);
@@ -1552,14 +1531,12 @@ void renderer_draw(const Draw& d) {
         vkCmdDraw(cmd, d.count, 1, 0, 0);
     }
     target.written = true;
-    target.add_drawn(static_cast<uint32_t>(scissor.offset.x), static_cast<uint32_t>(scissor.offset.y), static_cast<uint32_t>(scissor.offset.x) + scissor.extent.width,
-                     static_cast<uint32_t>(scissor.offset.y) + scissor.extent.height);
+    target.add_drawn(window.x0, window.y0, window.x1, window.y1);
     // (A depth-stencil surface is written by depth writes, and by a stencil test that may change it.)
     const auto changes = [](const Draw::Stencil& st) { return st.write_mask && (st.fail != 0x1e00 || st.zfail != 0x1e00 || st.zpass != 0x1e00); };
     if (depth && (d.depth_write || (d.stencil_test && (changes(d.stencil_front) || changes(d.stencil_back))))) {
         depth->written = true;
-        depth->add_drawn(static_cast<uint32_t>(scissor.offset.x), static_cast<uint32_t>(scissor.offset.y), static_cast<uint32_t>(scissor.offset.x) + scissor.extent.width,
-                         static_cast<uint32_t>(scissor.offset.y) + scissor.extent.height);
+        depth->add_drawn(window.x0, window.y0, window.x1, window.y1);
     }
     ++r.draws;
     ++g_stats.draws;

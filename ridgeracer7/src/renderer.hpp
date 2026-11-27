@@ -54,6 +54,7 @@ struct Draw {
     std::array<float, 4> viewport_scale{}, viewport_offset{};
     uint32_t clip_x = 0, clip_y = 0, clip_width = 0, clip_height = 0, window_height = 0;
     bool origin_bottom = false;
+    uint32_t window_offset_x = 0, window_offset_y = 0;  // the window's origin on the surface (SET_WINDOW_OFFSET)
     uint32_t scissor_x = 0, scissor_y = 0, scissor_width = 0, scissor_height = 0;
     bool blend = false;
     uint32_t blend_src = 0, blend_dst = 0, blend_equation = 0;

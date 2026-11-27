@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 
+#include "kernel_sched.hpp"  // (the scheduler: ScopedBlocking, for a native call that blocks)
 #include "machine.hpp"
 
 namespace rr7 {

@@ -2,13 +2,17 @@
 // (105-108), semaphores (90-94, 114); and sleeping and the clock (141, 142,
 // 145, 147).
 //
-// Each object is a host object found by its id. Waiters are woken in the
-// host's order: the system's own orders (first come, or by priority) are the
-// scheduler's business, which is to come; until then nothing here promises
-// one.
+// Each object is a host object found by its id, with its waiters in the
+// order the system wakes them: first come first, or by priority (the
+// longest waiting among equals), as the object's attribute says
+// (kernel_sched.hpp). What is let go is handed straight to the waiter woken:
+// a mutex's ownership, a semaphore's count. So a thread that lets go and
+// takes again at once doesn't take back from one already waiting (the game's
+// threads greet each other by posting a semaphore and then waiting on it, and
+// a post the poster could take back itself left the game reading a null
+// pointer). A thread gives its core token up only when it really waits.
 #include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <thread>
 
 #include "kernel.hpp"
@@ -20,26 +24,37 @@ namespace {
 
 constexpr uint32_t kRecursive = 0x10, kNotRecursive = 0x20;
 
-// Waits on `cv` until `ready`, or for `timeout` microseconds if it isn't 0. False if the time ran out.
-template <typename Ready>
-bool wait(std::condition_variable& cv, std::unique_lock<std::mutex>& lock, uint64_t timeout, Ready ready) {
-    if (timeout == 0) {
-        cv.wait(lock, ready);
-        return true;
-    }
-    return cv.wait_for(lock, std::chrono::microseconds(timeout), ready);
+// The waking order an object's attribute asks for (SYS_SYNC_FIFO, _PRIORITY or _PRIORITY_INHERIT); anything else stops
+// the game, naming it.
+WakeOrder order_for(uint32_t protocol, const char* what) {
+    WakeOrder order{};
+    if (protocol == kSyncRetry || !wake_order(protocol, order)) qilin::rt::fatal("%s with protocol %u, which this runtime doesn't know", what, protocol);
+    return order;
 }
 
 // ---------------------------------------------------------------- mutexes
 
 struct Mutex {
     std::mutex mutex;
-    std::condition_variable freed;
+    WaitQueue waiters;  // each waiter's data[0]: how many times it will hold it
     uint32_t owner = 0, count = 0;
     bool recursive = false;
     uint32_t conditions = 0;  // condition variables made on it
 };
 ObjectTable<Mutex> g_mutexes(0x85000001u);
+
+// Lets go of the mutex (its lock held): the next waiter owns it now, if one waits. (So a mutex with no owner has no
+// waiters.)
+void hand_on(Mutex& m) {
+    if (Waiter* const w = m.waiters.pop()) {
+        m.owner = w->thread;
+        m.count = static_cast<uint32_t>(w->data[0]);
+        w->wake();
+    } else {
+        m.owner = 0;
+        m.count = 0;
+    }
+}
 
 // sys_mutex_create(sys_mutex_t* id, const sys_mutex_attribute_t* attribute)
 // The attribute begins with the waking order and whether it is recursive.
@@ -55,6 +70,7 @@ void sys_mutex_create(Cpu& c) {
         return;
     }
     auto object = std::make_shared<Mutex>();
+    object->waiters = WaitQueue(order_for(load32(attribute), "sys_mutex_create"));
     object->recursive = recursive == kRecursive;
     store32(out, g_mutexes.add(std::move(object)));
     c.r[3] = kOk;
@@ -87,6 +103,7 @@ void mutex_lock(Cpu& c, bool waiting) {
         return;
     }
     const uint32_t me = current_thread();
+    Blocking blocking;  // (before the lock: the token is taken back once the lock is let go)
     std::unique_lock lock(object->mutex);
     if (object->owner == me) {
         if (!object->recursive) {
@@ -97,19 +114,27 @@ void mutex_lock(Cpu& c, bool waiting) {
         c.r[3] = kOk;
         return;
     }
-    if (object->owner) {
-        if (!waiting) {
-            c.r[3] = kEbusy;
-            return;
-        }
-        if (!wait(object->freed, lock, c.r[4], [&] { return object->owner == 0; })) {
-            c.r[3] = kEtimedout;
-            return;
-        }
+    if (object->owner == 0) {
+        object->owner = me;
+        object->count = 1;
+        c.r[3] = kOk;
+        return;
     }
-    object->owner = me;
-    object->count = 1;
-    c.r[3] = kOk;
+    if (!waiting) {
+        c.r[3] = kEbusy;
+        return;
+    }
+    Waiter self;
+    self.thread = me;
+    self.data[0] = 1;
+    object->waiters.push(self);
+    blocking.release();
+    if (!self.wait(lock, c.r[4])) {
+        object->waiters.remove(self);
+        c.r[3] = kEtimedout;
+        return;
+    }
+    c.r[3] = kOk;  // (handed over: hand_on made it the owner)
 }
 void sys_mutex_lock(Cpu& c) { mutex_lock(c, true); }
 void sys_mutex_trylock(Cpu& c) { mutex_lock(c, false); }
@@ -121,28 +146,23 @@ void sys_mutex_unlock(Cpu& c) {
         c.r[3] = kEsrch;
         return;
     }
-    {
-        const std::lock_guard lock(object->mutex);
-        if (object->owner != current_thread()) {
-            c.r[3] = kEperm;
-            return;
-        }
-        if (--object->count) {
-            c.r[3] = kOk;
-            return;
-        }
-        object->owner = 0;
+    const std::lock_guard lock(object->mutex);
+    if (object->owner != current_thread()) {
+        c.r[3] = kEperm;
+        return;
     }
-    object->freed.notify_one();
+    if (--object->count == 0) hand_on(*object);
     c.r[3] = kOk;
 }
 
 // ---------------------------------------------------------------- condition variables
 
+// Waiters are woken in the order of the mutex the condition is made on (*a stated reading*: its attribute has no order
+// of its own). A signalled waiter joins the mutex's waiters (or owns it at once, if it is free), and returns once it
+// owns it.
 struct Condition {
     std::shared_ptr<Mutex> mutex;  // the one it was made on, whose host lock guards these too
-    std::condition_variable signalled;
-    uint32_t waiters = 0, signals = 0;  // signals not yet taken by a waiter
+    WaitQueue waiters;             // each waiter's data[0]: how many times it held the mutex
 };
 ObjectTable<Condition> g_conditions(0x86000001u);
 
@@ -158,6 +178,7 @@ void sys_cond_create(Cpu& c) {
     object->mutex = mutex;
     {
         const std::lock_guard lock(mutex->mutex);
+        object->waiters = WaitQueue(mutex->waiters.order());
         ++mutex->conditions;
     }
     store32(out, g_conditions.add(std::move(object)));
@@ -174,7 +195,7 @@ void sys_cond_destroy(Cpu& c) {
     }
     {
         const std::lock_guard lock(object->mutex->mutex);
-        if (object->waiters) {
+        if (!object->waiters.empty()) {
             c.r[3] = kEbusy;
             return;
         }
@@ -193,22 +214,31 @@ void sys_cond_wait(Cpu& c) {
     }
     Mutex& mutex = *object->mutex;
     const uint32_t me = current_thread();
+    Blocking blocking;
     std::unique_lock lock(mutex.mutex);
     if (mutex.owner != me) {
         c.r[3] = kEperm;
         return;
     }
-    const uint32_t held = mutex.count;
-    mutex.owner = 0;
-    mutex.count = 0;
-    mutex.freed.notify_one();
-    ++object->waiters;
-    const bool signalled = wait(object->signalled, lock, c.r[4], [&] { return object->signals > 0; });
-    --object->waiters;
-    if (signalled) --object->signals;
-    mutex.freed.wait(lock, [&] { return mutex.owner == 0; });
-    mutex.owner = me;
-    mutex.count = held;
+    Waiter self;
+    self.thread = me;
+    self.data[0] = mutex.count;
+    hand_on(mutex);
+    object->waiters.push(self);
+    blocking.release();
+    bool signalled = true;
+    if (!self.wait(lock, c.r[4]) && object->waiters.remove(self)) {
+        // The time ran out before a signal: the mutex is to be had again all the same.
+        signalled = false;
+        if (mutex.owner == 0) {
+            mutex.owner = me;
+            mutex.count = static_cast<uint32_t>(self.data[0]);
+            self.woken = true;
+        } else {
+            mutex.waiters.push(self);
+        }
+    }
+    self.wait(lock, 0);  // (until the mutex is handed over, if it hasn't been)
     c.r[3] = signalled ? kOk : kEtimedout;
 }
 
@@ -219,35 +249,35 @@ void sys_cond_signal(Cpu& c) {
         c.r[3] = kEsrch;
         return;
     }
-    {
-        const std::lock_guard lock(object->mutex->mutex);
-        if (object->signals < object->waiters) ++object->signals;
+    Mutex& mutex = *object->mutex;
+    const std::lock_guard lock(mutex.mutex);
+    if (Waiter* const w = object->waiters.pop()) {
+        if (mutex.owner == 0) {
+            mutex.owner = w->thread;
+            mutex.count = static_cast<uint32_t>(w->data[0]);
+            w->wake();
+        } else {
+            mutex.waiters.push(*w);
+        }
     }
-    object->signalled.notify_all();  // (all: the one that takes the signal is whichever sees it first)
     c.r[3] = kOk;
 }
 
 // ---------------------------------------------------------------- semaphores
 
-// A post goes to the thread that has waited longest, if any waits: a thread that posts and then
-// waits itself does not take its own post back from one already waiting. (The game's threads greet
-// each other this way.) The console's other order, by priority, is the scheduler's, to come.
 struct Semaphore {
-    struct Waiter {
-        bool granted = false;
-    };
     std::mutex mutex;
-    std::condition_variable posted;
-    std::deque<Waiter*> waiters;  // longest first
-    int32_t value = 0, maximum = 0;
+    WaitQueue waiters;
+    int32_t value = 0, maximum = 0;  // (a count left over means nobody waits: a post goes to a waiter first)
 };
 ObjectTable<Semaphore> g_semaphores(0x96000001u);
 
-// sys_semaphore_create(sys_semaphore_t* id, attribute, initial value, maximum value)
+// sys_semaphore_create(sys_semaphore_t* id, const sys_semaphore_attribute_t* attribute (the waking order first),
+//                      initial value, maximum value)
 void sys_semaphore_create(Cpu& c) {
-    const uint32_t out = static_cast<uint32_t>(c.r[3]);
+    const uint32_t out = static_cast<uint32_t>(c.r[3]), attribute = static_cast<uint32_t>(c.r[4]);
     const int32_t initial = static_cast<int32_t>(c.r[5]), maximum = static_cast<int32_t>(c.r[6]);
-    if (!out || !c.r[4]) {
+    if (!out || !attribute) {
         c.r[3] = kEfault;
         return;
     }
@@ -256,6 +286,7 @@ void sys_semaphore_create(Cpu& c) {
         return;
     }
     auto object = std::make_shared<Semaphore>();
+    object->waiters = WaitQueue(order_for(load32(attribute), "sys_semaphore_create"));
     object->value = initial;
     object->maximum = maximum;
     store32(out, g_semaphores.add(std::move(object)));
@@ -288,8 +319,9 @@ void semaphore_wait(Cpu& c, bool waiting) {
         c.r[3] = kEsrch;
         return;
     }
+    Blocking blocking;
     std::unique_lock lock(object->mutex);
-    if (object->value > 0 && object->waiters.empty()) {
+    if (object->value > 0) {
         --object->value;
         c.r[3] = kOk;
         return;
@@ -298,10 +330,12 @@ void semaphore_wait(Cpu& c, bool waiting) {
         c.r[3] = kEbusy;
         return;
     }
-    Semaphore::Waiter self;
-    object->waiters.push_back(&self);
-    if (!wait(object->posted, lock, c.r[4], [&] { return self.granted; })) {
-        std::erase(object->waiters, &self);  // (not granted: so still queued)
+    Waiter self;
+    self.thread = current_thread();
+    object->waiters.push(self);
+    blocking.release();
+    if (!self.wait(lock, c.r[4])) {
+        object->waiters.remove(self);  // (not woken: so still queued)
         c.r[3] = kEtimedout;
         return;
     }
@@ -322,19 +356,17 @@ void sys_semaphore_post(Cpu& c) {
         c.r[3] = kEinval;
         return;
     }
-    {
-        const std::lock_guard lock(object->mutex);
-        if (count > object->maximum - object->value + static_cast<int32_t>(object->waiters.size())) {
-            c.r[3] = kEbusy;
-            return;
-        }
-        for (; count > 0 && !object->waiters.empty(); --count) {
-            object->waiters.front()->granted = true;
-            object->waiters.pop_front();
-        }
-        object->value += count;
+    const std::lock_guard lock(object->mutex);
+    if (count > object->maximum - object->value + static_cast<int32_t>(object->waiters.size())) {
+        c.r[3] = kEbusy;
+        return;
     }
-    object->posted.notify_all();
+    for (; count > 0; --count) {
+        Waiter* const w = object->waiters.pop();
+        if (!w) break;
+        w->wake();
+    }
+    object->value += count;
     c.r[3] = kOk;
 }
 
@@ -352,12 +384,14 @@ void sys_semaphore_get_value(Cpu& c) {
 
 // ---------------------------------------------------------------- sleeping, and the clock
 
-// sys_timer_usleep(microseconds), sys_timer_sleep(seconds)
+// sys_timer_usleep(microseconds), sys_timer_sleep(seconds): the core token is given up while sleeping.
 void sys_timer_usleep(Cpu& c) {
+    const ScopedBlocking blocking;
     std::this_thread::sleep_for(std::chrono::microseconds(c.r[3]));
     c.r[3] = kOk;
 }
 void sys_timer_sleep(Cpu& c) {
+    const ScopedBlocking blocking;
     std::this_thread::sleep_for(std::chrono::seconds(static_cast<uint32_t>(c.r[3])));
     c.r[3] = kOk;
 }

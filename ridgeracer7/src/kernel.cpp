@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "kernel_sched.hpp"
 #include "machine.hpp"
 #include "qilin/rt/report.hpp"
 #include "syscall_names.hpp"
@@ -35,6 +36,7 @@ struct Where {
 thread_local uint32_t t_thread = 0;
 thread_local Where* t_where = nullptr;
 thread_local const Cpu* t_cpu = nullptr;
+thread_local int t_native_depth = 0;  // native calls the thread is inside (more than one: a handler called the game back)
 std::mutex g_where_mutex;
 std::deque<Where> g_where;  // one for each guest thread there has been
 
@@ -64,6 +66,7 @@ EndOnExit::~EndOnExit() {
 }
 
 void thread_enters(const char* what, uint32_t number, uint32_t from) {
+    ++t_native_depth;
     if (!t_where) return;
     t_where->number.store(number, std::memory_order_relaxed);
     t_where->from.store(from, std::memory_order_relaxed);
@@ -89,6 +92,11 @@ const Cpu* current_cpu() { return t_cpu; }
 
 void thread_leaves() {
     if (t_where) t_where->what.store(nullptr, std::memory_order_relaxed);
+    // Back to the game's code: on a token (a wait gives it up and takes it back itself; this is only in case one didn't),
+    // and giving way to a thread of better priority waiting for one, as the console would have when it became ready. Not
+    // inside another native call (the game's function a handler calls back): the handler may hold a lock of its own.
+    take_core();
+    if (--t_native_depth == 0) switch_point();
 }
 
 void start_watch() {

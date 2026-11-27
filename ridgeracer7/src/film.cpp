@@ -423,7 +423,10 @@ void cellDmuxClose(Cpu& c) {
         d->closing = true;
         d->changed.notify_all();
     }
-    d->thread.join();
+    {
+        const ScopedBlocking blocking;  // (its thread may want a core token for a last callback)
+        d->thread.join();
+    }
     const std::lock_guard lock(g_mutex);
     for (auto& [handle, e] : d->es) {
         e->disabled = true;
@@ -635,7 +638,10 @@ void cellVdecClose(Cpu& c) {
         d->closing = true;
         d->changed.notify_all();
     }
-    d->thread.join();
+    {
+        const ScopedBlocking blocking;  // (its thread may want a core token for a last callback)
+        d->thread.join();
+    }
     avcodec_free_context(&d->context);
     const std::lock_guard lock(g_mutex);
     g_decoders.erase(d->handle);
@@ -852,7 +858,10 @@ void cellAdecClose(Cpu& c) {
         d->closing = true;
         d->changed.notify_all();
     }
-    d->thread.join();
+    {
+        const ScopedBlocking blocking;  // (its thread may want a core token for a last callback)
+        d->thread.join();
+    }
     if (d->context) avcodec_free_context(&d->context);
     const std::lock_guard lock(g_mutex);
     g_sound.erase(d->handle);

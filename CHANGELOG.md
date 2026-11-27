@@ -52,11 +52,13 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The pause under the menu (`pause.*`): the RSX's thread at a flip, the vertical blank's before its handler and the sound mixer's are held, each where it holds no lock and runs none of the game's code; the vertical blank goes on from the next, not catching up.
 - `ridgeracer7_settings_test` (in `ctest`): the settings file read and written, bad lines refused by number, the controller built from the bindings (the triggers' pressure, the sticks' keys), the pause holding a thread and letting it go.
 - `host/`: `Display::pause_frame_times` and `refresh_hz`, from WindWakerHD's.
+- The scheduler (`kernel_sched.*`, `docs/runtime.md`): guest PPU threads run guest code only while they hold one of two core tokens, handed out by priority, the longest ready first among equals; a thread gives its token up whenever it waits (the system's objects, sleeps, yields, joins, file reads and writes, joins of SPU and SPURS work, memory pools, the films' decoder threads, the RSX's command-buffer wait) and a thread of better priority takes one at the holder's next call into the system. A thread kept waiting while the holders run on without calling the system runs on a lent token (after 2 ms if it is as good as they are, 50 ms if not), logged. Taking and giving back a token with nobody waiting is one compare-and-swap. `RR7_FREE_THREADS=1` turns the tokens off. Its game-free tests are `ridgeracer7_sched_test` in `ctest` (21 cases).
 
 ### Changed
 - The controller's layout is the settings' (`[controls]`), its defaults the keyboard layout `main.cpp` had; L2 and R2 bound to a pad's triggers keep their pressure.
 - `host/`: `present_again` no longer stops the frame times (as WindWakerHD's): showing the last picture again between the game's no longer drops the next frame time.
 - README rewritten to the layout shared by the QilinRecomp projects: what works and how to build and play it, without the development history.
+- Mutexes, condition variables, lightweight mutexes, semaphores and event queues wake their waiters in the order their attribute asks for (`SYS_SYNC_FIFO`, or `SYS_SYNC_PRIORITY` and `_PRIORITY_INHERIT` by priority, the longest waiting first among equals), and hand what is let go (ownership, a count, an event) straight to the one woken. A protocol the runtime doesn't know stops the game by name.
 
 ### Checked
 - On the owner's PC: the game starts its sound core (`bnusCoreSpu.elf`) as an SPU thread, which runs; it reads and unpacks its first packs of `RR7.DAT`, and runs on to its first drawing: it stops at the RSX method that loads a vertex program. 110 of its 248 imports and 54 of its 78 system calls are provided.

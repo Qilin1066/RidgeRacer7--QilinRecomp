@@ -3,14 +3,11 @@
 // priorities 47 and 48).
 //
 // A guest thread is a host thread with a Cpu of its own, a stack of its
-// own in guest memory, and its own copy of the thread-local image.
-//
-// **Not yet as designed.** The roadmap's scheduler lets only two guest
-// threads run guest code at once, by priority, as the console's two
-// hardware threads do. Until it exists every guest thread simply runs, and a
-// priority is kept and reported but decides nothing. A game that leans on
-// the console's order of running could go wrong here in ways it wouldn't
-// there: when something looks like a race, this is the first suspect.
+// own in guest memory, and its own copy of the thread-local image. It runs
+// guest code only while it holds one of the two core tokens, handed out by
+// priority (kernel_sched.hpp): it takes one as it starts, gives it up while
+// it waits (a join, a yield to a thread as good as it) and gives it back as
+// it ends.
 #include <algorithm>
 #include <condition_variable>
 #include <cstring>
@@ -18,6 +15,7 @@
 #include <thread>
 
 #include "kernel.hpp"
+#include "kernel_sched.hpp"
 #include "qilin/rt/report.hpp"
 
 namespace rr7 {
@@ -52,10 +50,13 @@ struct ThreadExit {
 struct Start {
     uint32_t id, code, toc, stack_top, tls;
     uint64_t argument;
+    SchedThread* sched;
 };
 
 void run_thread(Start start) {
     set_current_thread(start.id);
+    bind_sched_thread(start.sched);
+    take_core();
     Cpu cpu;
     cpu.mem = guest_memory();
     cpu.hooks = &guest_hooks();
@@ -73,6 +74,7 @@ void run_thread(Start start) {
         value = exit.value;
     }
     set_current_cpu(nullptr);  // (its registers go with this function)
+    end_sched_thread();        // (its token goes back before a joiner can see it finished)
     {
         const std::lock_guard lock(g_mutex);
         Thread& self = g_threads[start.id];
@@ -126,6 +128,7 @@ void sys_ppu_thread_create(Cpu& c) {
     thread.priority = priority;
     thread.joinable = (flags & kJoinable) != 0;
     store64(out, start.id);
+    start.sched = new_sched_thread(start.id, priority);
     thread.host = std::thread(run_thread, start);
     c.r[3] = kOk;
 }
@@ -146,6 +149,7 @@ void sys_ppu_thread_join(Cpu& c) {
     std::thread host;
     uint64_t value = 0;
     {
+        Blocking blocking;  // (declared first: the token is taken back after the lock is let go)
         std::unique_lock lock(g_mutex);
         const auto it = g_threads.find(id);
         if (it == g_threads.end()) {
@@ -157,6 +161,7 @@ void sys_ppu_thread_join(Cpu& c) {
             return;
         }
         it->second.joined = true;
+        if (!it->second.finished) blocking.release();
         g_finished.wait(lock, [&] { return g_threads[id].finished; });
         value = g_threads[id].exit_value;
         host = std::move(g_threads[id].host);
@@ -197,7 +202,8 @@ void sys_ppu_thread_get_priority(Cpu& c) {
     c.r[3] = kOk;
 }
 
-// sys_ppu_thread_set_priority(thread, priority): kept and reported (see the top of the file).
+// sys_ppu_thread_set_priority(thread, priority): the scheduler's order changes at once; a thread of better priority
+// waiting for a token gets it when this call returns (kernel.cpp's switch point).
 void sys_ppu_thread_set_priority(Cpu& c) {
     const int32_t priority = static_cast<int32_t>(c.r[4]);
     if (priority < 0 || priority > kLowestPriority) {
@@ -211,12 +217,13 @@ void sys_ppu_thread_set_priority(Cpu& c) {
         return;
     }
     it->second.priority = priority;
+    set_sched_priority(it->first, priority);
     c.r[3] = kOk;
 }
 
 // sys_ppu_thread_yield()
 void sys_ppu_thread_yield(Cpu& c) {
-    std::this_thread::yield();
+    yield_core();
     c.r[3] = kOk;
 }
 
@@ -247,6 +254,7 @@ void become_guest_thread(Cpu& c, uint32_t stack_size, int32_t priority) {
         g_threads[id].priority = priority;
     }
     set_current_thread(id);
+    bind_sched_thread(new_sched_thread(id, priority));  // (it holds a token only while it runs the game's code: call_descriptor)
     c.mem = guest_memory();
     c.hooks = &guest_hooks();
     c.r[1] = stack_top - 0x80;
@@ -255,14 +263,27 @@ void become_guest_thread(Cpu& c, uint32_t stack_size, int32_t priority) {
 }
 
 void call_descriptor(Cpu& c, uint32_t descriptor) {
+    // The game's code runs on a token; a host thread of the runtime's (a handler's) takes one for the call and gives it back after.
+    struct Hold {
+        bool taken = !holds_core();
+        Hold() { take_core(); }
+        ~Hold() {
+            if (taken) give_up_core();
+        }
+    } hold;
     c.r[2] = load32(descriptor + 4);
     c.lr = kReturnToHost;
     call_guest(c, load32(descriptor));
 }
 
 void add_thread(uint32_t id, int32_t priority) {
-    const std::lock_guard lock(g_mutex);
-    g_threads[id].priority = priority;
+    {
+        const std::lock_guard lock(g_mutex);
+        g_threads[id].priority = priority;
+    }
+    // The calling host thread is that thread (the first: machine.cpp), and runs the game's code from here on.
+    bind_sched_thread(new_sched_thread(id, priority));
+    take_core();
 }
 
 std::span<const NativeSystemCall> thread_system_calls() { return kCalls; }

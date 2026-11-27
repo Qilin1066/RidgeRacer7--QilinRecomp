@@ -97,10 +97,12 @@ void command_buffer_callback(Cpu& c) {
     }
     store32(current, 0x20000000u | begin);  // a jump
     store32(control, begin);                // put
-    for (;;) {
+    Blocking blocking;  // (the core token, if the RSX keeps it waiting: the RSX may be waiting on another guest thread)
+    for (int spins = 0;; ++spins) {
         const uint32_t get = load32(control + 4);
         if (get < next || get > end) break;
         if (get == begin) break;  // it has taken the jump and waits there: the piece is free
+        if (spins == 64) blocking.release();
         std::this_thread::yield();
     }
     store32(context, io + begin);

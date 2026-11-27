@@ -21,6 +21,7 @@
 // size 10: (size + 1) * 8 bytes), checked on every frame of the three films with sound. The game reorders six channels from
 // the system's order as (0, 2, 1, 5, 3, 4): so the system gives L, C, R, Ls, Rs, LFE, and FFmpeg's planes, in the stream's
 // block order L, R, C, Ls, Rs, LFE (*the blocks' meaning a stated reading*), are put in that order.
+#include <algorithm>
 #include <bit>
 #include <condition_variable>
 #include <cstring>
@@ -49,6 +50,22 @@ uint32_t be32(const uint8_t* p) { return (uint32_t{p[0]} << 24) | (uint32_t{p[1]
 uint16_t be16(const uint8_t* p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
 void store16(uint32_t at, uint16_t v) { guest_memory()[at] = static_cast<uint8_t>(v >> 8), guest_memory()[at + 1] = static_cast<uint8_t>(v); }
 void put64(uint32_t at, uint64_t v) { store32(at, static_cast<uint32_t>(v >> 32)), store32(at + 4, static_cast<uint32_t>(v)); }
+
+// An access unit for one of FFmpeg's decoders, which may read up to AV_INPUT_BUFFER_PADDING_SIZE bytes past a packet's
+// end: its bytes, then that many zeroes.
+class Unit {
+public:
+    Unit(const uint8_t* bytes, size_t size) {
+        bytes_.reserve(size + AV_INPUT_BUFFER_PADDING_SIZE);
+        bytes_.insert(bytes_.end(), bytes, bytes + size);
+        bytes_.resize(size + AV_INPUT_BUFFER_PADDING_SIZE);  // (zeroes)
+    }
+    uint8_t* data() { return bytes_.data(); }
+    size_t size() const { return bytes_.size() - AV_INPUT_BUFFER_PADDING_SIZE; }
+
+private:
+    std::vector<uint8_t> bytes_;
+};
 
 // Calls the game's function(arguments...) through its descriptor, on a guest thread of the runtime's.
 template <typename... A>
@@ -241,6 +258,7 @@ struct Es {
     AVCodecParserContext* parser = nullptr;
     AVCodecContext* parser_context = nullptr;
     uint32_t info_slots = 0, next_slot = 0;
+    uint32_t resets = 0;    // cellDmuxResetEs's, counted: a reset while the demultiplexer's thread waits drops what it holds
     bool disabled = false;  // the game is done with it; the demultiplexer's thread may still hold it while it calls the game
     Es() = default;
     Es(const Es&) = delete;
@@ -311,15 +329,17 @@ void cut(Cpu& cpu, Demuxer& d, Es& e, const uint8_t* data, size_t size, bool end
 // The sound stream's new bytes, cut into frames with their headers.
 void cut_sound(Cpu& cpu, Demuxer& d, Es& e, const uint8_t* data, size_t size, std::unique_lock<std::mutex>& lock) {
     e.pending.insert(e.pending.end(), data, data + size);
+    const uint32_t resets = e.resets;
     size_t at = 0;
     while (e.pending.size() - at >= 8) {
         const uint8_t* f = e.pending.data() + at;
         if (f[0] != 0x0f || f[1] != 0xd0) fatal("a film's sound stream has no frame header where one should be");
         const uint32_t bytes = 8 + ((((f[2] & 3u) << 8) | f[3]) + 1) * 8;
         if (e.pending.size() - at < bytes) break;
-        const std::vector<uint8_t> unit(f, f + bytes);
+        const std::vector<uint8_t> unit(f, f + bytes);  // (found lets go of the lock: the game may reset the stream meanwhile)
         found(cpu, d, e, unit.data(), bytes, lock);
-        if (d.closing || e.disabled) return;
+        // (Reset meanwhile: what was pending is gone, and `at` is past its end.)
+        if (d.closing || e.disabled || e.resets != resets) return;
         at += bytes;
     }
     e.pending.erase(e.pending.begin(), e.pending.begin() + static_cast<std::ptrdiff_t>(at));
@@ -327,6 +347,7 @@ void cut_sound(Cpu& cpu, Demuxer& d, Es& e, const uint8_t* data, size_t size, st
 
 // A chunk of the program stream: its packs, and the packets of the streams enabled.
 void demux_chunk(Cpu& cpu, Demuxer& d, const uint8_t* p, uint32_t size, std::unique_lock<std::mutex>& lock) {
+    std::vector<std::shared_ptr<Es>> streams;  // (kept from packet to packet: its room is used again)
     uint32_t i = 0;
     while (i + 4 <= size) {
         if (be32(p + i) >> 8 != 1) fatal("a film's program stream has no start code at %u of a chunk", i);
@@ -336,7 +357,7 @@ void demux_chunk(Cpu& cpu, Demuxer& d, const uint8_t* p, uint32_t size, std::uni
             continue;
         }
         // (The streams as they are now, held: the game may disable one while its callback runs.)
-        std::vector<std::shared_ptr<Es>> streams;
+        streams.clear();
         for (const auto& [handle, e] : d.es) streams.push_back(e);
         if (code == 0xb9) {  // the program's end: what the parsers hold is the last access unit
             for (const auto& e : streams)
@@ -479,6 +500,7 @@ void cellDmuxResetEs(Cpu& c) {
     }
     const auto e = es_of(static_cast<uint32_t>(c.r[3]));
     e->ready.clear(), e->taken.clear(), e->pending.clear();
+    ++e->resets;
     if (e->parser) {
         av_parser_close(e->parser);
         e->parser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
@@ -534,7 +556,7 @@ struct Decoder {
     uint32_t handle = 0, callback = 0, argument = 0;
     uint32_t item = 0;  // the CellVdecPicItem and its CellVdecMpeg2Info, in the runtime's memory
     AVCodecContext* context = nullptr;
-    std::deque<std::vector<uint8_t>> units;  // access units to decode
+    std::deque<Unit> units;  // access units to decode
     std::deque<Picture> pictures;
     bool closing = false;
     std::condition_variable changed;
@@ -554,7 +576,7 @@ void decoder_thread(std::shared_ptr<Decoder> d) {
     for (;;) {
         d->changed.wait(lock, [&] { return d->closing || (!d->units.empty() && d->pictures.size() < kMostPictures); });
         if (d->closing) break;
-        std::vector<uint8_t> unit = std::move(d->units.front());
+        Unit unit = std::move(d->units.front());
         d->units.pop_front();
         lock.unlock();
         packet->data = unit.data(), packet->size = static_cast<int>(unit.size());
@@ -648,7 +670,7 @@ void cellVdecDecodeAu(Cpu& c) {
     const uint32_t address = load32(info), size = load32(info + 4);
     const std::lock_guard lock(g_mutex);
     const auto d = decoder_of(static_cast<uint32_t>(c.r[3]));
-    d->units.emplace_back(guest_memory() + address, guest_memory() + address + size);
+    d->units.emplace_back(guest_memory() + address, size);
     d->changed.notify_all();
     c.r[3] = kOk;
 }
@@ -670,6 +692,31 @@ void cellVdecGetPicItem(Cpu& c) {
     store32(static_cast<uint32_t>(c.r[4]), item);
     c.r[3] = kOk;
 }
+// A picture as A, R, G, B bytes, rows packed: YUV taken as limited range, in fixed point with 16 bits of fraction, BT.601
+// (matrix 0) or BT.709 (1); chroma from the nearest sample (*a stated choice, for speed*). A row at a time, each pixel
+// stored as one word (the same bytes as the pixel-by-pixel loop before it, checked on random pictures and every Y, U, V).
+void to_argb(const Picture& p, uint32_t matrix, uint8_t alpha, uint8_t* to) {
+    const int32_t ry = 76309, rv = matrix ? 117489 : 104597, gu = matrix ? -13975 : -25675, gv = matrix ? -34925 : -53279, bu = matrix ? 138438 : 132201;
+    const auto clamp = [](int32_t v) { return static_cast<uint32_t>(std::clamp(v, 0, 255)); };
+    const uint32_t cw = (p.width + 1) / 2;
+    // (A pixel's four bytes as one word in the host's order.)
+    constexpr bool kLittle = std::endian::native == std::endian::little;
+    const auto word = [](uint32_t a, uint32_t r, uint32_t g, uint32_t b) {
+        return kLittle ? a | r << 8 | g << 16 | b << 24 : a << 24 | r << 16 | g << 8 | b;
+    };
+    for (uint32_t y = 0; y < p.height; ++y) {
+        const uint8_t* const luma = p.y.data() + size_t{y} * p.width;
+        const uint8_t* const u = p.u.data() + size_t{y / 2} * cw;
+        const uint8_t* const v = p.v.data() + size_t{y / 2} * cw;
+        uint8_t* const row = to + size_t{y} * p.width * 4;
+        for (uint32_t x = 0; x < p.width; ++x) {
+            const int32_t Y = (luma[x] - 16) * ry, U = u[x / 2] - 128, V = v[x / 2] - 128;
+            const uint32_t q = word(alpha, clamp((Y + rv * V + 32768) >> 16), clamp((Y + gu * U + gv * V + 32768) >> 16), clamp((Y + bu * U + 32768) >> 16));
+            std::memcpy(row + size_t{x} * 4, &q, 4);
+        }
+    }
+}
+
 // cellVdecGetPicture(handle, const CellVdecPicFormat* {format, colour matrix, alpha}, buffer): the next picture, converted.
 // YUV is taken as limited range; chroma is taken from the nearest sample (*a stated choice, for speed*).
 void cellVdecGetPicture(Cpu& c) {
@@ -700,20 +747,7 @@ void cellVdecGetPicture(Cpu& c) {
     }
     if (type != 0) fatal("cellVdecGetPicture in format %u into a buffer (ARGB, 0, and YUV 4:2:0 planar, 3, are taken)", type);
     if (matrix > 1) fatal("cellVdecGetPicture with colour matrix %u", matrix);
-    // Fixed point, 16 bits of fraction: BT.601 (0) or BT.709 (1), limited range.
-    const int32_t ry = 76309, rv = matrix ? 117489 : 104597, gu = matrix ? -13975 : -25675, gv = matrix ? -34925 : -53279, bu = matrix ? 138438 : 132201;
-    uint8_t* to = guest_memory() + out;
-    const auto clamp = [](int32_t v) { return static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v); };
-    const uint32_t cw = (p.width + 1) / 2;
-    for (uint32_t y = 0; y < p.height; ++y)
-        for (uint32_t x = 0; x < p.width; ++x) {
-            const int32_t Y = (p.y[size_t{y} * p.width + x] - 16) * ry, U = p.u[size_t{y / 2} * cw + x / 2] - 128, V = p.v[size_t{y / 2} * cw + x / 2] - 128;
-            uint8_t* q = to + (size_t{y} * p.width + x) * 4;
-            q[0] = alpha;
-            q[1] = clamp((Y + rv * V + 32768) >> 16);
-            q[2] = clamp((Y + gu * U + gv * V + 32768) >> 16);
-            q[3] = clamp((Y + bu * U + 32768) >> 16);
-        }
+    to_argb(p, matrix, alpha, guest_memory() + out);
 }
 
 // ---------------------------------------------------------------- cellAdec
@@ -729,7 +763,7 @@ struct SoundDecoder {
     uint32_t item = 0;  // the CellAdecPcmItem, in the runtime's memory
     uint32_t channels_out = 0;
     AVCodecContext* context = nullptr;
-    std::deque<std::vector<uint8_t>> units;
+    std::deque<Unit> units;
     std::deque<Pcm> pcm;
     bool closing = false;
     std::condition_variable changed;
@@ -763,10 +797,10 @@ void sound_thread(std::shared_ptr<SoundDecoder> d) {
     for (;;) {
         d->changed.wait(lock, [&] { return d->closing || !d->units.empty(); });
         if (d->closing) break;
-        std::vector<uint8_t> unit = std::move(d->units.front());
+        Unit unit = std::move(d->units.front());
         d->units.pop_front();
         lock.unlock();
-        if (unit.size() < 8 || unit[0] != 0x0f || unit[1] != 0xd0) fatal("a film's sound access unit without its ATS header");
+        if (unit.size() < 8 || unit.data()[0] != 0x0f || unit.data()[1] != 0xd0) fatal("a film's sound access unit without its ATS header");
         if (!d->context) open_atrac(*d, unit.data());
         packet->data = unit.data() + 8, packet->size = static_cast<int>(unit.size() - 8);
         if (avcodec_send_packet(d->context, packet) < 0) fatal("FFmpeg's ATRAC3plus decoder refuses a film's frame");
@@ -864,7 +898,7 @@ void cellAdecDecodeAu(Cpu& c) {
     const uint32_t address = load32(info), size = load32(info + 4);
     const std::lock_guard lock(g_mutex);
     const auto d = sound_of(static_cast<uint32_t>(c.r[3]));
-    d->units.emplace_back(guest_memory() + address, guest_memory() + address + size);
+    d->units.emplace_back(guest_memory() + address, size);
     d->changed.notify_all();
     c.r[3] = kOk;
 }

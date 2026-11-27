@@ -20,9 +20,11 @@
 // *Stated readings:* the decoder's delay is fact's last number, and the loop's samples count from after it; the output is
 // interleaved big-endian floats in the system's channel order (L, C, R, Ls, Rs, LFE, as cellAdec's: film.cpp); no second
 // buffer is ever needed, since the ring takes the loop's start again.
+#include <algorithm>
 #include <bit>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -46,6 +48,17 @@ constexpr uint32_t kSamplesPerFrame = 2048;
 uint32_t le32(const uint8_t* p) { return p[0] | (uint32_t{p[1]} << 8) | (uint32_t{p[2]} << 16) | (uint32_t{p[3]} << 24); }
 uint16_t le16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
 
+// FFmpeg's objects, freed with their owner.
+struct FreeContext {
+    void operator()(AVCodecContext* context) const { avcodec_free_context(&context); }
+};
+struct FreePacket {
+    void operator()(AVPacket* packet) const { av_packet_free(&packet); }
+};
+struct FreeFrame {
+    void operator()(AVFrame* frame) const { av_frame_free(&frame); }
+};
+
 struct Atrac {
     uint32_t buffer = 0, buffer_size = 0;
     bool on_memory = false;  // the whole file is in the buffer, not streamed
@@ -60,7 +73,12 @@ struct Atrac {
     uint64_t read_at = 0, decode_at = 0;              // file positions: the reader's next, the decoder's next frame
     int32_t read_loops = 0, decode_loops = 0;         // loops still to make, by each side
     bool decode_first_pass = true;
-    AVCodecContext* context = nullptr;
+    // The decoder, and what each frame goes through on its way in and out: the frame's bytes are followed by the zeroes
+    // FFmpeg may read past a packet's end (AV_INPUT_BUFFER_PADDING_SIZE).
+    std::unique_ptr<AVCodecContext, FreeContext> context;
+    std::unique_ptr<AVPacket, FreePacket> packet;
+    std::unique_ptr<AVFrame, FreeFrame> decoded;
+    std::vector<uint8_t> frame;
 };
 std::mutex g_mutex;
 std::map<uint32_t, Atrac> g_atracs;  // by the game's CellAtracHandle
@@ -125,8 +143,7 @@ void cellAtracSetDataAndGetMemSize(Cpu& c) {
     a.consumed = a.decode_at = a.data_offset;
     store32(work, 0x10000);
     const std::lock_guard lock(g_mutex);
-    if (const auto it = g_atracs.find(handle); it != g_atracs.end() && it->second.context) avcodec_free_context(&it->second.context);
-    g_atracs[handle] = a;
+    g_atracs.insert_or_assign(handle, std::move(a));  // (a decoder it had before is freed)
     c.r[3] = kOk;
 }
 
@@ -135,20 +152,22 @@ void cellAtracCreateDecoder(Cpu& c) {
     const std::lock_guard lock(g_mutex);
     Atrac& a = atrac_of(static_cast<uint32_t>(c.r[3]));
     const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_ATRAC3P);
-    a.context = codec ? avcodec_alloc_context3(codec) : nullptr;
-    if (!a.context) fatal("FFmpeg's ATRAC3plus decoder can't be made");
+    a.context.reset(codec ? avcodec_alloc_context3(codec) : nullptr);
+    a.packet.reset(av_packet_alloc());
+    a.decoded.reset(av_frame_alloc());
+    if (!a.context || !a.packet || !a.decoded) fatal("FFmpeg's ATRAC3plus decoder can't be made");
     a.context->sample_rate = static_cast<int>(a.rate);
     av_channel_layout_default(&a.context->ch_layout, static_cast<int>(a.channels));
     a.context->block_align = static_cast<int>(a.frame_bytes);
-    if (avcodec_open2(a.context, codec, nullptr) < 0) fatal("FFmpeg's ATRAC3plus decoder can't be opened");
+    if (avcodec_open2(a.context.get(), codec, nullptr) < 0) fatal("FFmpeg's ATRAC3plus decoder can't be opened");
+    a.frame.assign(size_t{a.frame_bytes} + AV_INPUT_BUFFER_PADDING_SIZE, 0);
     c.r[3] = kOk;
 }
 // cellAtracDeleteDecoder(handle)
 void cellAtracDeleteDecoder(Cpu& c) {
     const std::lock_guard lock(g_mutex);
-    Atrac& a = atrac_of(static_cast<uint32_t>(c.r[3]));
-    if (a.context) avcodec_free_context(&a.context);
-    g_atracs.erase(static_cast<uint32_t>(c.r[3]));
+    atrac_of(static_cast<uint32_t>(c.r[3]));
+    g_atracs.erase(static_cast<uint32_t>(c.r[3]));  // (its decoder with it)
     c.r[3] = kOk;
 }
 
@@ -241,9 +260,9 @@ void cellAtracDecode(Cpu& c) {
         return;
     }
     // The frame, from the buffer: at its file position when all is in memory, else at its place in the ring.
-    std::vector<uint8_t> frame(a.frame_bytes);
+    uint8_t* const frame = a.frame.data();
     if (a.on_memory) {
-        std::memcpy(frame.data(), guest_memory() + a.buffer + a.decode_at, a.frame_bytes);
+        std::memcpy(frame, guest_memory() + a.buffer + a.decode_at, a.frame_bytes);
     } else {
         if (a.delivered - a.consumed < a.frame_bytes) {
             c.r[3] = kNoData;
@@ -253,20 +272,20 @@ void cellAtracDecode(Cpu& c) {
         // so a frame can run over the ring's end and go on at its start.
         const uint32_t at = static_cast<uint32_t>(a.consumed % a.buffer_size);
         const uint32_t first_part = std::min(a.frame_bytes, a.buffer_size - at);
-        std::memcpy(frame.data(), guest_memory() + a.buffer + at, first_part);
-        std::memcpy(frame.data() + first_part, guest_memory() + a.buffer, a.frame_bytes - first_part);
+        std::memcpy(frame, guest_memory() + a.buffer + at, first_part);
+        std::memcpy(frame + first_part, guest_memory() + a.buffer, a.frame_bytes - first_part);
         a.consumed += a.frame_bytes;
     }
     // The samples this frame holds, in the decoded stream (with the delay), and those this pass keeps.
     const uint64_t first = (a.decode_at - a.data_offset) / a.frame_bytes * kSamplesPerFrame;
     const uint64_t keep_from = a.delay + (a.decode_first_pass ? 0 : a.loop_first);
     const uint64_t keep_to = a.delay + ((a.has_loop && a.decode_loops != 0) ? uint64_t{a.loop_last} + 1 : a.total);
-    AVPacket* packet = av_packet_alloc();
-    AVFrame* decoded = av_frame_alloc();
-    packet->data = frame.data(), packet->size = static_cast<int>(frame.size());
-    if (avcodec_send_packet(a.context, packet) < 0) fatal("FFmpeg's ATRAC3plus decoder refuses a frame of the music");
+    AVPacket* const packet = a.packet.get();
+    AVFrame* const decoded = a.decoded.get();
+    packet->data = frame, packet->size = static_cast<int>(a.frame_bytes);
+    if (avcodec_send_packet(a.context.get(), packet) < 0) fatal("FFmpeg's ATRAC3plus decoder refuses a frame of the music");
     uint32_t written = 0;
-    while (avcodec_receive_frame(a.context, decoded) == 0) {
+    while (avcodec_receive_frame(a.context.get(), decoded) == 0) {
         if (decoded->format != AV_SAMPLE_FMT_FLTP) fatal("FFmpeg's ATRAC3plus decoder gives sample format %d", decoded->format);
         const int channels = decoded->ch_layout.nb_channels;
         int from[8];
@@ -283,8 +302,6 @@ void cellAtracDecode(Cpu& c) {
             ++written;
         }
     }
-    av_frame_free(&decoded);
-    av_packet_free(&packet);
     // On to the next frame: back to the loop's start after its end, while loops are left.
     a.decode_at += a.frame_bytes;
     if (a.decode_at == end && a.has_loop && a.decode_loops != 0) {

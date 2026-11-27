@@ -52,11 +52,14 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ### Changed
 - README rewritten to the layout shared by the QilinRecomp projects: what works and how to build and play it, without the development history.
 - SPURS tasks start for less: each SPU program's ELF is parsed once (checked against its headers at every use), local stores are kept zeroed between threads, a task's host thread is kept for the next task, the kernel's three calls are plain functions instead of `std::function`s, and a memory transfer no longer takes a lock to look through the (empty) list of forbidden ranges. Starting a task costs under 3 microseconds of its starter's time, from 45 to 80; a start and an end about 70, from 150 to 190 (`ridgeracer7_spu_test bench`). `ridgeracer7_spu_test` (in `ctest`) runs made-up SPU programs as tasks and as a thread group with no game.
+- A film's pictures are converted to ARGB a row at a time, each pixel stored as one word: 3.8 ms for a 1280 x 720 picture with MSVC, from 8.2 (Clang's code was already as fast); the same bytes as before on 20,000 random pictures and every Y, U and V for both colour matrices. The demultiplexer keeps its list of streams from packet to packet instead of making one for each; the music decoder keeps its packet, frame and frame buffer (and frees its FFmpeg objects by RAII); the sound mixer reads each block from guest memory directly and keeps its list of queues to tell.
 
 ### Checked
 - On the owner's PC: the game starts its sound core (`bnusCoreSpu.elf`) as an SPU thread, which runs; it reads and unpacks its first packs of `RR7.DAT`, and runs on to its first drawing: it stops at the RSX method that loads a vertex program. 110 of its 248 imports and 54 of its 78 system calls are provided.
 
 ### Fixed
+- FFmpeg's decoders were handed films' access units and the music's frames with nothing after their last byte, though they may read up to 64 bytes past a packet's end: each now has those bytes, zeroed.
+- A film's sound stream reset (`cellDmuxResetEs`) while the demultiplexer's thread waited for room in the stream's ring left that thread reading past the end of what it had pending; it now drops it, as the reset meant.
 - Building the game no longer needs 10 GB for one file: the SPU helpers that loop over sixteen bytes are left to MSVC's own inlining (`QILIN_SPU_BULKY`), which brings the heaviest file (`spu_p24`) to 4 GB and two minutes from six and a half. The build scripts count 5 GB per compiler.
 - The renderer no longer writes every surface back each time the RSX briefly runs out of commands mid-frame: it waits 2 ms first (labels, waits and flips still flush at once).
 - `sys_memory_allocate` could give the same address twice when blocks of both page sizes were allocated: the game's packs then overwrote one another, and it faulted going over one's table.

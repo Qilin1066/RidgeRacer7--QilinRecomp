@@ -55,10 +55,17 @@ std::vector<uint64_t> g_notify;  // the keys of the queues to tell
 std::function<void(const int16_t*, size_t)> g_sink;
 std::once_flag g_started;
 
-// One period: every running port's next block, mixed; then the events.
-void mix_once(std::array<float, kBlockSamples * 2>& mix, std::array<int16_t, kBlockSamples * 2>& out) {
+// A big-endian float in guest memory.
+float guest_float(const uint8_t* p) {
+    uint32_t v;
+    std::memcpy(&v, p, 4);
+    return std::bit_cast<float>(std::endian::native == std::endian::little ? std::byteswap(v) : v);
+}
+
+// One period: every running port's next block, mixed; then the events (to the queues in `notify`, which is the mixer's
+// own, kept from period to period).
+void mix_once(std::array<float, kBlockSamples * 2>& mix, std::array<int16_t, kBlockSamples * 2>& out, std::vector<uint64_t>& notify) {
     mix.fill(0.0f);
-    std::vector<uint64_t> notify;
     bool any = false;
     {
         const std::lock_guard lock(g_mutex);
@@ -67,7 +74,8 @@ void mix_once(std::array<float, kBlockSamples * 2>& mix, std::array<int16_t, kBl
             any = true;
             const uint64_t index = load64(port.read_index) % port.blocks;
             const uint32_t block = port.buffer + static_cast<uint32_t>(index) * kBlockSamples * port.channels * 4;
-            const auto sample = [&](uint32_t frame, uint32_t channel) { return std::bit_cast<float>(load32(block + (frame * port.channels + channel) * 4)); };
+            const uint8_t* const samples = guest_memory() + block;
+            const auto sample = [&](uint32_t frame, uint32_t channel) { return guest_float(samples + (frame * port.channels + channel) * 4); };
             for (uint32_t i = 0; i < kBlockSamples; ++i) {
                 float left, right;
                 if (port.channels == 2) {
@@ -85,7 +93,7 @@ void mix_once(std::array<float, kBlockSamples * 2>& mix, std::array<int16_t, kBl
             std::memset(guest_memory() + block, 0, kBlockSamples * port.channels * 4);
             store64(port.read_index, (index + 1) % port.blocks);
         }
-        notify = g_notify;
+        notify.assign(g_notify.begin(), g_notify.end());
     }
     if (any) {
         for (size_t i = 0; i < mix.size(); ++i) out[i] = static_cast<int16_t>(std::lround(std::clamp(mix[i], -1.0f, 1.0f) * 32767.0f));
@@ -100,13 +108,14 @@ void mixer() {
     using Clock = std::chrono::steady_clock;
     std::array<float, kBlockSamples * 2> mix{};
     std::array<int16_t, kBlockSamples * 2> out{};
+    std::vector<uint64_t> notify;
     Clock::time_point start = Clock::now();
     for (uint64_t n = 1;; ++n) {
         const Clock::time_point due = start + std::chrono::nanoseconds(n * (1000000000ull * kBlockSamples / kRate));
         // After a long stall (the host slept), start counting again from now and don't play catch-up.
         if (Clock::now() > due + std::chrono::milliseconds(200)) start = Clock::now(), n = 0;
         else std::this_thread::sleep_until(due);
-        mix_once(mix, out);
+        mix_once(mix, out, notify);
     }
 }
 

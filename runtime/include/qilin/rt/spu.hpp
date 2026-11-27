@@ -14,6 +14,7 @@
 // Runtime code: no std::format here.
 #pragma once
 
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -148,11 +149,16 @@ QILIN_SPU_INLINE void store(Spu& s, uint32_t address, const SpuReg& v) {
 
 // ---- constants ----
 // fsmbi: each of 16 bits makes a byte of ones or zeros, the top bit the first byte.
-QILIN_SPU_BULKY SpuReg fsmbi(uint32_t bits) {
-    SpuReg r{};
-    for (unsigned i = 0; i < 16; ++i)
-        if (bits & (0x8000u >> i)) set_byte(r, i, 0xff);
-    return r;
+// (Each four bits make a word: of a table of the sixteen.)
+inline constexpr std::array<uint32_t, 16> kByteMasks = [] {
+    std::array<uint32_t, 16> masks{};
+    for (unsigned n = 0; n < 16; ++n)
+        for (unsigned k = 0; k < 4; ++k)
+            if (n & (8u >> k)) masks[n] |= 0xffu << (24 - 8 * k);
+    return masks;
+}();
+QILIN_SPU_INLINE SpuReg fsmbi(uint32_t bits) {
+    return {{kByteMasks[(bits >> 12) & 0xfu], kByteMasks[(bits >> 8) & 0xfu], kByteMasks[(bits >> 4) & 0xfu], kByteMasks[bits & 0xfu]}};
 }
 QILIN_SPU_INLINE SpuReg fsmb(const SpuReg& a) { return fsmbi(a.w[0] & 0xffffu); }
 QILIN_SPU_INLINE SpuReg fsmh(const SpuReg& a) {
@@ -255,16 +261,19 @@ QILIN_SPU_INLINE SpuReg selb(const SpuReg& x, const SpuReg& y, const SpuReg& c) 
     return r;
 }
 // shufb: each byte of c picks a byte of a (0-15) or b (16-31), or is a constant: 10xxxxxx 0x00, 110xxxxx 0xff, 111xxxxx 0x80.
+// (Built a word at a time, each byte read straight from its word.)
 QILIN_SPU_BULKY SpuReg shufb(const SpuReg& x, const SpuReg& y, const SpuReg& c) {
-    SpuReg r{};
-    for (unsigned i = 0; i < 16; ++i) {
-        const uint32_t pick = byte(c, i);
-        uint32_t value;
-        if ((pick & 0xc0u) == 0x80u) value = 0x00;
-        else if ((pick & 0xe0u) == 0xc0u) value = 0xff;
-        else if ((pick & 0xe0u) == 0xe0u) value = 0x80;
-        else value = (pick & 0x10u) ? byte(y, pick & 0xfu) : byte(x, pick & 0xfu);
-        set_byte(r, i, value);
+    SpuReg r;
+    for (unsigned i = 0; i < 4; ++i) {
+        uint32_t w = 0;
+        for (unsigned k = 0; k < 4; ++k) {
+            const uint32_t pick = (c.w[i] >> (24 - 8 * k)) & 0xffu;
+            uint32_t value;
+            if (pick >= 0x80u) value = pick < 0xc0u ? 0x00u : pick < 0xe0u ? 0xffu : 0x80u;
+            else value = (((pick & 0x10u) ? y : x).w[(pick >> 2) & 3u] >> (24 - 8 * (pick & 3u))) & 0xffu;
+            w |= value << (24 - 8 * k);
+        }
+        r.w[i] = w;
     }
     return r;
 }
@@ -327,21 +336,35 @@ QILIN_SPU_BULKY SpuReg shift_right_bits(const SpuReg& x, unsigned bits) {
     for (unsigned i = 0; i < 4; ++i) r.w[i] = (x.w[i] >> bits) | (i > 0 ? x.w[i - 1] << (32 - bits) : 0u);
     return r;
 }
+// The register as a 128-bit number, its first byte the most significant, and its shifts by 0 to 127 bits.
+struct SpuQuad {
+    uint64_t hi, lo;
+};
+QILIN_SPU_INLINE SpuQuad as_quad(const SpuReg& x) { return {(uint64_t{x.w[0]} << 32) | x.w[1], (uint64_t{x.w[2]} << 32) | x.w[3]}; }
+QILIN_SPU_INLINE SpuReg from_quad(SpuQuad q) {
+    return {{static_cast<uint32_t>(q.hi >> 32), static_cast<uint32_t>(q.hi), static_cast<uint32_t>(q.lo >> 32), static_cast<uint32_t>(q.lo)}};
+}
+QILIN_SPU_INLINE SpuQuad quad_left(SpuQuad q, unsigned bits) {
+    if (bits == 0) return q;
+    if (bits >= 64) return {q.lo << (bits - 64), 0};
+    return {(q.hi << bits) | (q.lo >> (64 - bits)), q.lo << bits};
+}
+QILIN_SPU_INLINE SpuQuad quad_right(SpuQuad q, unsigned bits) {
+    if (bits == 0) return q;
+    if (bits >= 64) return {0, q.hi >> (bits - 64)};
+    return {q.hi >> bits, (q.lo >> bits) | (q.hi << (64 - bits))};
+}
 // Left by bytes: 16 or more leaves nothing of a shift; a rotate's count is 0 to 15.
 QILIN_SPU_BULKY SpuReg shift_left_bytes(const SpuReg& x, unsigned count, bool rotate) {
-    SpuReg r{};
-    for (unsigned i = 0; i < 16; ++i) {
-        const unsigned from = i + count;
-        if (rotate) set_byte(r, i, byte(x, from & 15u));
-        else if (from < 16) set_byte(r, i, byte(x, from));
+    if (rotate) {
+        const unsigned bits = 8 * (count & 15u);
+        if (bits == 0) return x;
+        const SpuQuad left = quad_left(as_quad(x), bits), right = quad_right(as_quad(x), 128 - bits);
+        return from_quad({left.hi | right.hi, left.lo | right.lo});
     }
-    return r;
+    return count >= 16 ? SpuReg{} : from_quad(quad_left(as_quad(x), 8 * count));
 }
-QILIN_SPU_BULKY SpuReg shift_right_bytes(const SpuReg& x, unsigned count) {
-    SpuReg r{};
-    for (unsigned i = count; i < 16; ++i) set_byte(r, i, byte(x, i - count));
-    return r;
-}
+QILIN_SPU_BULKY SpuReg shift_right_bytes(const SpuReg& x, unsigned count) { return count >= 16 ? SpuReg{} : from_quad(quad_right(as_quad(x), 8 * count)); }
 QILIN_SPU_INLINE SpuReg shlqbi(const SpuReg& x, uint32_t n) { return shift_left_bits(x, n & 7u, false); }
 QILIN_SPU_INLINE SpuReg shlqby(const SpuReg& x, uint32_t n) { return shift_left_bytes(x, n & 0x1fu, false); }
 QILIN_SPU_INLINE SpuReg shlqbybi(const SpuReg& x, uint32_t n) { return shift_left_bytes(x, (n >> 3) & 0x1fu, false); }

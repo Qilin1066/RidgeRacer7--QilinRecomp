@@ -31,4 +31,13 @@ struct Case {
 extern const Case kCases[];
 extern const size_t kCaseCount;
 
+// The unwinding program (gen.cpp, "C++ exceptions"): its words, for the reference, and its first function, lifted.
+struct ProgramWord {
+    uint32_t at, word;
+};
+extern const ProgramWord kEhProgram[];
+extern const size_t kEhProgramSize;
+extern const uint32_t kEhEntry, kEhPad;
+void eh_entry(qilin::rt::Cpu& c);
+
 }  // namespace difftest

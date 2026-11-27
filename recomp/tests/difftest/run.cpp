@@ -139,6 +139,119 @@ void compare(const Case& c, const rt::Cpu& cpu, const ref::State& s, const std::
     if (std::memcmp(lifted_memory.data(), reference_memory, kWinSize) != 0) fail(c, "memory differs");
 }
 
+// ---- the unwinding program (gen.cpp, "C++ exceptions") ----
+// Run lifted and by the reference interpreter, instruction by instruction: for the reference, __builtin_eh_return's
+// epilogue is an add and a return to LR, so it lands at the pad with nothing known about exceptions. Each depth and
+// mode from random states: everything must agree, and r7 must say the right frames ran (gen.cpp).
+constexpr uint32_t kReturnSentinel = 0x00001230u;
+
+// Runs the program from `pc` until it returns to the sentinel; false if it leaves the program or runs too long.
+bool interpret(ref::State& s, uint32_t pc) {
+    for (int steps = 0; steps < 10000; ++steps) {
+        if (pc == kReturnSentinel) return true;
+        const difftest::ProgramWord* w = nullptr;
+        for (size_t i = 0; i < difftest::kEhProgramSize; ++i)
+            if (difftest::kEhProgram[i].at == pc) w = &difftest::kEhProgram[i];
+        if (!w) return false;
+        const ppu::Insn in = ppu::decode(w->word);
+        switch (in.op) {
+        case ppu::Op::b:
+            if (in.lk()) s.lr = pc + 4;
+            pc = in.branch_target(pc);
+            break;
+        case ppu::Op::bc: {
+            const bool taken = ref::branch_taken(s, in.rd(), in.ra());
+            if (in.lk()) s.lr = pc + 4;
+            pc = taken ? in.branch_target(pc) : pc + 4;
+            break;
+        }
+        case ppu::Op::bclr:  // (only the unconditional return is in the program)
+            if (in.lk() || (in.rd() & 0x14) != 0x14) return false;
+            pc = static_cast<uint32_t>(s.lr) & ~3u;
+            break;
+        default:
+            if (!ref::step(s, in)) return false;
+            pc += 4;
+        }
+    }
+    return false;
+}
+
+int eh_failures = 0;
+
+void eh_fail(unsigned depth, unsigned mode, const std::string& what) {
+    if (++eh_failures <= 20) std::println(stderr, "FAIL the unwinding program, depth {} mode {}: {}", depth, mode, what);
+}
+
+// Returns the number of runs.
+size_t run_unwinding(rt::AddressSpace& space) {
+    uint8_t* const window = space.base() + kWin;
+    const uint32_t stack = kWin + 0x1800;
+    std::vector<uint8_t> before(kWinSize), lifted_memory(kWinSize);
+    size_t runs = 0;
+    for (unsigned depth = 0; depth < 3; ++depth)
+        for (unsigned mode = 0; mode < 4; ++mode)
+            for (int trial = 0; trial < 8; ++trial, ++runs) {
+                rt::Cpu cpu;
+                cpu.mem = space.base();
+                cpu.hooks = &kHooks;
+                for (uint64_t& r : cpu.r) r = interesting();
+                cpu.cr = static_cast<uint32_t>(rng());
+                cpu.ctr = interesting();
+                cpu.r[1] = stack;
+                cpu.r[3] = depth;
+                cpu.r[4] = mode == 3 ? 1 : mode;
+                // Mode 3: an exception for a frame that isn't on the stack (r5 names a frame whose back chain is no
+                // activation's): no function takes it, and it must come out of the outermost.
+                cpu.r[5] = mode == 3 ? stack - 0x400 : 0;
+                cpu.r[6] = difftest::kEhPad;
+                cpu.r[7] = 0;
+                cpu.lr = kReturnSentinel;
+                for (uint8_t& b : before) b = static_cast<uint8_t>(rng());
+                ref::State s;
+                for (unsigned i = 0; i < 32; ++i) s.gpr[i] = cpu.r[i];
+                s.cr = cpu.cr;
+                s.xer = cpu.xer();
+                s.lr = cpu.lr;
+                s.ctr = cpu.ctr;
+                s.mem = space.base();
+
+                std::memcpy(window, before.data(), kWinSize);
+                bool escaped = false;
+                try {
+                    difftest::eh_entry(cpu);
+                } catch (const rt::GuestUnwind& e) {
+                    escaped = true;
+                    if (e.pad != difftest::kEhPad || e.sp != stack - 0x400) eh_fail(depth, mode, std::format("escaped for {:#x} at {:#x}", e.pad, e.sp));
+                } catch (const Trapped&) {
+                    eh_fail(depth, mode, "trapped");
+                    continue;
+                }
+                if (escaped != (mode == 3)) {
+                    eh_fail(depth, mode, escaped ? "no function took the exception" : "an exception for no frame was taken");
+                    continue;
+                }
+                if (escaped) continue;
+                std::memcpy(lifted_memory.data(), window, kWinSize);
+
+                std::memcpy(window, before.data(), kWinSize);
+                if (!interpret(s, difftest::kEhEntry)) {
+                    eh_fail(depth, mode, "the reference left the program");
+                    continue;
+                }
+                const uint64_t r7 = mode == 0 ? 16 + depth + 1 : mode == 1 ? 0x100 : 0x100 + depth;
+                if (cpu.r[7] != r7) eh_fail(depth, mode, std::format("r7 {:#x}, not {:#x}", cpu.r[7], r7));
+                if (cpu.r[1] != stack) eh_fail(depth, mode, std::format("r1 {:#x} on return, not {:#x}", cpu.r[1], stack));
+                for (unsigned i = 0; i < 32; ++i)
+                    if (cpu.r[i] != s.gpr[i]) eh_fail(depth, mode, std::format("r{}: lifted {:#x}, reference {:#x}", i, cpu.r[i], s.gpr[i]));
+                if (cpu.cr != s.cr) eh_fail(depth, mode, std::format("CR: lifted {:#x}, reference {:#x}", cpu.cr, s.cr));
+                if (cpu.lr != s.lr) eh_fail(depth, mode, std::format("LR: lifted {:#x}, reference {:#x}", cpu.lr, s.lr));
+                if (cpu.ctr != s.ctr) eh_fail(depth, mode, std::format("CTR: lifted {:#x}, reference {:#x}", cpu.ctr, s.ctr));
+                if (std::memcmp(lifted_memory.data(), window, kWinSize) != 0) eh_fail(depth, mode, "memory differs");
+            }
+    return runs;
+}
+
 }  // namespace
 
 int main() {
@@ -287,10 +400,12 @@ int main() {
             compare(c, cpu, s, lifted_memory, window, operands);
         }
     }
-    if (failures) {
-        std::println(stderr, "difftest: {} disagreements", failures);
+    const size_t unwinding = run_unwinding(space);
+    if (failures || eh_failures) {
+        std::println(stderr, "difftest: {} disagreements, {} in the unwinding program", failures, eh_failures);
         return 1;
     }
-    std::println("difftest: {} cases, {} runs, all agree ({} branches taken, {} traps fired)", difftest::kCaseCount, runs, taken, traps);
+    std::println("difftest: {} cases, {} runs, all agree ({} branches taken, {} traps fired); the unwinding program: {} runs, all agree", difftest::kCaseCount,
+                 runs, taken, traps, unwinding);
     return 0;
 }

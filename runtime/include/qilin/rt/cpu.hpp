@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <span>
 
 #include "qilin/rt/fp.hpp"
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -81,6 +82,24 @@ struct Cpu {
         xer_bc = value & 0x7F;
     }
 };
+
+// ---- C++ exceptions: the guest's unwinder entering a landing pad ----
+// The game's own unwinder (lifted with the rest) ends, once it has found a landing pad, in __builtin_eh_return's
+// epilogue: the registers of the pad's frame restored, the stack pointer moved up to that frame by a register, and a
+// return to the pad through LR. A lifted function can't return into another function's middle, so the lifter makes
+// that epilogue a throw of this, carrying the pad and the stack pointer, with every register written back to the Cpu.
+// A function with landing pads is lifted twice, as a body entered at its start and one entered at a pad (which reads
+// the registers from the Cpu), and run by run_with_landing_pads: it takes the exception when the pad is one of the
+// function's and the pad's frame is this activation's, and runs the second body from that pad
+// (docs/recompiler-core.md). Lifted code between the two (and runtime code that called guest code) lets it pass: the
+// host's unwinding of their frames is what the guest's unwinder did to theirs. One nobody takes stops the thread.
+struct GuestUnwind {
+    uint32_t pad = 0;  // the landing pad's address
+    uint32_t sp = 0;   // the stack pointer it runs with: its function's frame
+};
+[[noreturn]] void eh_return(const Cpu& c);
+// The only try lifted code runs in (unwind.cpp): lifted functions have none of their own.
+void run_with_landing_pads(Cpu& c, void (*start)(Cpu&), void (*at_pad)(Cpu&, uint32_t pad), std::span<const uint32_t> pads);
 
 // mtfsf: the FPSCR's fields picked by the mask (bit 7 field 0, FPSCR bits 0-3) from the low word of frB's bits. FEX and VX
 // (bits 1 and 2) are summaries, not written: VX is the OR of the invalid-operation bits, FEX of the exceptions enabled.

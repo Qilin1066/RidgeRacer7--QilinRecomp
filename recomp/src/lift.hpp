@@ -31,7 +31,7 @@ struct LiftInput {
     uint32_t start = 0;
     std::vector<std::pair<uint32_t, ppu::Insn>> insns;  // the instructions reached, by address
     std::vector<JumpTable> tables;
-    std::vector<uint32_t> landing_pads;         // labels nothing in the function branches to
+    std::vector<uint32_t> landing_pads;         // where the guest's unwinder enters the function (nothing in it branches there)
     uint32_t falls_into = 0;                    // the next function, if execution runs into it
     std::function<bool(uint32_t)> is_function;  // a known function start (tail and call targets)
     bool keep_pc = false;                       // note each instruction's address in Cpu::pc before it touches memory (for finding faults: slower)
@@ -43,6 +43,8 @@ struct Lifted {
     std::string code;  // the definition, when ok
     std::string why;   // why not, when !ok: the first instruction outside the slice
     uint32_t why_at = 0;
+    bool catches = false;     // has landing pads, so its body is in a try (docs/recompiler-core.md, "C++ exceptions")
+    unsigned eh_returns = 0;  // __builtin_eh_return epilogues in it (the guest's unwinder), each lifted as a GuestUnwind throw
 };
 
 std::string fn_name(uint32_t address);  // "fn_00010200"

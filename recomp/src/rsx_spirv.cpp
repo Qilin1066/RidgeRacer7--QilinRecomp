@@ -413,10 +413,25 @@ public:
                 input_vars_[n] = m.variable(kStorageInput, vec4);
                 m.decorate(input_vars_[n], kDecorationLocation, {kLocation[n]});
                 // (Flat, a colour isn't interpolated at all: with or without perspective is moot.)
-                if (variant_.flat && (n == 1 || n == 2)) m.decorate(input_vars_[n], kDecorationFlat);
-                else if (no_perspective & (1u << n)) m.decorate(input_vars_[n], kDecorationNoPerspective);
+                const auto interpolation = [&](uint32_t var) {
+                    if (variant_.flat && (n == 1 || n == 2)) m.decorate(var, kDecorationFlat);
+                    else if (no_perspective & (1u << n)) m.decorate(var, kDecorationNoPerspective);
+                };
+                interpolation(input_vars_[n]);
                 interface_.push_back(input_vars_[n]);
+                // Two-sided: the back colour, BFC0 or BFC1 (the vertex program's outputs 3 and 4), read on back faces.
+                if (variant_.two_sided && (n == 1 || n == 2)) {
+                    back_vars_[n] = m.variable(kStorageInput, vec4);
+                    m.decorate(back_vars_[n], kDecorationLocation, {n + 2});
+                    interpolation(back_vars_[n]);
+                    interface_.push_back(back_vars_[n]);
+                }
             }
+        if (variant_.two_sided && (inputs_ & 6)) {
+            front_facing_ = m.variable(kStorageInput, b);
+            m.decorate(front_facing_, kDecorationBuiltIn, {kBuiltInFrontFacing});
+            interface_.push_back(front_facing_);
+        }
         size_t slots = 0;
         for (const FpInsn& in : insns_) slots += in.has_constant;
         if (slots) {
@@ -462,6 +477,14 @@ public:
         for (const unsigned r : used_r_) r_[r] = make_local(zero4);
         for (const unsigned h : used_h_) h_[h] = make_local(zero4);
         cc_ = make_local(zero4);
+        // Two-sided: COL0 and COL1 as the face drawn has them, chosen once.
+        if (front_facing_) {
+            const uint32_t front = m.op(OpLoad, b, {front_facing_});
+            const uint32_t where = m.op(OpCompositeConstruct, bvec4, {front, front, front, front});
+            for (unsigned n = 1; n <= 2; ++n)
+                if (back_vars_[n])
+                    colours_[n] = make_local(m.op(OpSelect, vec4, {where, m.op(OpLoad, vec4, {input_vars_[n]}), m.op(OpLoad, vec4, {back_vars_[n]})}));
+        }
         size_t slot = 0, at = 0;
         for (const FpInsn& in : insns_) {
             at += 16;
@@ -560,7 +583,7 @@ private:
         uint32_t v = 0;
         switch (s.type) {
         case FpRegister::temp: v = m.op(OpLoad, vec4, {s.half ? h_.at(s.index) : r_.at(s.index)}); break;
-        case FpRegister::input: v = m.op(OpLoad, vec4, {input_vars_[in.input]}); break;
+        case FpRegister::input: v = m.op(OpLoad, vec4, {in.input <= 2 && colours_[in.input] ? colours_[in.input] : input_vars_[in.input]}); break;
         case FpRegister::constant: {
             const uint32_t ptr = m.type_pointer(kStorageUniform, vec4);
             v = m.op(OpLoad, vec4, {m.op(OpAccessChain, ptr, {constants_, m.constant_int(0), m.constant_int(static_cast<int32_t>(slot))})});
@@ -671,6 +694,8 @@ private:
     std::set<unsigned> used_r_, used_h_, written_r_, written_h_;
     std::map<unsigned, uint32_t> r_, h_;
     std::array<uint32_t, 16> input_vars_{}, samplers_{}, sampler_types_{};
+    std::array<uint32_t, 3> back_vars_{}, colours_{};  // the two-sided form's: BFC0 and BFC1, and COL0 and COL1 as the face has them
+    uint32_t front_facing_ = 0;
     std::array<uint32_t, 4> colour_vars_{};
     std::vector<uint32_t> interface_;
 };
@@ -680,7 +705,7 @@ private:
 std::expected<Translation, std::string> translate(const CgProgram& program, const Variant& variant) {
     try {
         if (program.vertex) {
-            if (variant.flat) refuse("a flat form of a vertex program");
+            if (variant.flat || variant.two_sided) refuse("a flat or two-sided form of a vertex program");
             return VertexTranslator(program).run();
         }
         return FragmentTranslator(program, variant).run();

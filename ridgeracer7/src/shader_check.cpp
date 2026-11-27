@@ -89,12 +89,14 @@ int main() {
                 ++bad_modules;
             }
         }
-    // A fragment program's inputs at their locations: COL0 1, COL1 2, FOGC 5, TEXn 7 + n (rsx_spirv.hpp).
-    const auto fragment_needs = [](uint32_t inputs) {
+    // A fragment program's inputs at their locations: COL0 1, COL1 2, FOGC 5, TEXn 7 + n (rsx_spirv.hpp); in its two-sided
+    // forms (2, 3) the back colours too, BFC0 3 and BFC1 4.
+    const auto fragment_needs = [](uint32_t inputs, unsigned form = 0) {
         static constexpr unsigned kLocation[14] = {0, 1, 2, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
         uint32_t outputs = 0;
         for (unsigned n = 1; n < 14; ++n)
             if (inputs & (1u << n)) outputs |= 1u << kLocation[n];
+        if (form & 2) outputs |= (inputs & 6) << 2;
         return outputs;
     };
     // A pipeline of vertex program v and fragment program f, in the forms given (0 the plain ones).
@@ -145,26 +147,28 @@ int main() {
     size_t first_fragment = rt::kTranslatedShaderCount;
     for (size_t i = 0; i < rt::kTranslatedShaderCount; ++i)
         if (!rt::kTranslatedShaders[i].vertex && modules[i] && rt::kTranslatedShaders[i].inputs == 0) first_fragment = std::min(first_fragment, i);
+    // A partner for program i in its form n: for a vertex program, a fragment program reading nothing it doesn't write (failing
+    // that, the first that reads nothing at all); for a fragment program, a vertex program writing all it reads.
+    const auto partner_of = [&](size_t i, unsigned n) {
+        const rt::TranslatedShader& s = rt::kTranslatedShaders[i];
+        for (size_t j = 0; j < rt::kTranslatedShaderCount; ++j) {
+            const rt::TranslatedShader& o = rt::kTranslatedShaders[j];
+            if (o.vertex == s.vertex || !modules[j]) continue;
+            if (s.vertex ? (fragment_needs(o.inputs) & ~s.outputs) == 0 : (fragment_needs(s.inputs, n) & ~o.outputs) == 0) return j;
+        }
+        return s.vertex ? first_fragment : rt::kTranslatedShaderCount;
+    };
     for (size_t i = 0; i < rt::kTranslatedShaderCount; ++i) {
         if (!modules[i]) continue;
         const rt::TranslatedShader& s = rt::kTranslatedShaders[i];
-        size_t partner = rt::kTranslatedShaderCount;
-        if (s.vertex) {
-            // A fragment program reading nothing it doesn't write; failing that, the first that reads nothing at all.
-            for (size_t j = 0; j < rt::kTranslatedShaderCount && partner == rt::kTranslatedShaderCount; ++j)
-                if (!rt::kTranslatedShaders[j].vertex && modules[j] && (fragment_needs(rt::kTranslatedShaders[j].inputs) & ~s.outputs) == 0) partner = j;
-            if (partner == rt::kTranslatedShaderCount) partner = first_fragment;
-        } else {
-            for (size_t j = 0; j < rt::kTranslatedShaderCount && partner == rt::kTranslatedShaderCount; ++j)
-                if (rt::kTranslatedShaders[j].vertex && modules[j] && (fragment_needs(s.inputs) & ~rt::kTranslatedShaders[j].outputs) == 0) partner = j;
-        }
-        if (partner == rt::kTranslatedShaderCount) {
-            std::printf("  no partner for the %s program at %08x\n", s.vertex ? "vertex" : "fragment", s.address);
-            continue;
-        }
-        // The program in each of its forms, with its partner in its plain one.
+        // The program in each of its forms, with a partner in its plain one.
         for (unsigned n = 0; n < 4; ++n) {
             if (n && !forms[i][n]) continue;
+            const size_t partner = partner_of(i, n);
+            if (partner == rt::kTranslatedShaderCount) {
+                std::printf("  no partner for the %s program at %08x in its form %u\n", s.vertex ? "vertex" : "fragment", s.address, n);
+                continue;
+            }
             ++pipelines;
             if (!(s.vertex ? pipeline(i, partner, n, 0) : pipeline(partner, i, 0, n))) {
                 std::printf("  the driver refuses a pipeline with the %s program at %08x in its form %u\n", s.vertex ? "vertex" : "fragment", s.address, n);

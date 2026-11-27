@@ -724,6 +724,13 @@ int cmd_shaders(const Args& a) {
         for (size_t i = 0; i < spirv.size(); ++i) words += std::format("{}0x{:08x}u,", i % 8 ? " " : "\n    ", spirv[i]);
         return words;
     };
+    // (A two-sided form is of use only if some vertex program writes a back colour, BFC0 or BFC1: outputs 3 and 4.)
+    bool back_colours = false;
+    for (const ShaderProgram& s : *programs) {
+        const auto p = rsx::parse_cg(elf.bytes_at(s.address, s.size), s.address);
+        if (p && p->vertex)
+            if (const auto t = rsx::translate(*p); t && (t->outputs & 0x18)) back_colours = true;
+    }
     for (const ShaderProgram& s : *programs) {
         const auto p = rsx::parse_cg(elf.bytes_at(s.address, s.size), s.address);
         const auto t = rsx::translate(*p);
@@ -736,13 +743,14 @@ int cmd_shaders(const Args& a) {
             continue;
         }
         ++translated;
-        // The forms it needs: a fragment program that reads a colour, a flat one.
+        // The forms it needs: a fragment program that reads a colour, a flat one, and two-sided ones where a vertex program
+        // writes a back colour.
         std::array<std::string, rsx::kVariants> variant_names{std::format("kSpirv{}", modules.size())};
         std::string variant_text;
         for (unsigned n = 1; n < rsx::kVariants; ++n) {
             const rsx::Variant v = rsx::variant_of(p->vertex, n);
             // (A number whose form isn't defined yet comes back as another's.)
-            const bool wanted = rsx::variant_number(v) == n && !p->vertex && (t->inputs & 6) && v.flat;
+            const bool wanted = rsx::variant_number(v) == n && !p->vertex && (t->inputs & 6) && (!v.two_sided || back_colours);
             if (!wanted) continue;
             const auto form = rsx::translate(*p, v);
             if (!form) throw Failure{std::format("{} (its form {})", form.error(), n)};

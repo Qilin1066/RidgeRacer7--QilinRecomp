@@ -12,7 +12,7 @@
 //     A component of an output the program doesn't write is (0, 0, 0, 1)'s: *a stated choice*.
 // Fragment programs
 //   - inputs: COL0 at location 1, COL1 at 2, FOGC at 5, TEXn at 7 + n (the vertex outputs' numbers); COL0 and COL1 flat in
-//     the flat form (Variant);
+//     the flat form, and with their back colours at 3 and 4 in the two-sided form (Variant);
 //   - inline constants: set 0, binding 1, a uniform block of vec4, one for each constant slot in the order they come
 //     (`constant_slots` says where each is in the microcode, for the renderer to read the game's values from it);
 //   - textures: set 1, binding n for texture unit n: a 2D or cube sampler, as the program's Cg parameters say;
@@ -34,12 +34,14 @@ namespace qilin::rsx {
 // A program's forms for draw state its plain translation can't serve, each a module of its own made at build time (a
 // decoration or a built-in can't be changed by the renderer). They are numbered for the shader table (shaders.hpp):
 //   fragment programs: 1 flat colours (COL0 and COL1, and the back colours, not interpolated: each primitive's provoking
-//     vertex's, which the renderer puts first), for SET_SHADE_MODE FLAT;
+//     vertex's, which the renderer puts first), for SET_SHADE_MODE FLAT; 2 two-sided colours (on a back face COL0 and COL1
+//     are the vertex program's back colours, BFC0 and BFC1 at locations 3 and 4), for SET_TWO_SIDE_LIGHT_EN; 3 both;
 struct Variant {
     bool flat = false;
+    bool two_sided = false;
 };
-constexpr unsigned variant_number(const Variant& v) { return v.flat ? 1u : 0u; }
-constexpr Variant variant_of(bool vertex, unsigned number) { return Variant{!vertex && (number & 1) != 0}; }
+constexpr unsigned variant_number(const Variant& v) { return (v.flat ? 1u : 0u) | (v.two_sided ? 2u : 0u); }
+constexpr Variant variant_of(bool vertex, unsigned number) { return Variant{!vertex && (number & 1) != 0, !vertex && (number & 2) != 0}; }
 constexpr unsigned kVariants = 4;  // numbers 0 (the plain form) to 3
 
 struct Translation {

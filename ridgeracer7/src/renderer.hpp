@@ -65,6 +65,7 @@ struct Draw {
     // Flat shading (SET_SHADE_MODE), and whether a primitive's first vertex gives its colour rather than its last
     // (SET_FLAT_SHADE_OP).
     bool flat = false, flat_first = false;
+    bool two_sided = false;  // back faces take the vertex program's back colours (SET_TWO_SIDE_LIGHT_EN)
     // The alpha test, for the fragment program (rsx_spirv.cpp): {reference, scale, -, -}, {less, equal, greater, -} passing.
     std::array<float, 8> alpha_test{0, 0, 0, 0, 1, 1, 1, 0};
     std::array<TextureUnit, 16> textures{};

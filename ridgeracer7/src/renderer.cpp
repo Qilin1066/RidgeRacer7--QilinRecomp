@@ -1270,6 +1270,16 @@ void renderer_draw(const Draw& d) {
         if (!fs.variant_spirv[forms.fragment])
             fatal("a draw with flat shading, and the fragment program at %08x has no flat form: translate the shaders again (qilin shaders)", fs.address);
     }
+    // Two-sided colours: a fragment program that reads a colour in its two-sided form, which reads the back colours (BFC0,
+    // BFC1) on back faces; the vertex program must write those it reads. (Which faces are front: as culling has it.)
+    if (d.two_sided && (fs.inputs & 6)) {
+        forms.fragment |= 2;
+        for (unsigned c = 0; c < 2; ++c)
+            if ((fs.inputs & (2u << c)) && !(vs.outputs & (8u << c)))
+                fatal("a draw with two-sided colours, and the vertex program at %08x writes no back colour BFC%u for the fragment program's COL%u", vs.address, c, c);
+        if (!fs.variant_spirv[forms.fragment])
+            fatal("a draw with two-sided colours, and the fragment program at %08x has no two-sided form: translate the shaders again (qilin shaders)", fs.address);
+    }
     static std::vector<uint32_t> made;  // the lists assemble() makes (kept: only the RSX's thread draws)
     const auto assembly = assemble(d.primitive, order, d.indexed, provoking, made);
     if (!assembly) fatal("%s", assembly.error().c_str());

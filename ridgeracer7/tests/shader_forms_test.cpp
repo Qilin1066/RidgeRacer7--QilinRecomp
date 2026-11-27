@@ -99,10 +99,40 @@ void test_flat() {
     CHECK(variant_number(Variant{.flat = true}) == 1 && variant_of(false, 1).flat && !variant_of(true, 1).flat);
 }
 
+// Whether the module has a built-in input of this number (OpDecorate BuiltIn, 11).
+bool has_built_in(const std::vector<uint32_t>& spirv, uint32_t built_in) {
+    for (const auto& in : instructions(spirv))
+        if ((in[0] & 0xffff) == 71 && in.size() >= 4 && in[2] == 11 && in[3] == built_in) return true;
+    return false;
+}
+
+void test_two_sided() {
+    // The two-sided form: the back colour at location 3 (BFC0) for COL0, 4 (BFC1) for COL1, and FrontFacing to choose.
+    const auto plain = translate(fragment_reading(1));
+    const auto two = translate(fragment_reading(1), Variant{.two_sided = true});
+    const auto two1 = translate(fragment_reading(2), Variant{.two_sided = true});
+    const auto both = translate(fragment_reading(1), Variant{.flat = true, .two_sided = true});
+    CHECK(plain && two && two1 && both);
+    if (!plain || !two || !two1 || !both) return;
+    write_out("fs_col0_two_sided", two->spirv);
+    write_out("fs_col0_flat_two_sided", both->spirv);
+    CHECK(!has_built_in(plain->spirv, 17) && at_location(plain->spirv, 3) == 0);
+    CHECK(has_built_in(two->spirv, 17) && at_location(two->spirv, 1) != 0 && at_location(two->spirv, 3) != 0 && at_location(two->spirv, 4) == 0);
+    CHECK(has_built_in(two1->spirv, 17) && at_location(two1->spirv, 4) != 0 && at_location(two1->spirv, 3) == 0);
+    // Both: front and back colours flat.
+    const std::vector<uint32_t> flat = decorated(both->spirv, 14);
+    CHECK(has(flat, at_location(both->spirv, 1)) && has(flat, at_location(both->spirv, 3)));
+    // A program reading no colour: nothing to choose.
+    const auto tex = translate(fragment_reading(4), Variant{.two_sided = true});
+    CHECK(tex && !has_built_in(tex->spirv, 17));
+    CHECK(variant_number(Variant{.flat = true, .two_sided = true}) == 3 && variant_of(false, 2).two_sided && !variant_of(false, 2).flat);
+}
+
 }  // namespace
 
 int main() {
     test_flat();
+    test_two_sided();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

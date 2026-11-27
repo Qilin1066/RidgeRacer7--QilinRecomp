@@ -73,7 +73,7 @@ std::span<const NativeSystemCall> tty_system_calls();     // tty.cpp
 std::span<const NativeSystemCall> event_system_calls();   // events.cpp
 std::span<const NativeSystemCall> timer_system_calls();   // timers.cpp
 std::span<const NativeSystemCall> spu_system_calls();  // spu.cpp
-// Makes a thread known to the system (threads.cpp).
+// Makes the first thread known to the system, as the calling host thread, holding a core token (threads.cpp).
 void add_thread(uint32_t id, int32_t priority);
 std::span<const NativeImport> thread_imports();  // threads.cpp
 

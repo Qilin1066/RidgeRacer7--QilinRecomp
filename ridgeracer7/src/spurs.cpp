@@ -273,8 +273,10 @@ void cellSpursShutdownTaskset(Cpu& c) {
 // cellSpursJoinTaskset(taskset): waits for every task to have exited, and forgets the taskset.
 void cellSpursJoinTaskset(Cpu& c) {
     const uint32_t taskset = static_cast<uint32_t>(c.r[3]);
+    Blocking blocking;  // (the core token while it waits: its tasks may wait on another guest thread)
     std::unique_lock lock(g_mutex);
     if (!g_tasksets.contains(taskset)) qilin::rt::fatal("cellSpursJoinTaskset on %08x, which is no taskset", taskset);
+    if (g_tasksets.at(taskset).running != 0) blocking.release();
     g_changed.wait(lock, [&] { return g_tasksets.at(taskset).running == 0; });
     g_tasksets.erase(taskset);
     c.r[3] = kOk;

@@ -259,6 +259,7 @@ void cellFsClose(Cpu& c) {
 void cellFsRead(Cpu& c) {
     const uint32_t buffer = static_cast<uint32_t>(c.r[4]), out = static_cast<uint32_t>(c.r[6]);
     const uint64_t bytes = c.r[5];
+    const ScopedBlocking blocking;  // (the core token, while the host reads: before the lock, so taken back after it)
     // Keep the handle alive through the read, as write and seek do. Another
     // guest thread may close it while this thread waits for renderer access.
     const std::lock_guard lock(g_mutex);
@@ -284,6 +285,7 @@ void cellFsRead(Cpu& c) {
 void cellFsWrite(Cpu& c) {
     const uint32_t buffer = static_cast<uint32_t>(c.r[4]), out = static_cast<uint32_t>(c.r[6]);
     const uint64_t bytes = c.r[5];
+    const ScopedBlocking blocking;  // (the core token, while the host writes)
     const std::lock_guard lock(g_mutex);
     Handle* h = handle(c.r[3], false);
     if (!h || !h->writable) {

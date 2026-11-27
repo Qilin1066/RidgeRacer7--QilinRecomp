@@ -62,12 +62,14 @@ void allocate_block(Cpu& c, bool waiting) {
         c.r[3] = 0;
         return;
     }
+    Blocking blocking;  // (the core token while it waits: taken back after the lock is let go)
     std::unique_lock lock(pool->mutex);
     if (pool->free.empty()) {
         if (!waiting) {
             c.r[3] = 0;
             return;
         }
+        blocking.release();
         pool->freed.wait(lock, [&] { return !pool->free.empty(); });
     }
     c.r[3] = pool->free.back();

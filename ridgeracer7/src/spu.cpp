@@ -797,6 +797,7 @@ void sys_spu_thread_group_start(Cpu& c) {
 // group; 2: every thread exited), and the status given.
 void sys_spu_thread_group_join(Cpu& c) {
     const uint32_t cause = static_cast<uint32_t>(c.r[4]), status = static_cast<uint32_t>(c.r[5]);
+    Blocking blocking;  // (the core token while it waits: its SPU threads may wait on another guest thread)
     std::unique_lock lock(g_mutex);
     const auto it = g_groups.find(static_cast<uint32_t>(c.r[3]));
     if (it == g_groups.end()) {
@@ -804,6 +805,7 @@ void sys_spu_thread_group_join(Cpu& c) {
         return;
     }
     const std::shared_ptr<Group> group = it->second;
+    if (!group->ended) blocking.release();
     group->changed.wait(lock, [&] { return group->ended; });
     if (cause) store32(cause, group->cause);
     if (status) store32(status, group->status);

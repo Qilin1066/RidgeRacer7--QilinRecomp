@@ -870,7 +870,6 @@ const FrameTimes& Display::frame_times() const { return impl_->times; }
 
 void Display::present_again() {
     Impl& d = *impl_;
-    d.counting = false;  // the pause isn't a frame time
     check(vkWaitForFences(d.gpu.device, 1, &d.done, VK_TRUE, UINT64_MAX), "vkWaitForFences");
     if (!d.shown_any) {  // nothing yet: black
         static const uint8_t black[4] = {0, 0, 0, 255};
@@ -879,6 +878,8 @@ void Display::present_again() {
     }
     d.show(d.last, d.last_had_second ? &d.last_second : nullptr);
 }
+
+void Display::pause_frame_times() { impl_->counting = false; }
 
 Gpu& Display::gpu() { return impl_->gpu; }
 
@@ -961,6 +962,14 @@ void Display::set_fullscreen(bool on) {
     SDL_SetWindowFullscreen(impl_->window, on);
 }
 const std::string& Display::mode_note() const { return impl_->mode_note; }
+
+double Display::refresh_hz() const {
+    if (!impl_->window) return 0;
+    const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(impl_->window));
+    if (!m) return 0;
+    return m->refresh_rate_numerator && m->refresh_rate_denominator ? double(m->refresh_rate_numerator) / double(m->refresh_rate_denominator)
+                                                                    : double(m->refresh_rate);
+}
 
 std::vector<std::string> Display::monitors() const {
     std::vector<std::string> out;

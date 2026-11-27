@@ -119,7 +119,7 @@ target_compile_definitions(qilin PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 enable_testing()
 find_package(Threads REQUIRED)
 add_executable(ridgeracer7_runtime_io_test ridgeracer7/tests/runtime_io_test.cpp
-    ridgeracer7/src/fs.cpp ridgeracer7/src/threads.cpp)
+    ridgeracer7/src/fs.cpp ridgeracer7/src/threads.cpp ridgeracer7/src/kernel_sched.cpp)
 target_include_directories(ridgeracer7_runtime_io_test PRIVATE recomp/src runtime/include ridgeracer7/src)
 target_link_libraries(ridgeracer7_runtime_io_test PRIVATE qilin_warnings Threads::Threads)
 foreach(case open read-close threads)
@@ -133,6 +133,16 @@ target_link_libraries(ridgeracer7_spu_test PRIVATE qilin_game qilin_warnings Thr
 foreach(case tasks group)
     add_test(NAME ridgeracer7_spu_${case} COMMAND ridgeracer7_spu_test ${case})
     set_tests_properties(ridgeracer7_spu_${case} PROPERTIES TIMEOUT 60)
+endforeach()
+# The scheduler and the synchronisation objects' waking orders, with guest memory stood in.
+add_executable(ridgeracer7_sched_test ridgeracer7/tests/sched_test.cpp
+    ridgeracer7/src/kernel_sched.cpp ridgeracer7/src/sync.cpp ridgeracer7/src/sync_calls.cpp ridgeracer7/src/events.cpp)
+target_include_directories(ridgeracer7_sched_test PRIVATE recomp/src runtime/include ridgeracer7/src)
+target_link_libraries(ridgeracer7_sched_test PRIVATE qilin_warnings Threads::Threads)
+foreach(case fast priority two-tokens switch-point yield blocking sleep lend free mutex-fifo mutex-priority semaphore-fifo
+        semaphore-priority lwmutex-fifo lwmutex-priority cond-priority cond-timeout events-fifo events-priority events-cancel stress)
+    add_test(NAME ridgeracer7_sched_${case} COMMAND ridgeracer7_sched_test ${case})
+    set_tests_properties(ridgeracer7_sched_${case} PROPERTIES TIMEOUT 30)
 endforeach()
 add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_game qilin_recomp qilin_warnings)
@@ -177,6 +187,27 @@ if(QILIN_HOST)
     target_include_directories(qilin_volk PUBLIC ${volk_SOURCE_DIR})
     target_link_libraries(qilin_volk PUBLIC Vulkan::Headers ${CMAKE_DL_LIBS})
     target_compile_definitions(qilin_volk PUBLIC VK_NO_PROTOTYPES)
+
+    # Dear ImGui (MIT) for the settings menu, as the other Qilin recomps draw
+    # theirs: the same commit (v1.93.0), its core and its SDL3 and Vulkan
+    # backends, fetched and pinned. Its Vulkan backend loads its functions
+    # through volk (no prototypes).
+    FetchContent_Declare(imgui
+        URL https://github.com/ocornut/imgui/archive/c1aaac65e896a45f81f47a4d68f9959e0f86c859.tar.gz
+        URL_HASH SHA256=b3d8f99838bb3ff05e14185562345f85e00c032da4d8fc277608d7898d847114)
+    FetchContent_MakeAvailable(imgui)
+    add_library(qilin_imgui STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+    target_include_directories(qilin_imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+    target_compile_definitions(qilin_imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_NO_PROTOTYPES IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+    target_link_libraries(qilin_imgui PUBLIC SDL3::SDL3-static Vulkan::Headers)
+    if(MSVC)
+        target_compile_options(qilin_imgui PRIVATE /W0)  # third-party code: its warnings aren't ours
+    else()
+        target_compile_options(qilin_imgui PRIVATE -w)
+    endif()
 
     add_library(qilin_host STATIC host/src/vulkan.cpp host/src/display.cpp host/src/audio.cpp host/src/paths.cpp)
     target_include_directories(qilin_host PUBLIC host/include)
@@ -237,16 +268,19 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/gcm.cpp
     ridgeracer7/src/imports.cpp
     ridgeracer7/src/kernel.cpp
+    ridgeracer7/src/kernel_sched.cpp
     ridgeracer7/src/machine.cpp
     ridgeracer7/src/memory.cpp
     ridgeracer7/src/mempool.cpp
     ridgeracer7/src/net.cpp
     ridgeracer7/src/np.cpp
     ridgeracer7/src/pad.cpp
+    ridgeracer7/src/pause.cpp
     ridgeracer7/src/renderer.cpp
     ridgeracer7/src/textures.cpp
     ridgeracer7/src/rtc.cpp
     ridgeracer7/src/savedata.cpp
+    ridgeracer7/src/settings.cpp
     ridgeracer7/src/film.cpp
     ridgeracer7/src/atrac.cpp
     ridgeracer7/src/rsx.cpp
@@ -273,6 +307,19 @@ endif()
 target_link_libraries(ridgeracer7_machine PUBLIC qilin_game qilin_rt qilin_host PRIVATE qilin_warnings freetype qilin_ffmpeg)
 # FreeType's headers are not ours to warn about.
 target_include_directories(ridgeracer7_machine SYSTEM PRIVATE $<TARGET_PROPERTY:freetype,INTERFACE_INCLUDE_DIRECTORIES>)
+# The settings menu (Dear ImGui over the window): built always, so that CI compiles it.
+add_library(ridgeracer7_window STATIC ridgeracer7/src/menu.cpp)
+target_link_libraries(ridgeracer7_window PUBLIC ridgeracer7_machine qilin_host qilin_imgui SDL3::SDL3-static PRIVATE qilin_warnings)
+target_compile_definitions(ridgeracer7_window PRIVATE RIDGERACER7_VERSION="${PROJECT_VERSION}")
+if(NOT MSVC)
+    target_compile_options(ridgeracer7_window PRIVATE -Wno-missing-field-initializers)
+endif()
+# The settings file and the controller from its bindings, and the pause's holding and letting go: no game, no window.
+add_executable(ridgeracer7_settings_test ridgeracer7/tests/settings_test.cpp ridgeracer7/src/settings.cpp ridgeracer7/src/pause.cpp)
+target_include_directories(ridgeracer7_settings_test PRIVATE recomp/src runtime/include ridgeracer7/src host/include)
+target_link_libraries(ridgeracer7_settings_test PRIVATE qilin_rt qilin_warnings Threads::Threads)
+add_test(NAME ridgeracer7_settings_test COMMAND ridgeracer7_settings_test)
+set_tests_properties(ridgeracer7_settings_test PROPERTIES TIMEOUT 20)
 set(QILIN_GEN_DIR "" CACHE PATH "The folder `qilin lift <game> --out` wrote: the lifted code of your own copy")
 if(QILIN_GEN_DIR)
     if(NOT EXISTS "${QILIN_GEN_DIR}/table.cpp" OR NOT EXISTS "${QILIN_GEN_DIR}/spu_table.cpp")
@@ -293,7 +340,7 @@ if(QILIN_GEN_DIR)
     endif()
     add_executable(ridgeracer7 ridgeracer7/src/main.cpp ${qilin_lifted})
     target_include_directories(ridgeracer7 PRIVATE "${QILIN_GEN_DIR}")
-    target_link_libraries(ridgeracer7 PRIVATE ridgeracer7_machine qilin_host SDL3::SDL3-static qilin_warnings)
+    target_link_libraries(ridgeracer7 PRIVATE ridgeracer7_machine ridgeracer7_window qilin_host SDL3::SDL3-static qilin_warnings)
     # Lifted code is generated: its unused labels and the like are not warnings worth reading.
     if(MSVC)
         set_source_files_properties(${qilin_lifted} PROPERTIES COMPILE_OPTIONS "/w;/bigobj")

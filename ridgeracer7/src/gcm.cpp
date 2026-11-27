@@ -19,6 +19,7 @@
 #include <thread>
 
 #include "kernel.hpp"
+#include "pause.hpp"
 #include "qilin/rt/report.hpp"
 
 namespace rr7 {
@@ -96,10 +97,12 @@ void command_buffer_callback(Cpu& c) {
     }
     store32(current, 0x20000000u | begin);  // a jump
     store32(control, begin);                // put
-    for (;;) {
+    Blocking blocking;  // (the core token, if the RSX keeps it waiting: the RSX may be waiting on another guest thread)
+    for (int spins = 0;; ++spins) {
         const uint32_t get = load32(control + 4);
         if (get < next || get > end) break;
         if (get == begin) break;  // it has taken the jump and waits there: the piece is free
+        if (spins == 64) blocking.release();
         std::this_thread::yield();
     }
     store32(context, io + begin);
@@ -295,6 +298,8 @@ void vblank_thread() {
     // (From the next blank on the shared clock.)
     const auto since = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - g_vblank_origin).count();
     for (uint64_t n = static_cast<uint64_t>(since) * 60 / 1001000000ull + 1;; ++n) {
+        // Held while the settings menu pauses the game (pause.hpp), then on from the next blank, not catching up.
+        if (hold_while_paused(HoldPoint::vertical_blank)) n = next_vertical_blank();
         std::this_thread::sleep_until(vblank_time(n));
         g_vblanks.store(n, std::memory_order_relaxed);
         if (const uint32_t handler = g_vblank_handler.load()) {

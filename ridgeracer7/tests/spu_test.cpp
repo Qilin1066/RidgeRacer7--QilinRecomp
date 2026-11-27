@@ -293,6 +293,10 @@ void spurs_task_exited(const SpuTaskSetup&, uint32_t status) {
     exits_changed.notify_all();
 }
 void spurs_task_wait_signal(const SpuTaskSetup&) {}
+// The scheduler (kernel_sched.cpp): the test's threads hold no core token.
+bool holds_core() { return false; }
+void give_up_core() {}
+void take_core() {}
 }  // namespace rr7
 
 namespace qilin::rt {

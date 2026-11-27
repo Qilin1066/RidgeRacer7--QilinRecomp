@@ -1,5 +1,5 @@
 // The RSX's drawing state as the renderer gives it to Vulkan: how primitives are assembled, how polygons are rasterised,
-// the window's place on the surface. Pure functions, tested without a GPU (ridgeracer7/tests/render_test.cpp); what Vulkan can't do the same way is refused
+// the window's place on the surface, the logic operations. Pure functions, tested without a GPU (ridgeracer7/tests/render_test.cpp); what Vulkan can't do the same way is refused
 // by name, never approximated.
 //
 // Runtime code: no std::format.
@@ -58,6 +58,10 @@ struct PolygonState {
     bool edge_flag = true;
 };
 std::expected<Rasterisation, std::string> rasterisation(uint32_t primitive, const PolygonState& s);
+
+// A logic operation (SET_LOGIC_OP: OpenGL's CLEAR 0x1500 to SET 0x150F) as Vulkan's VkLogicOp, which lists them in the same
+// order; none for any other value.
+std::optional<uint32_t> logic_op(uint32_t gl);
 
 // The window's place on the surface: the viewport as the translated vertex programs take it (rsx_spirv.hpp: clip_xy,
 // clip_z, for a Vulkan viewport covering the surface) and the scissor, in the surface's pixels, clipped to it. The RSX's

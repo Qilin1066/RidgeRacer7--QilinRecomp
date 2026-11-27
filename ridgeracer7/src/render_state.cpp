@@ -115,6 +115,11 @@ std::expected<Rasterisation, std::string> rasterisation(uint32_t primitive, cons
     return Rasterisation{mode, bias};
 }
 
+std::optional<uint32_t> logic_op(uint32_t gl) {
+    if (gl < 0x1500 || gl > 0x150f) return std::nullopt;
+    return gl - 0x1500;
+}
+
 WindowMapping window_mapping(const Draw& d) {
     WindowMapping w;
     const float width = static_cast<float>(d.color.width), height = static_cast<float>(d.color.height);

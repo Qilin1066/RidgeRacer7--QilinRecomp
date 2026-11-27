@@ -160,7 +160,7 @@ struct WordsHash {
     }
 };
 // A pipeline's key: the programs and every piece of state that goes into it (pipeline_for), as words.
-using PipelineKey = std::array<uint32_t, 40>;
+using PipelineKey = std::array<uint32_t, 42>;
 
 struct Renderer {
     host::Gpu* gpu = nullptr;
@@ -475,6 +475,8 @@ VkStencilOpState stencil_state(const Draw::Stencil& s) {
     return v;
 }
 
+static_assert(VK_LOGIC_OP_CLEAR == 0 && VK_LOGIC_OP_COPY == 3 && VK_LOGIC_OP_XOR == 6 && VK_LOGIC_OP_SET == 15, "Vulkan lists the logic operations in OpenGL's order (logic_op)");
+
 VkPrimitiveTopology vulkan_topology(Topology t) {
     switch (t) {
     case Topology::points: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
@@ -496,7 +498,7 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
                               d.stencil_front.zpass, d.stencil_back.func, d.stencil_back.ref, d.stencil_back.func_mask, d.stencil_back.write_mask, d.stencil_back.fail,
                               d.stencil_back.zfail, d.stencil_back.zpass,
                               std::bit_cast<uint32_t>(d.bias_factor), std::bit_cast<uint32_t>(d.bias_units),
-                              d.depth_bounds, std::bit_cast<uint32_t>(d.bounds_min), std::bit_cast<uint32_t>(d.bounds_max), static_cast<uint32_t>(rasterising.mode)};
+                              d.depth_bounds, std::bit_cast<uint32_t>(d.bounds_min), std::bit_cast<uint32_t>(d.bounds_max), static_cast<uint32_t>(rasterising.mode), d.logic, d.logic ? d.logic_op : 0u};
     auto& p = g_renderer->pipelines[key];
     if (p) return p;
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -548,6 +550,14 @@ VkPipeline pipeline_for(const Draw& d, const qilin::rt::TranslatedShader& vs, co
     }
     VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blending.attachmentCount = 1, blending.pAttachments = &blend;
+    if (d.logic) {
+        // In place of blending, in Vulkan as on the RSX. (Vulkan applies none to a float surface.)
+        const std::optional<uint32_t> op = logic_op(d.logic_op);
+        if (!op) fatal("a logic operation %#x, which the renderer doesn't know", d.logic_op);
+        if (!g_renderer->gpu->logic_op) fatal("a draw with a logic operation, which this GPU can't (logicOp)");
+        if (format == VK_FORMAT_R32_SFLOAT) fatal("a logic operation on a float surface, which Vulkan doesn't apply");
+        blending.logicOpEnable = VK_TRUE, blending.logicOp = static_cast<VkLogicOp>(*op);
+    }
     const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = 2, dynamic.pDynamicStates = dynamic_states;

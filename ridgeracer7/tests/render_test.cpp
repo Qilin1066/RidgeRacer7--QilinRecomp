@@ -349,6 +349,12 @@ void test_window() {
     CHECK(w.x0 == 200 && w.x1 == 200);
 }
 
+void test_logic_op() {
+    // OpenGL's CLEAR to SET are Vulkan's VkLogicOp in the same order: COPY 0x1503 is 3, XOR 0x1506 6, SET 0x150F 15.
+    CHECK(rr7::logic_op(0x1500) == 0u && rr7::logic_op(0x1503) == 3u && rr7::logic_op(0x1506) == 6u && rr7::logic_op(0x150f) == 15u);
+    CHECK(!rr7::logic_op(0x14ff) && !rr7::logic_op(0x1510) && !rr7::logic_op(0));
+}
+
 }  // namespace
 
 int main() {
@@ -364,6 +370,7 @@ int main() {
     test_assembly();
     test_rasterisation();
     test_window();
+    test_logic_op();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

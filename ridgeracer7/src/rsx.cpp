@@ -254,10 +254,11 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         d.stencil_front = side(0x0328);
         d.stencil_back = state(0x0348) ? side(0x0348) : d.stencil_front;
     }
-    // State this renderer doesn't take, refused by name rather than ignored: flat shading, logic operations, two-sided vertex
-    // colours, user clip planes, polygon stipple.
+    // State this renderer doesn't take, refused by name rather than ignored: flat shading, two-sided vertex colours, user clip
+    // planes, polygon stipple.
     if (state(0x0368) == 0x1d00) fatal("a draw with flat shading, which the renderer doesn't take yet (at offset %08x)", at);
-    if (state(0x0374)) fatal("a draw with a logic operation (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x0378), at);
+    // A logic operation (SET_LOGIC_OP_ENABLE, SET_LOGIC_OP: OpenGL's), which replaces blending.
+    if (state(0x0374)) d.logic = true, d.logic_op = state(0x0378);
     if (state(0x142c)) fatal("a draw with two-sided vertex colours, which the renderer doesn't take yet (at offset %08x)", at);
     if (state(0x1478)) fatal("a draw with user clip planes (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x1478), at);
     if (state(0x147c)) fatal("a draw with polygon stipple, which the renderer doesn't take yet (at offset %08x)", at);

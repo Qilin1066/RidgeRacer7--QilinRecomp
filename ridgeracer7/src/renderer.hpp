@@ -58,6 +58,8 @@ struct Draw {
     uint32_t scissor_x = 0, scissor_y = 0, scissor_width = 0, scissor_height = 0;
     bool blend = false;
     uint32_t blend_src = 0, blend_dst = 0, blend_equation = 0;
+    bool logic = false;      // a logic operation in place of blending (SET_LOGIC_OP_ENABLE)
+    uint32_t logic_op = 0;   // OpenGL's CLEAR 0x1500 to SET 0x150F (SET_LOGIC_OP)
     bool cull = false;
     uint32_t cull_face = 0, front_face = 0;
     // The alpha test, for the fragment program (rsx_spirv.cpp): {reference, scale, -, -}, {less, equal, greater, -} passing.

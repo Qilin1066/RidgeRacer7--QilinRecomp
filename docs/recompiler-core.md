@@ -116,7 +116,7 @@ The roadmap's open question was the reference: binutils dropped the SPU after it
 
 `qilin spu-profile`: the 42 programs' **209,492 words; 209,488 decode**. The other four are the one jump table in all of the SPU code (four addresses after a `bi`, in the sound core).
 
-- **147 of the 199 instructions are used.** The most frequent: `lqd`, `il`, `stqd`, `shufb`, `ai`, `ori`, `rotqby`, `lqx`: loads, constants and shuffles, as SPU code is.
+- **147 of the 199 instructions are used.** The most frequent: `lqd`, `il`, `stqd`, `shufb`, `ai`, `ori`, `rotqby`, `lqx`: loads, constants and shuffles, as SPU code is. So `spu.hpp`'s `shufb` builds a word at a time from picks read straight from the source words, and the byte shifts and rotates (`rotqby` and its kin) work on the register as two 64-bit halves (checked against the byte-at-a-time versions they replaced on 21 million cases, and by the differential test).
 - **Floating point is single precision**: `fma` (3,690), `fm`, `fs`, `fcgt`, `fnms`, `fa`, the estimates (`frest`, `frsqest` with `fi`). Double precision appears in two programs only (`dfm`, `dfs`, `dfa`, 219 words), and the double fused forms and compares not at all.
 - **5,547 channel writes and 845 reads**: the programs talk to the system through channels (memory transfers, signals, the mailboxes), which is what the runtime has to provide in place of an SPU's hardware.
 - 4,714 branch hints (`hbra`, `hbr`, `hbrr`): no effect on what a program computes; the lifter drops them.

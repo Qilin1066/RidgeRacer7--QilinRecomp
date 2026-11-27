@@ -1307,6 +1307,8 @@ void renderer_draw(const Draw& d) {
     const auto raster = rasterisation(d.primitive, {d.front_polygon_mode, d.back_polygon_mode, d.cull, d.cull_face, d.offset_point, d.offset_line, d.offset_fill, d.edge_flag});
     if (!raster) fatal("a draw of %s, which the renderer doesn't take yet", raster.error().c_str());
     if (raster->mode != PolygonMode::fill && !gpu.fill_non_solid) fatal("a draw of polygons as lines or points, which this GPU can't (fillModeNonSolid)");
+    if (d.line_stipple && (assembly->topology == Topology::lines || assembly->topology == Topology::line_strip || raster->mode == PolygonMode::line))
+        fatal("a draw of lines with line stipple, which Vulkan 1.3 doesn't have");
     uint32_t pixel_bytes = 0;
     const VkFormat format = surface_format(d.color.format, pixel_bytes);
 

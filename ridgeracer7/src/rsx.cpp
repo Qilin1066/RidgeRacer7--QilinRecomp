@@ -276,6 +276,8 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         if (const uint32_t test = (d.clip_planes >> (4 * n)) & 0xf; test > 2 || (n >= 6 && test))
             fatal("a draw with user clip plane %u's test %u, which the renderer doesn't know (at offset %08x)", n, test, at);
     if (state(0x147c)) fatal("a draw with polygon stipple, which the renderer doesn't take yet (at offset %08x)", at);
+    // Line stipple (SET_LINE_STIPPLE): refused by the renderer where lines are drawn (Vulkan 1.3 has none either).
+    d.line_stipple = state(0x1db4) != 0;
     // The alpha test (SET_ALPHA_FUNC: OpenGL's NEVER 0x200 to ALWAYS 0x207, bit 0 less, bit 1 equal, bit 2 greater; SET_ALPHA_REF):
     // on 8-bit surfaces the reference's low byte against the alpha as stored. *Its reference on a float surface isn't known here.*
     if (state(0x0304)) {

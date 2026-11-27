@@ -29,14 +29,20 @@
 // **Not as a console does it, and to be kept in mind:** SPU threads run
 // freely, each on a host thread, with no priorities (the scheduler is to
 // come).
+//
+// What a start costs is kept small, since a SPURS frame starts many tasks:
+// each ELF file is parsed once (and checked against its headers at every
+// use), local stores are kept zeroed between threads, and a task's host
+// thread is kept for the next task when it ends.
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
-#include <functional>
+#include <expected>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -56,16 +62,142 @@ namespace rr7 {
 
 namespace {
 
-// SPURS tasks' times (spu_report): starting them, and running them, by program.
+// SPURS tasks' times (spu_report): starting them; running them is counted by program (Program).
 using Clock = std::chrono::steady_clock;
 uint64_t since_ns(Clock::time_point t) { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
 std::atomic<uint64_t> g_tasks_started{0}, g_task_setup_ns{0};
-std::mutex g_task_times_mutex;
-std::map<std::string, std::pair<uint64_t, uint64_t>> g_task_times;  // by program name: runs, nanoseconds
 
 using qilin::rt::fatal;
+using qilin::rt::kSpuLocalStore;
 using qilin::rt::Spu;
 using qilin::rt::SpuReg;
+
+// Big-endian numbers in the SPU's memory or the game's.
+uint32_t be32(const uint8_t* p) {
+    uint32_t v;
+    std::memcpy(&v, p, 4);
+    return std::endian::native == std::endian::little ? std::byteswap(v) : v;
+}
+void put_be32(uint8_t* p, uint32_t v) {
+    if constexpr (std::endian::native == std::endian::little) v = std::byteswap(v);
+    std::memcpy(p, &v, 4);
+}
+uint32_t be16(const uint8_t* p) { return (uint32_t{p[0]} << 8) | p[1]; }
+
+// ---------------------------------------------------------------- programs and local stores
+
+// An SPU program as the game's memory holds it, parsed once: the system is handed the same few dozen ELF files again and
+// again (a SPURS task is started from its ELF every time). Kept by the file's address and checked at every use against
+// the headers there now (the ELF header, the program headers and the section headers, which hold everything loading
+// uses), so a different program put at the same address is parsed afresh. (Only the name, from a note's contents, could
+// change unseen: it is used for messages and spu_report.)
+struct Program {
+    uint32_t address = 0;
+    qilin::SpuImage image;
+    const qilin::rt::LiftedSpuProgram* lifted = nullptr;  // null: not among the lifted (a thread of it stops the game)
+    std::array<uint8_t, 52> header{};                     // the ELF header as parsed: where the two tables are
+    std::vector<uint8_t> segments, sections;              // the program and section headers as parsed
+    std::atomic<uint64_t> runs{0}, ns{0};                 // as SPURS tasks, for spu_report
+};
+std::mutex g_programs_mutex;
+std::map<uint32_t, std::shared_ptr<Program>> g_programs;  // by address
+
+// A table of headers: where in the file the ELF header puts it, and its length.
+struct Table {
+    uint32_t offset, bytes;
+};
+Table program_headers(const uint8_t* file) { return {be32(file + 28), be16(file + 42) * be16(file + 44)}; }
+Table section_headers(const uint8_t* file) { return {be32(file + 32), be16(file + 46) * be16(file + 48)}; }
+
+bool unchanged(const Program& p, const uint8_t* file) {
+    // (The same ELF header puts the two tables in the same places.)
+    return std::memcmp(file, p.header.data(), p.header.size()) == 0 &&
+           std::memcmp(file + program_headers(file).offset, p.segments.data(), p.segments.size()) == 0 &&
+           std::memcmp(file + section_headers(file).offset, p.sections.data(), p.sections.size()) == 0;
+}
+
+// The program whose ELF file is at `address` in the game's memory, or why there is none.
+std::expected<std::shared_ptr<Program>, std::string> program_at(uint32_t address) {
+    const uint8_t* const file = guest_memory() + address;
+    {
+        const std::lock_guard lock(g_programs_mutex);
+        if (const auto it = g_programs.find(address); it != g_programs.end() && unchanged(*it->second, file)) return it->second;
+    }
+    auto parsed = qilin::parse_spu_image({file, 0x40000}, address);
+    if (!parsed) return std::unexpected(std::move(parsed.error()));
+    auto program = std::make_shared<Program>();
+    program->address = address;
+    program->image = std::move(*parsed);
+    for (const qilin::rt::LiftedSpuProgram& lifted : spu_programs())
+        if (lifted.address == address) program->lifted = &lifted;
+    std::memcpy(program->header.data(), file, program->header.size());
+    const Table segments = program_headers(file), sections = section_headers(file);  // (within the file: parsing checked)
+    program->segments.assign(file + segments.offset, file + segments.offset + segments.bytes);
+    program->sections.assign(file + sections.offset, file + sections.offset + sections.bytes);
+    const std::lock_guard lock(g_programs_mutex);
+    g_programs.insert_or_assign(address, program);
+    return program;
+}
+
+// The lifted code of a program a thread is to run: every SPU program must be known when the game is built.
+const qilin::rt::LiftedSpuProgram& lifted(const Program& program) {
+    if (!program.lifted)
+        fatal("the game starts an SPU program at %08x (%s) that is not among the %zu lifted: every SPU program must be known when the game is built", program.address,
+              program.image.name.c_str(), spu_programs().size());
+    return *program.lifted;
+}
+
+// An SPU's 256 KiB of memory, all zeroes when had. Kept for the next thread when one is done with it, and zeroed then by
+// the thread giving it back: a SPURS task is given a fresh local store each time it starts and gives it back on its own
+// host thread as it ends, so its starter only copies the program in.
+class LocalStore {
+public:
+    LocalStore() = default;
+    LocalStore(const LocalStore&) = delete;
+    LocalStore& operator=(const LocalStore&) = delete;
+    ~LocalStore() { give_back(std::move(bytes_)); }
+
+    uint8_t* data() const { return bytes_.get(); }
+    bool empty() const { return !bytes_; }
+    // A zeroed local store in place of the one held, if any.
+    void renew() {
+        give_back(std::move(bytes_));
+        bytes_ = take();
+    }
+
+private:
+    static constexpr size_t kKept = 16;  // the most kept (4 MiB): more than the game runs at once
+    struct Kept {
+        std::mutex mutex;
+        std::vector<std::unique_ptr<uint8_t[]>> stores;
+    };
+    // (Never destroyed: a host thread may give one back as the process ends.)
+    static Kept& kept() {
+        static Kept& k = *new Kept;
+        return k;
+    }
+    static std::unique_ptr<uint8_t[]> take() {
+        {
+            Kept& k = kept();
+            const std::lock_guard lock(k.mutex);
+            if (!k.stores.empty()) {
+                auto store = std::move(k.stores.back());
+                k.stores.pop_back();
+                return store;
+            }
+        }
+        return std::make_unique<uint8_t[]>(kSpuLocalStore);  // (zeroed)
+    }
+    static void give_back(std::unique_ptr<uint8_t[]> store) {
+        if (!store) return;
+        std::memset(store.get(), 0, kSpuLocalStore);
+        Kept& k = kept();
+        const std::lock_guard lock(k.mutex);
+        if (k.stores.size() < kKept) k.stores.push_back(std::move(store));
+    }
+
+    std::unique_ptr<uint8_t[]> bytes_;
+};
 
 constexpr uint64_t kSpuUserEvent = 0xFFFFFFFF53505501ull;  // where a thread's own events say they come from
 constexpr uint32_t kJoinGroupExit = 1, kJoinAllThreadsExit = 2;
@@ -76,11 +208,9 @@ struct Thread {
     uint32_t id = 0;
     Group* group = nullptr;
     std::string name;
-    const qilin::rt::LiftedSpuProgram* program = nullptr;
-    qilin::SpuImage image;
-    uint32_t image_address = 0;  // the ELF file, in the game's memory
+    std::shared_ptr<Program> program;  // its ELF file in the game's memory, and its lifted code
     uint64_t arguments[4] = {};
-    std::vector<uint8_t> ls;
+    LocalStore ls;
     Spu spu;
     std::thread host;
 
@@ -124,12 +254,16 @@ std::atomic<void (*)(uint32_t)> g_atomic_watch{nullptr};
 // Where a task's SPURS kernel is, in its local store below the program (spu.cpp's prepare): its context and its entry.
 constexpr uint32_t kTaskContext = 0x2d00, kKernelEntry = 0x2e00;
 
+// forbid_spu_transfers' ranges: few, only ever added, and read by every transfer without a lock (an entry is written
+// before the count that takes it in).
 struct Forbidden {
-    uint32_t address, size;
-    const char* what;
+    uint32_t address = 0, size = 0;
+    const char* what = nullptr;
 };
-std::mutex g_forbidden_mutex;
-std::vector<Forbidden> g_forbidden;  // forbid_spu_transfers
+constexpr size_t kMostForbidden = 32;
+std::mutex g_forbidden_mutex;  // (those adding)
+std::array<Forbidden, kMostForbidden> g_forbidden{};
+std::atomic<size_t> g_forbidden_count{0};
 
 struct ThreadExit {
     uint32_t status;
@@ -149,7 +283,7 @@ std::string guest_string(uint32_t address, size_t most) {
 // ---------------------------------------------------------------- memory transfers
 
 uint8_t* local(Thread& t, uint32_t address, uint32_t size, uint32_t pc) {
-    if (address > qilin::rt::kSpuLocalStore || size > qilin::rt::kSpuLocalStore - address)
+    if (address > kSpuLocalStore || size > kSpuLocalStore - address)
         fatal("SPU thread %s: a transfer of %u bytes at %05x of its memory, which runs off the end (at %05x)", t.name.c_str(), size, address, pc);
     return t.ls.data() + address;
 }
@@ -160,10 +294,9 @@ uint8_t* shared(Thread& t, uint32_t address, uint32_t size, uint32_t pc) {
 }
 
 void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
-    {
+    if (const size_t forbidden = g_forbidden_count.load(std::memory_order_acquire)) {
         const uint32_t bytes = std::max<uint32_t>(t.size, 128);  // (an atomic transfer is a 128-byte line)
-        const std::lock_guard lock(g_forbidden_mutex);
-        for (const Forbidden& f : g_forbidden)
+        for (const Forbidden& f : std::span(g_forbidden.data(), forbidden))
             if (t.eah == 0 && t.eal < f.address + f.size && f.address < t.eal + bytes)
                 fatal("SPU program %s transfers (command %#x) at %08x, inside %s at %08x, which this runtime keeps natively: its layout is the SDK's, not known here (at %05x)",
                       t.name.c_str(), command, t.eal, f.what, f.address, pc);
@@ -181,8 +314,7 @@ void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
         uint32_t at = t.lsa;
         const uint8_t* const list = local(t, t.eal & 0x3fff8u, t.size, pc);
         for (uint32_t i = 0; i + 8 <= t.size; i += 8) {
-            const uint32_t first = (uint32_t{list[i]} << 24) | (uint32_t{list[i + 1]} << 16) | (uint32_t{list[i + 2]} << 8) | list[i + 3];
-            const uint32_t address = (uint32_t{list[i + 4]} << 24) | (uint32_t{list[i + 5]} << 16) | (uint32_t{list[i + 6]} << 8) | list[i + 7];
+            const uint32_t first = be32(list + i), address = be32(list + i + 4);
             const uint32_t bytes = first & 0x7fffu;
             if (first & 0x80000000u) fatal("SPU thread %s: a transfer list that asks to stall and notify, which this runtime doesn't provide yet (at %05x)", t.name.c_str(), pc);
             // Each piece lies in the SPU's memory where its address's low four bits put it within a quadword.
@@ -247,7 +379,7 @@ void interrupt_word(Thread& t, uint32_t value, uint32_t pc) {
     uint32_t queue = 0, data1;
     {
         const std::lock_guard lock(t.mutex);
-        if (t.task) queue = t.setup.port_queue(port);
+        if (t.task) queue = spurs_port_queue(t.setup.spurs, port);
         else if (const auto it = t.ports.find(port); it != t.ports.end()) queue = it->second;
         data1 = t.out_mailbox;
     }
@@ -350,7 +482,7 @@ void native_call(Spu& s, uint32_t target, uint32_t pc) {
     switch (call) {
     case 0: throw ThreadExit{0};
     case 2:
-        t.setup.wait_signal();
+        spurs_task_wait_signal(t.setup);
         s.r[3] = SpuReg{};
         return;
     default: fatal("SPURS task %s calls the kernel with %u, which this runtime doesn't provide yet (at %05x)", t.name.c_str(), call, pc);
@@ -363,7 +495,7 @@ const qilin::rt::SpuHooks kHooks{read_channel, write_channel, channel_count, sto
 
 void finish(Thread& t, uint32_t cause, uint32_t status) {
     if (t.task) {
-        t.setup.exited(status);
+        spurs_task_exited(t.setup, status);
         // Its record goes with it: the game starts tasks every frame, each with its own local store.
         const std::lock_guard lock(g_mutex);
         g_threads.erase(t.id);
@@ -394,14 +526,13 @@ void run_thread(std::shared_ptr<Thread> thread) {
         Clock::time_point started;
         ~Timed() {
             if (!t.task) return;
-            const uint64_t ns = since_ns(started);
-            const std::lock_guard lock(g_task_times_mutex);
-            auto& [runs, total] = g_task_times[t.name];
-            ++runs, total += ns;
+            t.program->ns.fetch_add(since_ns(started), std::memory_order_relaxed);
+            t.program->runs.fetch_add(1, std::memory_order_relaxed);
         }
     } timed{t, started};
     try {
-        t.program->call(t.spu, t.image.entry, t.image.entry);
+        const uint32_t entry = t.program->image.entry;
+        t.program->lifted->call(t.spu, entry, entry);
         fatal("SPU thread %s: its program returned from its entry point", t.name.c_str());
     } catch (const ThreadExit& exit) {
         finish(t, 0, exit.status);
@@ -413,18 +544,60 @@ void run_thread(std::shared_ptr<Thread> thread) {
     }
 }
 
+// The host threads SPURS tasks run on. A task is handed to one waiting for work, or to a new one if none is (so every task
+// still starts at once, as when each had a thread of its own); a thread whose task has ended waits for the next. Making a
+// host thread costs more than many a task's whole run.
+class TaskHosts {
+public:
+    void run(std::shared_ptr<Thread> task) {
+        {
+            const std::lock_guard lock(mutex_);
+            if (idle_ > 0) {
+                --idle_;  // (that thread's: so no more tasks are handed over than there are threads waiting)
+                handed_.push_back(std::move(task));
+                work_.notify_one();
+                return;
+            }
+        }
+        std::thread([this, first = std::move(task)]() mutable { host(std::move(first)); }).detach();
+    }
+
+private:
+    void host(std::shared_ptr<Thread> task) {
+        for (;;) {
+            run_thread(std::move(task));
+            std::unique_lock lock(mutex_);
+            ++idle_;
+            work_.wait(lock, [&] { return !handed_.empty(); });
+            task = std::move(handed_.front());
+            handed_.pop_front();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable work_;
+    std::deque<std::shared_ptr<Thread>> handed_;  // tasks handed over, not yet taken up
+    size_t idle_ = 0;                             // threads waiting, less the tasks handed over
+};
+// (Never destroyed: its threads wait on it as the process ends.)
+TaskHosts& task_hosts() {
+    static TaskHosts& hosts = *new TaskHosts;
+    return hosts;
+}
+
 // The program's memory as the system leaves it for a new thread: its segments, zeroes elsewhere, the arguments in $3 to $6.
 void prepare(Thread& t) {
-    t.ls.assign(qilin::rt::kSpuLocalStore, 0);
-    const uint8_t* const file = guest_memory() + t.image_address;
-    for (const qilin::SpuSegment& segment : t.image.segments) {
+    t.ls.renew();
+    uint8_t* const ls = t.ls.data();
+    const uint8_t* const file = guest_memory() + t.program->address;
+    for (const qilin::SpuSegment& segment : t.program->image.segments) {
         if (segment.type != 1 || segment.memory_size == 0) continue;  // (1: a segment to load)
-        if (segment.address > qilin::rt::kSpuLocalStore || segment.memory_size > qilin::rt::kSpuLocalStore - segment.address)
+        if (segment.address > kSpuLocalStore || segment.memory_size > kSpuLocalStore - segment.address)
             fatal("SPU program %s has a segment outside an SPU's memory", t.name.c_str());
-        std::memcpy(t.ls.data() + segment.address, file + segment.offset, segment.file_size);
+        std::memcpy(ls + segment.address, file + segment.offset, segment.file_size);
     }
     t.spu = Spu{};
-    t.spu.ls = t.ls.data();
+    t.spu.ls = ls;
     t.spu.hooks = &kHooks;
     t.spu.owner = &t;
     for (unsigned i = 0; i < 4; ++i) t.spu.r[3 + i] = SpuReg{{static_cast<uint32_t>(t.arguments[i] >> 32), static_cast<uint32_t>(t.arguments[i]), 0, 0}};
@@ -436,9 +609,7 @@ void prepare(Thread& t) {
         // 0x1C0, the taskset's workload number in 0x1D0's last word, and at 0x2FB8 the address of a context: +152 non-zero
         // in a task, +184 the taskset's 64-bit address, +196 the kernel's entry, +208 the DMA tag the kernel lends the library, +212 the task.
         // *The tag (31) and +152's value (1) are stated choices.*
-        const auto put = [&](uint32_t at, uint32_t v) {
-            t.ls[at] = static_cast<uint8_t>(v >> 24), t.ls[at + 1] = static_cast<uint8_t>(v >> 16), t.ls[at + 2] = static_cast<uint8_t>(v >> 8), t.ls[at + 3] = static_cast<uint8_t>(v);
-        };
+        const auto put = [ls](uint32_t at, uint32_t v) { put_be32(ls + at, v); };
         put(0x1c4, t.setup.spurs);
         put(0x1dc, t.setup.workload);
         put(0x2fb8, kTaskContext);
@@ -453,13 +624,6 @@ void prepare(Thread& t) {
     t.out_mailbox = 0;
     t.reserved = false;
     t.lsa = t.eah = t.eal = t.size = t.tag = t.tag_mask = t.atomic_status = 0;
-}
-
-const qilin::rt::LiftedSpuProgram& lifted(uint32_t image_address, const std::string& name) {
-    for (const qilin::rt::LiftedSpuProgram& program : spu_programs())
-        if (program.address == image_address) return program;
-    fatal("the game starts an SPU program at %08x (%s) that is not among the %zu lifted: every SPU program must be known when the game is built", image_address, name.c_str(),
-          spu_programs().size());
 }
 
 std::shared_ptr<Thread> thread_of(uint64_t id) {
@@ -495,12 +659,12 @@ void sys_spu_image_import(Cpu& c) {
         c.r[3] = kEinval;
         return;
     }
-    const auto parsed = qilin::parse_spu_image({guest_memory() + file, 0x40000}, file);
-    if (!parsed) fatal("sys_spu_image_import: what the game gives at %08x is not an SPU program: %s", file, parsed.error().c_str());
+    const auto program = program_at(file);
+    if (!program) fatal("sys_spu_image_import: what the game gives at %08x is not an SPU program: %s", file, program.error().c_str());
     store32(image, 0);
-    store32(image + 4, parsed->entry);
+    store32(image + 4, (*program)->image.entry);
     store32(image + 8, file);
-    store32(image + 12, static_cast<uint32_t>(parsed->segments.size()));
+    store32(image + 12, static_cast<uint32_t>((*program)->image.segments.size()));
     c.r[3] = kOk;
 }
 
@@ -564,13 +728,14 @@ void sys_spu_thread_initialize(Cpu& c) {
         return;
     }
     auto thread = std::make_shared<Thread>();
-    thread->image_address = load32(image + 8);
-    const auto parsed = qilin::parse_spu_image({guest_memory() + thread->image_address, 0x40000}, thread->image_address);
-    if (!parsed) fatal("sys_spu_thread_initialize: the image names no SPU program (%08x): %s", thread->image_address, parsed.error().c_str());
-    thread->image = *parsed;
+    const uint32_t file = load32(image + 8);
+    auto program = program_at(file);
+    if (!program) fatal("sys_spu_thread_initialize: the image names no SPU program (%08x): %s", file, program.error().c_str());
+    thread->program = std::move(*program);
+    lifted(*thread->program);
+    const std::string& program_name = thread->program->image.name;
     thread->name = attribute ? guest_string(load32(attribute), load32(attribute + 4)) : std::string();
-    if (thread->name.empty()) thread->name = parsed->name.empty() ? "(no name)" : parsed->name;
-    thread->program = &lifted(thread->image_address, parsed->name);
+    if (thread->name.empty()) thread->name = program_name.empty() ? "(no name)" : program_name;
     if (arguments)
         for (unsigned i = 0; i < 4; ++i) thread->arguments[i] = load64(arguments + 8 * i);
     const std::lock_guard lock(g_mutex);
@@ -595,7 +760,7 @@ void sys_spu_thread_initialize(Cpu& c) {
     g_threads.emplace(thread->id, thread);
     store32(out, thread->id);
     qilin::rt::log("the game makes SPU thread %s in group %s: the program at %08x, arguments %llx %llx %llx %llx", thread->name.c_str(), group.name.c_str(),
-                   thread->image_address, static_cast<unsigned long long>(thread->arguments[0]), static_cast<unsigned long long>(thread->arguments[1]),
+                   file, static_cast<unsigned long long>(thread->arguments[0]), static_cast<unsigned long long>(thread->arguments[1]),
                    static_cast<unsigned long long>(thread->arguments[2]), static_cast<unsigned long long>(thread->arguments[3]));
     c.r[3] = kOk;
 }
@@ -654,7 +819,7 @@ void local_store_word(Cpu& c, bool write) {
         c.r[3] = kEsrch;
         return;
     }
-    if ((bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) || address > qilin::rt::kSpuLocalStore - bytes || address % bytes || thread->ls.empty()) {
+    if ((bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) || address > kSpuLocalStore - bytes || address % bytes || thread->ls.empty()) {
         c.r[3] = kEinval;
         return;
     }
@@ -783,27 +948,24 @@ std::span<const NativeSystemCall> spu_system_calls() { return kCalls; }
 std::span<const NativeImport> spu_imports() { return kImports; }
 
 // A SPURS task: a thread of no group, started at once, on a host thread of its own (spurs.cpp: what SPURS makes of it).
-void start_spu_task(SpuTaskSetup setup) {
+void start_spu_task(const SpuTaskSetup& setup) {
     const Clock::time_point setup_start = Clock::now();
-    const uint32_t image_address = setup.image;
-    const std::string name = setup.name;
     auto thread = std::make_shared<Thread>();
-    thread->image_address = image_address;
-    const auto parsed = qilin::parse_spu_image({guest_memory() + image_address, 0x40000}, image_address);
-    if (!parsed) fatal("a SPURS task's program at %08x is no SPU program: %s", image_address, parsed.error().c_str());
-    thread->image = *parsed;
-    thread->name = name.empty() ? parsed->name : name;
-    thread->program = &lifted(image_address, parsed->name);
+    auto program = program_at(setup.image);
+    if (!program) fatal("a SPURS task's program at %08x is no SPU program: %s", setup.image, program.error().c_str());
+    thread->program = std::move(*program);
+    lifted(*thread->program);
+    thread->name = thread->program->image.name;
     thread->task = true;
-    thread->setup = std::move(setup);
+    thread->setup = setup;
     {
         const std::lock_guard lock(g_mutex);
         thread->id = g_next_thread++;
         g_threads.emplace(thread->id, thread);
     }
     prepare(*thread);
-    // (The host thread is left to end by itself; the task's record is dropped when it ends: finish.)
-    std::thread(run_thread, thread).detach();
+    // (The task's record is dropped when it ends: finish.)
+    task_hosts().run(std::move(thread));
     ++g_tasks_started;
     g_task_setup_ns += since_ns(setup_start);
 }
@@ -811,12 +973,21 @@ void start_spu_task(SpuTaskSetup setup) {
 void spu_report() {
     qilin::rt::log("spu: %llu SPURS tasks started (%.0f ms starting them)", static_cast<unsigned long long>(g_tasks_started.load()),
                    static_cast<double>(g_task_setup_ns.load()) / 1e6);
-    const std::lock_guard lock(g_task_times_mutex);
-    std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> top(g_task_times.begin(), g_task_times.end());
-    std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    struct Times {
+        std::string name;
+        uint64_t runs, ns;
+    };
+    std::vector<Times> top;
+    {
+        const std::lock_guard lock(g_programs_mutex);
+        for (const auto& [address, program] : g_programs)
+            if (const uint64_t runs = program->runs.load(std::memory_order_relaxed))
+                top.push_back({program->image.name, runs, program->ns.load(std::memory_order_relaxed)});
+    }
+    std::ranges::sort(top, std::ranges::greater{}, &Times::ns);
     for (size_t i = 0; i < top.size() && i < 12; ++i)
-        qilin::rt::log("spu: task %s: %llu runs, %.0f ms in all, %.3f ms each", top[i].first.c_str(), static_cast<unsigned long long>(top[i].second.first),
-                       static_cast<double>(top[i].second.second) / 1e6, static_cast<double>(top[i].second.second) / 1e6 / static_cast<double>(top[i].second.first));
+        qilin::rt::log("spu: task %s: %llu runs, %.0f ms in all, %.3f ms each", top[i].name.c_str(), static_cast<unsigned long long>(top[i].runs), static_cast<double>(top[i].ns) / 1e6,
+                       static_cast<double>(top[i].ns) / 1e6 / static_cast<double>(top[i].runs));
 }
 
 std::mutex& spu_atomic_mutex() { return g_atomic; }
@@ -825,7 +996,10 @@ void set_spu_atomic_watch(void (*watch)(uint32_t line)) { g_atomic_watch.store(w
 
 void forbid_spu_transfers(uint32_t address, uint32_t size, const char* what) {
     const std::lock_guard lock(g_forbidden_mutex);
-    g_forbidden.push_back({address, size, what});
+    const size_t n = g_forbidden_count.load(std::memory_order_relaxed);
+    if (n == kMostForbidden) fatal("more than %zu ranges of memory forbidden to SPU transfers (%s at %08x)", kMostForbidden, what, address);
+    g_forbidden[n] = {address, size, what};
+    g_forbidden_count.store(n + 1, std::memory_order_release);
 }
 
 }  // namespace rr7

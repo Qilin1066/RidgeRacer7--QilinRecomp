@@ -198,49 +198,8 @@ void start_task(uint32_t taskset, uint32_t id) {
         set_task_bit(taskset, kPending, id, false);
         set_task_bit(taskset, kRunning, id, true);
     }
-    const auto port_queue = [spurs](uint32_t port) -> uint32_t {
-        const std::lock_guard lock(g_mutex);
-        const auto it = g_instances.find(spurs);
-        if (it == g_instances.end()) return 0;
-        const auto p = it->second.ports.find(port);
-        return p == it->second.ports.end() ? 0 : p->second;
-    };
     if (spurs_log()) qilin::rt::log("(spurs) taskset %08x starts task %u: the program at %08x, argument %08x %08x %08x %08x", taskset, id, elf, r3[0], r3[1], r3[2], r3[3]);
-    SpuTaskSetup setup;
-    setup.image = elf, setup.spurs = spurs, setup.taskset = taskset, setup.workload = workload, setup.id = id, setup.r3 = r3, setup.r4 = r4;
-    setup.port_queue = port_queue;
-    setup.exited = [taskset, id](uint32_t) {
-        if (spurs_log()) qilin::rt::log("(spurs) taskset %08x task %u ends", taskset, id);
-        // The task's bits and this runtime's record of it change together (under both locks, as watch_atomic_put takes
-        // them): otherwise a task made again with the same id in between would be missed, or taken for this one.
-        const std::lock_guard lock(g_mutex);
-        Taskset& t = g_tasksets.at(taskset);
-        {
-            const std::lock_guard atomic(spu_atomic_mutex());
-            for (const uint32_t mask : {kRunning, kPending, kEnabled, kSignalled, kWaiting}) set_task_bit(taskset, mask, id, false);
-            --t.running;
-            t.started &= ~(1u << id);
-            spu_atomic_changed().notify_all();
-        }
-        g_changed.notify_all();
-    };
-    // The kernel's wait: a task not yet signalled is waiting, not running, until it is (cellSpursSendSignal in the tasks sets
-    // the signalled bit); the signal is used up.
-    setup.wait_signal = [taskset, id] {
-        std::unique_lock atomic(spu_atomic_mutex());
-        if (spurs_log()) qilin::rt::log("(spurs) taskset %08x task %u waits%s", taskset, id, task_bit(taskset, kSignalled, id) ? " (signalled already)" : "");
-        if (!task_bit(taskset, kSignalled, id)) {
-            set_task_bit(taskset, kRunning, id, false);
-            set_task_bit(taskset, kWaiting, id, true);
-            spu_atomic_changed().notify_all();
-            spu_atomic_changed().wait(atomic, [&] { return task_bit(taskset, kSignalled, id); });
-            set_task_bit(taskset, kWaiting, id, false);
-            set_task_bit(taskset, kRunning, id, true);
-            if (spurs_log()) qilin::rt::log("(spurs) taskset %08x task %u is signalled", taskset, id);
-        }
-        set_task_bit(taskset, kSignalled, id, false);
-    };
-    start_spu_task(std::move(setup));
+    start_spu_task({.image = elf, .spurs = spurs, .taskset = taskset, .workload = workload, .id = id, .r3 = r3, .r4 = r4});
 }
 
 // After an SPU program's atomic put: if the line is a taskset's, the tasks the program has marked at +0x20 and this runtime
@@ -484,5 +443,50 @@ constexpr NativeImport kImports[] = {
 }  // namespace
 
 std::span<const NativeImport> spurs_imports() { return kImports; }
+
+// ---- the kernel's part in a task (machine.hpp), on the task's host thread
+
+uint32_t spurs_port_queue(uint32_t spurs, uint32_t port) {
+    const std::lock_guard lock(g_mutex);
+    const auto it = g_instances.find(spurs);
+    if (it == g_instances.end()) return 0;
+    const auto p = it->second.ports.find(port);
+    return p == it->second.ports.end() ? 0 : p->second;
+}
+
+void spurs_task_exited(const SpuTaskSetup& task, uint32_t) {
+    const uint32_t taskset = task.taskset, id = task.id;
+    if (spurs_log()) qilin::rt::log("(spurs) taskset %08x task %u ends", taskset, id);
+    // The task's bits and this runtime's record of it change together (under both locks, as watch_atomic_put takes
+    // them): otherwise a task made again with the same id in between would be missed, or taken for this one.
+    const std::lock_guard lock(g_mutex);
+    Taskset& t = g_tasksets.at(taskset);
+    {
+        const std::lock_guard atomic(spu_atomic_mutex());
+        for (const uint32_t mask : {kRunning, kPending, kEnabled, kSignalled, kWaiting}) set_task_bit(taskset, mask, id, false);
+        --t.running;
+        t.started &= ~(1u << id);
+        spu_atomic_changed().notify_all();
+    }
+    g_changed.notify_all();
+}
+
+// The kernel's wait: a task not yet signalled is waiting, not running, until it is (cellSpursSendSignal in the tasks sets
+// the signalled bit); the signal is used up.
+void spurs_task_wait_signal(const SpuTaskSetup& task) {
+    const uint32_t taskset = task.taskset, id = task.id;
+    std::unique_lock atomic(spu_atomic_mutex());
+    if (spurs_log()) qilin::rt::log("(spurs) taskset %08x task %u waits%s", taskset, id, task_bit(taskset, kSignalled, id) ? " (signalled already)" : "");
+    if (!task_bit(taskset, kSignalled, id)) {
+        set_task_bit(taskset, kRunning, id, false);
+        set_task_bit(taskset, kWaiting, id, true);
+        spu_atomic_changed().notify_all();
+        spu_atomic_changed().wait(atomic, [&] { return task_bit(taskset, kSignalled, id); });
+        set_task_bit(taskset, kWaiting, id, false);
+        set_task_bit(taskset, kRunning, id, true);
+        if (spurs_log()) qilin::rt::log("(spurs) taskset %08x task %u is signalled", taskset, id);
+    }
+    set_task_bit(taskset, kSignalled, id, false);
+}
 
 }  // namespace rr7

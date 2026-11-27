@@ -162,15 +162,17 @@ void set_pad_state(const PadState& state);
 // SPURS's tasks (spurs.cpp), run as SPU programs on host threads (spu.cpp), with a SPURS kernel of the runtime's in their
 // memory (spu.cpp: what of it the tasks use). A task is started from:
 struct SpuTaskSetup {
-    std::string name;
     uint32_t image = 0;                     // the program's ELF in guest memory
     uint32_t spurs = 0, taskset = 0, workload = 0, id = 0;
     std::array<uint32_t, 4> r3{}, r4{};     // as the task is given them
-    std::function<uint32_t(uint32_t port)> port_queue;  // the queue behind its instance's port, as it is when it sends (0: none)
-    std::function<void(uint32_t status)> exited;        // it has ended (stop 0x102, or the kernel's call 0)
-    std::function<void()> wait_signal;                  // the kernel's call 2: returns when the task has been signalled
 };
-void start_spu_task(SpuTaskSetup setup);
+void start_spu_task(const SpuTaskSetup& setup);
+// What SPURS (spurs.cpp) does for a task, called on the task's own host thread: the queue behind its instance's port, as
+// it is when the task sends (0: none); the task has ended (stop 0x102, or the kernel's call 0); the kernel's call 2,
+// which returns when the task has been signalled.
+uint32_t spurs_port_queue(uint32_t spurs, uint32_t port);
+void spurs_task_exited(const SpuTaskSetup& task, uint32_t status);
+void spurs_task_wait_signal(const SpuTaskSetup& task);
 // Woken whenever an SPU program's atomic put succeeds (with spu_atomic_mutex), for native code waiting on a line to change.
 std::condition_variable& spu_atomic_changed();
 // Called (without the lock) after each atomic put an SPU program makes, with the line's address: how SPURS sees what the

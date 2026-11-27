@@ -51,6 +51,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Changed
 - README rewritten to the layout shared by the QilinRecomp projects: what works and how to build and play it, without the development history.
+- SPURS tasks start for less: each SPU program's ELF is parsed once (checked against its headers at every use), local stores are kept zeroed between threads, a task's host thread is kept for the next task, the kernel's three calls are plain functions instead of `std::function`s, and a memory transfer no longer takes a lock to look through the (empty) list of forbidden ranges. Starting a task costs under 3 microseconds of its starter's time, from 45 to 80; a start and an end about 70, from 150 to 190 (`ridgeracer7_spu_test bench`). `ridgeracer7_spu_test` (in `ctest`) runs made-up SPU programs as tasks and as a thread group with no game.
 
 ### Checked
 - On the owner's PC: the game starts its sound core (`bnusCoreSpu.elf`) as an SPU thread, which runs; it reads and unpacks its first packs of `RR7.DAT`, and runs on to its first drawing: it stops at the RSX method that loads a vertex program. 110 of its 248 imports and 54 of its 78 system calls are provided.

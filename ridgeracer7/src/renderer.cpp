@@ -17,6 +17,7 @@
 #include <tuple>
 
 #include "kernel.hpp"
+#include "render_formats.hpp"
 #include "machine.hpp"
 #include "qilin/host/vulkan.hpp"
 #include "qilin/rt/report.hpp"
@@ -274,77 +275,6 @@ VkFormat surface_format(uint32_t format, uint32_t& bytes) {
     case 8: bytes = 4; return VK_FORMAT_R8G8B8A8_UNORM;   // A8R8G8B8
     case 13: bytes = 4; return VK_FORMAT_R32_SFLOAT;      // F_X32
     default: fatal("a colour surface of format %u, which the renderer doesn't draw yet", format);
-    }
-}
-
-// Guest memory to the image's bytes, and back: A8R8G8B8 is A, R, G, B in memory and R, G, B, A in the image; floats are big-endian.
-// (As words, on a little-endian host as load32 and store32 assume: A8R8G8B8 is a rotation by a byte, a float a byte swap.)
-void to_host(uint32_t format, const uint8_t* from, uint8_t* to, size_t pixels) {
-    for (size_t i = 0; i < pixels; ++i, from += 4, to += 4) {
-        uint32_t w;
-        std::memcpy(&w, from, 4);
-        w = format == 8 ? std::rotr(w, 8) : std::byteswap(w);
-        std::memcpy(to, &w, 4);
-    }
-}
-void to_guest(uint32_t format, const uint8_t* from, uint8_t* to, size_t pixels) {
-    for (size_t i = 0; i < pixels; ++i, from += 4, to += 4) {
-        uint32_t w;
-        std::memcpy(&w, from, 4);
-        w = format == 8 ? std::rotl(w, 8) : std::byteswap(w);
-        std::memcpy(to, &w, 4);
-    }
-}
-
-// One vertex attribute's components as floats: the RSX's types (CELL_GCM_VERTEX_...), big-endian.
-uint32_t load_be32(const uint8_t* p) {
-    uint32_t w;
-    std::memcpy(&w, p, 4);
-    return std::byteswap(w);
-}
-
-// A half (big-endian bytes) as a float. A normal one is built from its bits (exactly 1.m times 2 to the e - 15).
-float half_float(const uint8_t* p) {
-    const uint16_t h = static_cast<uint16_t>((p[0] << 8) | p[1]);
-    const uint32_t sign = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
-    if (e != 0 && e != 31) return std::bit_cast<float>((sign << 31) | ((e + 112) << 23) | (m << 13));
-    const float v = e == 0 ? std::ldexp(static_cast<float>(m), -24) : m ? NAN : INFINITY;
-    return sign ? -v : v;
-}
-
-// One component of a vertex attribute of the RSX's type `Type` (CELL_GCM_VERTEX_...), big-endian.
-template <uint32_t Type>
-float component(const uint8_t* p, uint32_t c) {
-    if constexpr (Type == 1) return std::max(-1.0f, static_cast<float>(static_cast<int16_t>((p[2 * c] << 8) | p[2 * c + 1])) / 32767.0f);  // S1
-    if constexpr (Type == 2) return std::bit_cast<float>(load_be32(p + 4 * c));                                                         // F
-    if constexpr (Type == 3) return half_float(p + 2 * c);                                                                             // SF
-    if constexpr (Type == 4) return static_cast<float>(p[c]) / 255.0f;                                                                 // UB
-    if constexpr (Type == 5) return static_cast<float>(static_cast<int16_t>((p[2 * c] << 8) | p[2 * c + 1]));                         // S32K
-    if constexpr (Type == 7) return static_cast<float>(p[c]);                                                                          // UB256
-}
-template <uint32_t Type>
-void decode_attribute(const uint8_t* p, size_t stride, uint32_t size, uint32_t count, float* out) {
-    for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) {
-        out[0] = out[1] = out[2] = 0.0f, out[3] = 1.0f;
-        for (uint32_t c = 0; c < size; ++c) out[c] = component<Type>(p, c);
-    }
-}
-
-// An attribute's `count` vertices from `p`, `stride` bytes apart, as four floats each (missing components 0, 0, 0, 1).
-void decode_attributes(uint32_t format, const uint8_t* p, size_t stride, uint32_t count, float* out) {
-    const uint32_t type = format & 0xf, size = (format >> 4) & 0xf;
-    if (!count || !size) {
-        for (uint32_t v = 0; v < count; ++v) out[4 * v] = out[4 * v + 1] = out[4 * v + 2] = 0.0f, out[4 * v + 3] = 1.0f;
-        return;
-    }
-    switch (type) {
-    case 1: return decode_attribute<1>(p, stride, size, count, out);
-    case 2: return decode_attribute<2>(p, stride, size, count, out);
-    case 3: return decode_attribute<3>(p, stride, size, count, out);
-    case 4: return decode_attribute<4>(p, stride, size, count, out);
-    case 5: return decode_attribute<5>(p, stride, size, count, out);
-    case 7: return decode_attribute<7>(p, stride, size, count, out);
-    default: fatal("a vertex attribute of type %u, which the renderer doesn't take yet", type);
     }
 }
 
@@ -780,11 +710,8 @@ uint32_t surface_copies(const SurfaceEntry& s, VkBufferImageCopy (&copies)[2]) {
     return 2;
 }
 
-// A Z24S8 surface's words to the staging buffer's two aspects and back. With D24_UNORM_S8_UINT the depth aspect is a word
-// with depth in its low 24 bits; with D32_SFLOAT_S8_UINT a float, depth / (2^24 - 1) (*then the test compares floats, not
-// 24-bit numbers: a stated difference. Each 24-bit depth is a float of its own, so order and the value written back are
-// kept; a fragment exactly at a stored depth may test otherwise than on the RSX*).
-void depth_to_host(const SurfaceEntry& s) {
+// A Z24S8 surface's words to the staging buffer's two aspects (render_formats.hpp: depth_to_host), and back.
+void depth_from_guest(const SurfaceEntry& s) {
     const bool unorm = g_renderer->depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
     const size_t texels = size_t{s.desc.width} * s.desc.height;
     uint32_t* depth = static_cast<uint32_t*>(s.staging.mapped);
@@ -796,7 +723,7 @@ void depth_to_host(const SurfaceEntry& s) {
             std::memcpy(&w, row + 4 * x, 4);
             w = std::byteswap(w);
             const size_t i = size_t{y} * s.desc.width + x;
-            depth[i] = unorm ? w >> 8 : std::bit_cast<uint32_t>(static_cast<float>(w >> 8) / 16777215.0f);
+            depth[i] = depth_to_host(w >> 8, unorm);
             stencil[i] = static_cast<uint8_t>(w);
         }
     }
@@ -810,7 +737,7 @@ uint64_t surface_to_guest(SurfaceEntry& s) {
     if (!s.depth) {
         for (uint32_t y = y0; y < y1; ++y) {
             uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
-            to_guest(s.desc.format, static_cast<const uint8_t*>(s.staging.mapped) + (size_t{y} * s.desc.width + x0) * 4, row + size_t{x0} * 4, x1 - x0);
+            pixels_to_guest(s.desc.format, static_cast<const uint8_t*>(s.staging.mapped) + (size_t{y} * s.desc.width + x0) * 4, row + size_t{x0} * 4, x1 - x0);
         }
         return surface_hash(s.desc);
     }
@@ -822,10 +749,7 @@ uint64_t surface_to_guest(SurfaceEntry& s) {
         uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
         for (uint32_t x = x0; x < x1; ++x) {
             const size_t i = size_t{y} * s.desc.width + x;
-            uint32_t d = depth[i] & 0xffffffu;
-            // (Rounded half away from zero, as lround, on a non-negative float below 2^24: adding a half is exact in a double.)
-            if (!unorm) d = static_cast<uint32_t>(static_cast<double>(std::clamp(std::bit_cast<float>(depth[i]), 0.0f, 1.0f) * 16777215.0f) + 0.5);
-            const uint32_t w = std::byteswap((d << 8) | stencil[i]);
+            const uint32_t w = std::byteswap((depth_to_guest(depth[i], unorm) << 8) | stencil[i]);
             std::memcpy(row + 4 * x, &w, 4);
         }
     }
@@ -921,10 +845,10 @@ void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s, bool discard) {
     finish_batch_numbered(*g_renderer, s.staging_batch);
     s.staging_batch = g_renderer->flushes;
     if (s.depth) {
-        depth_to_host(s);
+        depth_from_guest(s);
     } else {
         for (uint32_t y = 0; y < s.desc.height; ++y)
-            to_host(s.desc.format, guest_memory() + s.desc.address + size_t{y} * s.desc.pitch, static_cast<uint8_t*>(s.staging.mapped) + size_t{y} * s.desc.width * 4, s.desc.width);
+            pixels_to_host(s.desc.format, guest_memory() + s.desc.address + size_t{y} * s.desc.pitch, static_cast<uint8_t*>(s.staging.mapped) + size_t{y} * s.desc.width * 4, s.desc.width);
     }
     if (!s.coherent) {
         const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s.staging.memory, 0, VK_WHOLE_SIZE};
@@ -1507,7 +1431,8 @@ void renderer_draw(const Draw& d) {
             offsets[slot++] = at;
             continue;
         }
-        decode_attributes(format_word, guest_memory() + d.attribute_address[a] + size_t{d.first} * stride, stride, d.count, out);
+        if (!decode_attributes(format_word, guest_memory() + d.attribute_address[a] + size_t{d.first} * stride, stride, d.count, out))
+            fatal("a vertex attribute of type %u, which the renderer doesn't take yet", format_word & 0xf);
         if (d.logged && d.count) {
             const uint8_t* raw = guest_memory() + d.attribute_address[a] + d.first * stride;
             qilin::rt::log("(draw)   attribute %u format %08x: first vertex %g %g %g %g (bytes %02x %02x %02x %02x)", a, format_word, out[0], out[1], out[2], out[3], raw[0],
@@ -1700,7 +1625,7 @@ void renderer_clear(const Clear& c) {
         ++n;
     }
     if (depth) {
-        // Depth as depth_to_host makes it: d / (2^24 - 1).
+        // Depth as depth_to_host makes it (render_formats.hpp): d / (2^24 - 1).
         clears[n].aspectMask = (c.depth ? VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT} : VkImageAspectFlags{0}) | (c.stencil ? VkImageAspectFlags{VK_IMAGE_ASPECT_STENCIL_BIT} : VkImageAspectFlags{0});
         clears[n].clearValue.depthStencil = {static_cast<float>(c.depth_value >> 8) / 16777215.0f, c.depth_value & 0xffu};
         ++n;

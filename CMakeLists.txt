@@ -126,6 +126,11 @@ foreach(case open read-close threads)
     add_test(NAME ridgeracer7_runtime_io_${case} COMMAND ridgeracer7_runtime_io_test ${case})
     set_tests_properties(ridgeracer7_runtime_io_${case} PROPERTIES TIMEOUT 20)
 endforeach()
+# The renderer's pure parts (textures' channel orders, surfaces' pixels, vertex attributes): no GPU, no game.
+add_executable(ridgeracer7_render_test ridgeracer7/tests/render_test.cpp ridgeracer7/src/textures.cpp ridgeracer7/src/render_formats.cpp)
+target_include_directories(ridgeracer7_render_test PRIVATE ridgeracer7/src)
+target_link_libraries(ridgeracer7_render_test PRIVATE qilin_warnings)
+add_test(NAME ridgeracer7_render_test COMMAND ridgeracer7_render_test)
 add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_game qilin_recomp qilin_warnings)
 qilin_tool(qilin_tests)
@@ -236,6 +241,7 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/np.cpp
     ridgeracer7/src/pad.cpp
     ridgeracer7/src/renderer.cpp
+    ridgeracer7/src/render_formats.cpp
     ridgeracer7/src/textures.cpp
     ridgeracer7/src/rtc.cpp
     ridgeracer7/src/savedata.cpp

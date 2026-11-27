@@ -167,6 +167,10 @@ Gpu Gpu::create(std::span<const char* const> instance_extensions, bool want_swap
     f2.features.samplerAnisotropy = have.samplerAnisotropy;
     f2.features.depthBounds = have.depthBounds;
     g.depth_bounds = have.depthBounds;
+    f2.features.fillModeNonSolid = have.fillModeNonSolid;
+    g.fill_non_solid = have.fillModeNonSolid;
+    f2.features.shaderClipDistance = have.shaderClipDistance;
+    g.clip_distance = have.shaderClipDistance;
     if (have.samplerAnisotropy) g.max_anisotropy = g.properties.limits.maxSamplerAnisotropy;
     g.logic_op = have.logicOp;
     g.wide_lines = have.wideLines;

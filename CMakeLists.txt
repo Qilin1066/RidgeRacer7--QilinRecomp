@@ -145,6 +145,18 @@ foreach(case fast priority two-tokens switch-point yield blocking sleep lend fre
     add_test(NAME ridgeracer7_sched_${case} COMMAND ridgeracer7_sched_test ${case})
     set_tests_properties(ridgeracer7_sched_${case} PROPERTIES TIMEOUT 30)
 endforeach()
+# The renderer's pure parts (textures' channel orders, surfaces' pixels, vertex attributes, primitives, rasterisation): no
+# GPU, no game.
+add_executable(ridgeracer7_render_test ridgeracer7/tests/render_test.cpp ridgeracer7/src/textures.cpp ridgeracer7/src/render_formats.cpp
+    ridgeracer7/src/render_state.cpp)
+target_include_directories(ridgeracer7_render_test PRIVATE ridgeracer7/src)
+target_link_libraries(ridgeracer7_render_test PRIVATE qilin_warnings)
+add_test(NAME ridgeracer7_render_test COMMAND ridgeracer7_render_test)
+# The translated programs' other forms for draw state (rsx_spirv.hpp's Variant), on synthetic programs.
+add_executable(ridgeracer7_shader_forms_test ridgeracer7/tests/shader_forms_test.cpp)
+target_link_libraries(ridgeracer7_shader_forms_test PRIVATE qilin_recomp qilin_warnings)
+qilin_tool(ridgeracer7_shader_forms_test)
+add_test(NAME ridgeracer7_shader_forms_test COMMAND ridgeracer7_shader_forms_test)
 add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_game qilin_recomp qilin_warnings)
 qilin_tool(qilin_tests)
@@ -278,6 +290,9 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/pad.cpp
     ridgeracer7/src/pause.cpp
     ridgeracer7/src/renderer.cpp
+    ridgeracer7/src/renderer_pipelines.cpp
+    ridgeracer7/src/render_formats.cpp
+    ridgeracer7/src/render_state.cpp
     ridgeracer7/src/textures.cpp
     ridgeracer7/src/rtc.cpp
     ridgeracer7/src/savedata.cpp
@@ -300,7 +315,7 @@ add_library(ridgeracer7_machine STATIC
 target_include_directories(ridgeracer7_machine PUBLIC ridgeracer7/src)
 # Vulkan structures are written {sType} with the rest zeroed: the idiom, not a mistake (as host/'s sources).
 if(NOT MSVC)
-    set_source_files_properties(ridgeracer7/src/renderer.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
+    set_source_files_properties(ridgeracer7/src/renderer.cpp ridgeracer7/src/renderer_pipelines.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
 endif()
 if(NOT TARGET qilin_host)
     message(FATAL_ERROR "the game's machine needs the host layer: configure with -DQILIN_HOST=ON")

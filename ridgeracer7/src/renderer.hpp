@@ -1,13 +1,12 @@
 // The RSX's drawing, on Vulkan (renderer.cpp). The RSX thread (rsx.cpp)
 // reads the commands and gathers each draw's state; this draws it.
 //
-// **The first design, chosen for being plainly correct, not fast:** guest
-// memory is the only truth. Each draw uploads its colour surface from guest
-// memory, draws, and writes it back; a flip reads the display buffer from
-// guest memory. So whatever the game reads from memory (a render target as a
-// texture, a picture the CPU looks at) is what was drawn. Keeping surfaces
-// on the GPU and writing them back only when something reads them is the
-// next design, once the picture is right.
+// Guest memory is the truth wherever the game can look: draws are recorded
+// into batches, surfaces stay on the GPU between the points where the game
+// can look, and what was drawn goes back to guest memory when something
+// first touches it (docs/runtime.md). The pure parts are render_formats
+// (guest memory to the GPU and back), render_state (primitives, polygons, the
+// window) and textures; renderer_pipelines makes the Vulkan objects.
 //
 // Runtime code: no std::format.
 #pragma once
@@ -54,11 +53,21 @@ struct Draw {
     std::array<float, 4> viewport_scale{}, viewport_offset{};
     uint32_t clip_x = 0, clip_y = 0, clip_width = 0, clip_height = 0, window_height = 0;
     bool origin_bottom = false;
+    uint32_t window_offset_x = 0, window_offset_y = 0;  // the window's origin on the surface (SET_WINDOW_OFFSET)
     uint32_t scissor_x = 0, scissor_y = 0, scissor_width = 0, scissor_height = 0;
     bool blend = false;
     uint32_t blend_src = 0, blend_dst = 0, blend_equation = 0;
+    bool logic = false;      // a logic operation in place of blending (SET_LOGIC_OP_ENABLE)
+    uint32_t logic_op = 0;   // OpenGL's CLEAR 0x1500 to SET 0x150F (SET_LOGIC_OP)
     bool cull = false;
     uint32_t cull_face = 0, front_face = 0;
+    // Flat shading (SET_SHADE_MODE), and whether a primitive's first vertex gives its colour rather than its last
+    // (SET_FLAT_SHADE_OP).
+    bool flat = false, flat_first = false;
+    bool two_sided = false;  // back faces take the vertex program's back colours (SET_TWO_SIDE_LIGHT_EN)
+    // The user clip planes (SET_USER_CLIP_PLANE_CONTROL): plane n's test in bits 4n to 4n + 3, 0 off, 1 LT, 2 GE.
+    uint32_t clip_planes = 0;
+    bool line_stipple = false;  // SET_LINE_STIPPLE: refused where lines are drawn
     // The alpha test, for the fragment program (rsx_spirv.cpp): {reference, scale, -, -}, {less, equal, greater, -} passing.
     std::array<float, 8> alpha_test{0, 0, 0, 0, 1, 1, 1, 0};
     std::array<TextureUnit, 16> textures{};
@@ -74,8 +83,12 @@ struct Draw {
     };
     bool stencil_test = false;
     Stencil stencil_front, stencil_back;
-    bool depth_bias = false;  // polygon offset
+    // Polygons (render_state.hpp: rasterisation): their faces' modes (OpenGL's POINT 0x1B00, LINE 0x1B01, FILL 0x1B02), polygon
+    // offset's enable for each mode and its factor and units, the edge flag.
+    uint32_t front_polygon_mode = 0, back_polygon_mode = 0;
+    bool offset_point = false, offset_line = false, offset_fill = false;
     float bias_factor = 0, bias_units = 0;
+    bool edge_flag = true;
     // The depth bounds test: the depth already stored at the pixel against [min, max], as Vulkan's.
     bool depth_bounds = false;
     float bounds_min = 0, bounds_max = 1;

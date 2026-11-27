@@ -30,6 +30,7 @@
 // (docs/elf-analysis.md says how to make it from your own disc).
 // Exit status is non-zero on any error; nothing fails silently.
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
@@ -713,11 +714,23 @@ int cmd_shaders(const Args& a) {
         }
     }
     std::println("decoded: {} instructions; {} of {} programs disagree with their own tables", instructions, wrong_programs, programs->size());
-    // Each translated to SPIR-V (rsx_spirv.hpp).
+    // Each translated to SPIR-V (rsx_spirv.hpp), with the other forms it needs for draw state (its Variants).
     std::map<std::string, size_t> refusals;
-    size_t translated = 0;
+    size_t translated = 0, variants = 0;
     std::string table;
     std::vector<std::string> modules;
+    const auto words_of = [](const std::vector<uint32_t>& spirv) {
+        std::string words;
+        for (size_t i = 0; i < spirv.size(); ++i) words += std::format("{}0x{:08x}u,", i % 8 ? " " : "\n    ", spirv[i]);
+        return words;
+    };
+    // (A two-sided form is of use only if some vertex program writes a back colour, BFC0 or BFC1: outputs 3 and 4.)
+    bool back_colours = false;
+    for (const ShaderProgram& s : *programs) {
+        const auto p = rsx::parse_cg(elf.bytes_at(s.address, s.size), s.address);
+        if (p && p->vertex)
+            if (const auto t = rsx::translate(*p); t && (t->outputs & 0x18)) back_colours = true;
+    }
     for (const ShaderProgram& s : *programs) {
         const auto p = rsx::parse_cg(elf.bytes_at(s.address, s.size), s.address);
         const auto t = rsx::translate(*p);
@@ -730,19 +743,38 @@ int cmd_shaders(const Args& a) {
             continue;
         }
         ++translated;
+        // The forms it needs: a fragment program that reads a colour, a flat one, and two-sided ones where a vertex program
+        // writes a back colour; a vertex program that writes a clip plane's distance, a clip one.
+        std::array<std::string, rsx::kVariants> variant_names{std::format("kSpirv{}", modules.size())};
+        std::string variant_text;
+        for (unsigned n = 1; n < rsx::kVariants; ++n) {
+            const rsx::Variant v = rsx::variant_of(p->vertex, n);
+            // (A number whose form isn't defined yet comes back as another's.)
+            const bool wanted = rsx::variant_number(v) == n &&
+                                (p->vertex ? v.clip && t->clip_planes : (t->inputs & 6) && (!v.two_sided || back_colours));
+            if (!wanted) continue;
+            const auto form = rsx::translate(*p, v);
+            if (!form) throw Failure{std::format("{} (its form {})", form.error(), n)};
+            variant_names[n] = std::format("kSpirv{}v{}", modules.size(), n);
+            variant_text += std::format("const uint32_t {}[] = {{{}\n}};\n", variant_names[n], words_of(form->spirv));
+            ++variants;
+        }
         if (a.out) {
-            std::string words;
-            for (size_t i = 0; i < t->spirv.size(); ++i) words += std::format("{}0x{:08x}u,", i % 8 ? " " : "\n    ", t->spirv[i]);
-            modules.push_back(std::format("const uint32_t kSpirv{}[] = {{{}\n}};\n", modules.size(), words));
+            modules.push_back(std::format("const uint32_t kSpirv{}[] = {{{}\n}};\n", modules.size(), words_of(t->spirv)) + variant_text);
             std::string slots;
             for (const uint32_t o : t->constant_slots) slots += std::format("{}, ", o);
             if (!slots.empty()) modules.back() += std::format("const uint32_t kSlots{}[] = {{{}}};\n", modules.size() - 1, slots);
-            table += std::format("    {{0x{:016x}ull, {}, 0x{:08x}u, kSpirv{}, std::size(kSpirv{}), 0x{:x}u, 0x{:x}u, 0x{:x}u, 0x{:x}u, {}, {}}},\n", rsx::program_key(*p),
+            std::string forms, sizes;
+            for (unsigned n = 0; n < rsx::kVariants; ++n) {
+                forms += std::format("{}{}", n ? ", " : "", variant_names[n].empty() ? "nullptr" : variant_names[n]);
+                sizes += std::format("{}{}", n ? ", " : "", variant_names[n].empty() ? "0" : std::format("std::size({})", variant_names[n]));
+            }
+            table += std::format("    {{0x{:016x}ull, {}, 0x{:08x}u, kSpirv{}, std::size(kSpirv{}), 0x{:x}u, 0x{:x}u, 0x{:x}u, 0x{:x}u, {}, {}, {{{}}}, {{{}}}, 0x{:x}u}},\n", rsx::program_key(*p),
                                  p->vertex ? "true" : "false", s.address, modules.size() - 1, modules.size() - 1, t->inputs, t->outputs, t->textures, t->cube_textures,
-                                 slots.empty() ? "nullptr" : std::format("kSlots{}", modules.size() - 1), t->constant_slots.size());
+                                 slots.empty() ? "nullptr" : std::format("kSlots{}", modules.size() - 1), t->constant_slots.size(), forms, sizes, t->clip_planes);
         }
     }
-    std::println("translated to SPIR-V: {} of {}", translated, programs->size());
+    std::println("translated to SPIR-V: {} of {}, with {} other forms for draw state", translated, programs->size(), variants);
     for (const auto& [why, n] : refusals) std::println("  {:4}  refused: {}", n, why);
     if (a.out) {
         const fs::path folder = *a.out;

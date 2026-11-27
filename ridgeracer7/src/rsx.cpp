@@ -134,11 +134,25 @@ constexpr StateMethods kState[] = {
     {0xa30c, 1, "NV308A SIZE_IN"},
 };
 
-bool is_state(uint32_t method) {
+// The table as a bit a method, made when the program is compiled: every command word asks.
+constexpr auto kStateBits = [] {
+    std::array<uint64_t, 0x10000 / 4 / 64> bits{};
     for (const StateMethods& m : kState)
-        if (method >= m.first && method < m.first + 4u * m.count) return true;
-    return false;
-}
+        for (uint32_t i = 0; i < m.count; ++i) {
+            const uint32_t word = (m.first + 4u * i) / 4;
+            bits[word / 64] |= uint64_t{1} << (word % 64);
+        }
+    return bits;
+}();
+constexpr bool is_state(uint32_t method) { return method < 0x10000 && ((kStateBits[method / 4 / 64] >> (method / 4 % 64)) & 1) != 0; }
+// (Every run's ends are in, and methods that act are not.)
+static_assert([] {
+    for (const StateMethods& m : kState)
+        if (!is_state(m.first) || !is_state(m.first + 4u * (m.count - 1u))) return false;
+    for (const uint32_t acting : {0x0050u, 0x0064u, 0x0068u, 0x006cu, 0x0100u, 0x1808u, 0x1814u, 0x1824u, 0x1d70u, 0x1d74u, 0x1d94u, 0x1e9cu, 0x1efcu, 0xa400u, 0x10000u})
+        if (is_state(acting)) return false;
+    return true;
+}());
 
 // A development aid, never a way to play: with RR7_RSX_SURVEY set in the environment, methods not yet
 // provided are counted, not run, and at the first flip (or after ten seconds) the list is printed and
@@ -212,7 +226,8 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
     d.color.address = guest_address(surface_location(state(0x0194)), state(0x0210), "a colour surface");
     d.color.width = state(0x0200) >> 16, d.color.height = state(0x0204) >> 16;
     if ((state(0x0200) & 0xffff) || (state(0x0204) & 0xffff)) fatal("a surface whose clip doesn't start at 0, 0 (at offset %08x)", at);
-    if (state(0x02b8)) fatal("a draw with window offset %08x, which the renderer doesn't take yet (at offset %08x)", state(0x02b8), at);
+    // The window offset (SET_WINDOW_OFFSET: x in the low half, y in the high: *a stated reading*, as the RSX's other pairs).
+    d.window_offset_x = state(0x02b8) & 0xffff, d.window_offset_y = state(0x02b8) >> 16;
     d.color_mask = state(0x0324);
     // What the first renderer doesn't take: said by name.
     if (state(0x0a74)) {
@@ -230,10 +245,14 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         d.depth.address = guest_address(surface_location(state(0x0198)), state(0x0214), "a depth surface");
         d.depth.width = state(0x0200) >> 16, d.depth.height = state(0x0204) >> 16;
     }
-    // Polygon offset for filled primitives (SET_POLY_OFFSET_FILL_ENABLE, SCALE_FACTOR, BIAS): Vulkan's depth bias, the slope
-    // factor and the constant. *With D32S8 a unit of bias follows the depth's exponent rather than 2^-24: a stated difference.*
-    if (state(0x0a60) || state(0x0a64)) fatal("a draw with polygon offset for points or lines, which the renderer doesn't take yet (at offset %08x)", at);
-    if (state(0x0a68)) d.depth_bias = true, d.bias_factor = state_float(0x0a78), d.bias_units = state_float(0x0a7c);
+    // Polygon offset (SET_POLY_OFFSET_POINT_ENABLE, LINE, FILL, SCALE_FACTOR, BIAS): Vulkan's depth bias, the slope factor and the
+    // constant, for polygons drawn in a mode whose enable is on (render_state.hpp). *With D32S8 a unit of bias follows the depth's
+    // exponent rather than 2^-24: a stated difference.*
+    d.offset_point = state(0x0a60) != 0, d.offset_line = state(0x0a64) != 0, d.offset_fill = state(0x0a68) != 0;
+    d.bias_factor = state_float(0x0a78), d.bias_units = state_float(0x0a7c);
+    // Polygons' modes (SET_FRONT_POLYGON_MODE, BACK_POLYGON_MODE) and the edge flag (SET_EDGE_FLAG), which a polygon drawn as lines
+    // needs on.
+    d.front_polygon_mode = state(0x1828), d.back_polygon_mode = state(0x182c), d.edge_flag = state(0x1454) != 0;
     // The stencil test (NV30/40's: Mesa's nv30-40_3d.xml.h): 0x328 on, 0x32c write mask, 0x330 function, 0x334 reference,
     // 0x338 function mask, 0x33c/0x340/0x344 the operations on failing, the depth test failing, passing; the back faces' at
     // 0x348 on (two-sided) to 0x364.
@@ -249,15 +268,30 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
         d.stencil_front = side(0x0328);
         d.stencil_back = state(0x0348) ? side(0x0348) : d.stencil_front;
     }
-    // State this renderer doesn't take, refused by name rather than ignored: flat shading, logic operations, two-sided vertex
-    // colours, user clip planes, polygon stipple, and polygons drawn as points or lines.
-    if (state(0x0368) == 0x1d00) fatal("a draw with flat shading, which the renderer doesn't take yet (at offset %08x)", at);
-    if (state(0x0374)) fatal("a draw with a logic operation (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x0378), at);
-    if (state(0x142c)) fatal("a draw with two-sided vertex colours, which the renderer doesn't take yet (at offset %08x)", at);
-    if (state(0x1478)) fatal("a draw with user clip planes (%#x), which the renderer doesn't take yet (at offset %08x)", state(0x1478), at);
+    // Flat shading (SET_SHADE_MODE: OpenGL's FLAT 0x1D00, SMOOTH 0x1D01, 0 as the system leaves it), with the provoking vertex
+    // SET_FLAT_SHADE_OP gives: 0 a primitive's last, OpenGL's convention, 1 its first (*a stated reading*: NV40's FLATSHADE_FIRST,
+    // as Mesa's driver names the method).
+    if (const uint32_t shade = state(0x0368); shade == 0x1d00) {
+        d.flat = true;
+        const uint32_t op = state(0x1450);
+        if (op > 1) fatal("a draw with flat shading by %#x (SET_FLAT_SHADE_OP), which the renderer doesn't know (at offset %08x)", op, at);
+        d.flat_first = op == 1;
+    } else if (shade != 0 && shade != 0x1d01) {
+        fatal("a draw with shade mode %#x, which the renderer doesn't know (at offset %08x)", shade, at);
+    }
+    // A logic operation (SET_LOGIC_OP_ENABLE, SET_LOGIC_OP: OpenGL's), which replaces blending.
+    if (state(0x0374)) d.logic = true, d.logic_op = state(0x0378);
+    // State this renderer doesn't take, refused by name rather than ignored: polygon stipple (Vulkan has none).
+    // Two-sided colours (SET_TWO_SIDE_LIGHT_EN): on back faces the vertex program's back colours.
+    d.two_sided = state(0x142c) != 0;
+    // User clip planes (SET_USER_CLIP_PLANE_CONTROL: a plane's test in each of the low six nibbles, 0 off, 1 LT, 2 GE).
+    d.clip_planes = state(0x1478);
+    for (unsigned n = 0; n < 8; ++n)
+        if (const uint32_t test = (d.clip_planes >> (4 * n)) & 0xf; test > 2 || (n >= 6 && test))
+            fatal("a draw with user clip plane %u's test %u, which the renderer doesn't know (at offset %08x)", n, test, at);
     if (state(0x147c)) fatal("a draw with polygon stipple, which the renderer doesn't take yet (at offset %08x)", at);
-    for (const uint32_t mode : {state(0x1828), state(0x182c)})
-        if (mode && mode != 0x1b02) fatal("a draw with polygons drawn as %s, which the renderer doesn't take yet (at offset %08x)", mode == 0x1b00 ? "points" : "lines", at);
+    // Line stipple (SET_LINE_STIPPLE): refused by the renderer where lines are drawn (Vulkan 1.3 has none either).
+    d.line_stipple = state(0x1db4) != 0;
     // The alpha test (SET_ALPHA_FUNC: OpenGL's NEVER 0x200 to ALWAYS 0x207, bit 0 less, bit 1 equal, bit 2 greater; SET_ALPHA_REF):
     // on 8-bit surfaces the reference's low byte against the alpha as stored. *Its reference on a float surface isn't known here.*
     if (state(0x0304)) {
@@ -392,8 +426,10 @@ void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
                 qilin::rt::log("(draw)   texture %u at %08x format %08x size %ux%u remap %08x", u, t.address, t.format, t.rect >> 16, t.rect & 0xffff, t.remap);
                 // Each texture once, decoded as the renderer decodes it (its first level), to texture-<address>.bmp.
                 static std::map<uint32_t, bool> written;
-                Texels tx;
-                if (!written[t.address] && decode_texture(t, guest_memory(), tx).empty()) {
+                std::expected<Texels, std::string> decoded = std::unexpected(std::string("written already"));
+                if (!written[t.address]) decoded = decode_texture(t, guest_memory());
+                if (decoded) {
+                    const Texels& tx = *decoded;
                     written[t.address] = true;
                     char name[64];
                     std::snprintf(name, sizeof name, "texture-%08x.bmp", t.address);
@@ -714,6 +750,8 @@ void serve() {
     // And the clear's rectangle (SET_CLEAR_RECT_HORIZONTAL, VERTICAL: origin and size) covering everything: the game never
     // sets it and clears with it, so the system's start-up must (*a stated choice*: 0 to 4095 each way, clipped to the surface).
     r.state[0x1d98 / 4] = r.state[0x1d9c / 4] = 0x0fff0000u;
+    // And the edge flag (SET_EDGE_FLAG) on, as OpenGL starts it (*a stated choice*: what the system leaves isn't known here).
+    r.state[0x1454 / 4] = 1;
     g_survey = std::getenv("RR7_RSX_SURVEY") != nullptr;
     g_trace = std::getenv("RR7_RSX_TRACE") != nullptr;
     g_survey_ends = std::chrono::steady_clock::now() + std::chrono::seconds(10);

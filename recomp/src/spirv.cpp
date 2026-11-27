@@ -83,6 +83,20 @@ uint32_t Module::constant_composite(uint32_t type, std::initializer_list<uint32_
     }
 }
 
+uint32_t Module::spec_constant_int(uint32_t spec_id, int32_t default_value) {
+    const uint32_t result = id();
+    const uint32_t operands[] = {type_int(), result, static_cast<uint32_t>(default_value)};
+    put(globals_, OpSpecConstant, operands);
+    decorate(result, kDecorationSpecId, {spec_id});
+    return result;
+}
+
+void Module::capability(uint32_t c) {
+    for (size_t i = 0; i < capabilities_.size(); ++i)
+        if (capabilities_[i] == c) return;
+    capabilities_.push_back(c);
+}
+
 uint32_t Module::variable(uint32_t storage, uint32_t type) {
     const uint32_t result = id();
     const uint32_t operands[] = {type_pointer(storage, type), result, storage};
@@ -176,6 +190,10 @@ std::vector<uint32_t> Module::words() const {
     std::vector<uint32_t> w{0x07230203u, 0x00010300u /* SPIR-V 1.3 */, 0 /* generator */, next_, 0};
     const uint32_t capability[] = {kCapabilityShader};
     put(w, OpCapability, capability);
+    for (const uint32_t c : capabilities_) {
+        const uint32_t more[] = {c};
+        put(w, OpCapability, more);
+    }
     std::vector<uint32_t> import{glsl_};
     const std::vector<uint32_t> s = text("GLSL.std.450");
     import.insert(import.end(), s.begin(), s.end());

@@ -248,6 +248,7 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/np.cpp
     ridgeracer7/src/pad.cpp
     ridgeracer7/src/renderer.cpp
+    ridgeracer7/src/renderer_pipelines.cpp
     ridgeracer7/src/render_formats.cpp
     ridgeracer7/src/render_state.cpp
     ridgeracer7/src/textures.cpp
@@ -271,7 +272,7 @@ add_library(ridgeracer7_machine STATIC
 target_include_directories(ridgeracer7_machine PUBLIC ridgeracer7/src)
 # Vulkan structures are written {sType} with the rest zeroed: the idiom, not a mistake (as host/'s sources).
 if(NOT MSVC)
-    set_source_files_properties(ridgeracer7/src/renderer.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
+    set_source_files_properties(ridgeracer7/src/renderer.cpp ridgeracer7/src/renderer_pipelines.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
 endif()
 if(NOT TARGET qilin_host)
     message(FATAL_ERROR "the game's machine needs the host layer: configure with -DQILIN_HOST=ON")

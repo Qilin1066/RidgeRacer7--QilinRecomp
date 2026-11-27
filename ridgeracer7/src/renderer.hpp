@@ -1,13 +1,12 @@
 // The RSX's drawing, on Vulkan (renderer.cpp). The RSX thread (rsx.cpp)
 // reads the commands and gathers each draw's state; this draws it.
 //
-// **The first design, chosen for being plainly correct, not fast:** guest
-// memory is the only truth. Each draw uploads its colour surface from guest
-// memory, draws, and writes it back; a flip reads the display buffer from
-// guest memory. So whatever the game reads from memory (a render target as a
-// texture, a picture the CPU looks at) is what was drawn. Keeping surfaces
-// on the GPU and writing them back only when something reads them is the
-// next design, once the picture is right.
+// Guest memory is the truth wherever the game can look: draws are recorded
+// into batches, surfaces stay on the GPU between the points where the game
+// can look, and what was drawn goes back to guest memory when something
+// first touches it (docs/runtime.md). The pure parts are render_formats
+// (guest memory to the GPU and back), render_state (primitives, polygons, the
+// window) and textures; renderer_pipelines makes the Vulkan objects.
 //
 // Runtime code: no std::format.
 #pragma once

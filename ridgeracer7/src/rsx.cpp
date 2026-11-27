@@ -134,11 +134,25 @@ constexpr StateMethods kState[] = {
     {0xa30c, 1, "NV308A SIZE_IN"},
 };
 
-bool is_state(uint32_t method) {
+// The table as a bit a method, made when the program is compiled: every command word asks.
+constexpr auto kStateBits = [] {
+    std::array<uint64_t, 0x10000 / 4 / 64> bits{};
     for (const StateMethods& m : kState)
-        if (method >= m.first && method < m.first + 4u * m.count) return true;
-    return false;
-}
+        for (uint32_t i = 0; i < m.count; ++i) {
+            const uint32_t word = (m.first + 4u * i) / 4;
+            bits[word / 64] |= uint64_t{1} << (word % 64);
+        }
+    return bits;
+}();
+constexpr bool is_state(uint32_t method) { return method < 0x10000 && ((kStateBits[method / 4 / 64] >> (method / 4 % 64)) & 1) != 0; }
+// (Every run's ends are in, and methods that act are not.)
+static_assert([] {
+    for (const StateMethods& m : kState)
+        if (!is_state(m.first) || !is_state(m.first + 4u * (m.count - 1u))) return false;
+    for (const uint32_t acting : {0x0050u, 0x0064u, 0x0068u, 0x006cu, 0x0100u, 0x1808u, 0x1814u, 0x1824u, 0x1d70u, 0x1d74u, 0x1d94u, 0x1e9cu, 0x1efcu, 0xa400u, 0x10000u})
+        if (is_state(acting)) return false;
+    return true;
+}());
 
 // A development aid, never a way to play: with RR7_RSX_SURVEY set in the environment, methods not yet
 // provided are counted, not run, and at the first flip (or after ten seconds) the list is printed and

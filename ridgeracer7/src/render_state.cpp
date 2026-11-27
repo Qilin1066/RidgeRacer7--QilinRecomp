@@ -69,7 +69,7 @@ std::expected<Assembly, std::string> assemble(uint32_t primitive, std::span<cons
                                               std::vector<uint32_t>& indices) {
     indices.clear();
     if (primitive < 1 || primitive > 10 || primitive == 3) return std::unexpected(what("a draw of primitive %u, which the renderer doesn't take yet", primitive));
-    const bool restart = std::ranges::find(order, kRestart) != order.end();
+    const bool restart = given_indexed && std::ranges::find(order, kRestart) != order.end();  // (0, 1, 2... has none)
     if (!restart && provoking == Provoking::any) {
         switch (primitive) {
         case 1: return Assembly{Topology::points, given_indexed, false};

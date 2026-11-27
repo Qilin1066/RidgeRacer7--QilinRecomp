@@ -8,7 +8,7 @@ A static recompilation of **Ridge Racer 7** (Namco Bandai Games, PlayStation 3, 
 
 ## Status
 
-Runs from start-up through its logos, title film and menus to its first race, with the 3D world drawn, music, films, a controller and saves. Some drawing is still wrong, there is no settings menu, and it has only been built and run on Windows.
+Runs from start-up through its logos, title film and menus to its first race, with the 3D world drawn, music, films, a controller and saves. Some drawing is still wrong, and it has only been built and run on Windows.
 
 | Part | State |
 |---|---|
@@ -23,7 +23,7 @@ Runs from start-up through its logos, title film and menus to its first race, wi
 | Films and sound | ✅ MPEG-2 and ATRAC3plus through FFmpeg's decoders |
 | Controller | ✅ gamepad or keyboard, triggers with pressure |
 | Thread scheduling | 🔨 priorities not honoured yet |
-| Settings menu (F1) | ⏳ |
+| Settings menu (F1) | ✅ controls, display, the console's settings; pauses the game |
 | CI | ✅ six configurations, warnings as errors; the game itself needs your copy, so isn't built there |
 
 ## Playing
@@ -75,7 +75,10 @@ A gamepad works as the DualShock 3 in the first port. On the keyboard:
 | Z | Cross | 1 / 2 | L2 / R2 |
 | X | Circle | Return | Start |
 | A | Square | Backspace | Select |
-| S | Triangle | | |
+| S | Triangle | C / V | L3 / R3 |
+| I J K L | Left stick | Keypad 8 4 2 6 | Right stick |
+
+F1 or Esc (a controller: Back and Start together) opens the settings menu over the game, which pauses: every button can be set there by pressing the key or pad button for it, and the picture, the display and the console's language and confirming button changed. F11 or Alt+Enter is full screen, F3 shows the frame times. The settings are kept in `ridgeracer7.ini`.
 
 Saves go in `qilin/ridgeracer7` in your per-user application data, or in `RIDGERACER7_SAVE_DIR`.
 
@@ -90,7 +93,7 @@ The whole project is **C++23**. You need CMake 3.25 or newer and one of:
 | Apple Clang | Xcode 16 | |
 | MSVC | Visual Studio 2022 17.10 | |
 
-CMake stops with a clear message if the compiler is older or the target is 32-bit. It fetches and pins SDL3, the Vulkan headers, volk, FreeType and part of FFmpeg's libavcodec (`cmake/ffmpeg.cmake`). On Linux, SDL3 needs the X11, Wayland and sound development packages listed in `.github/workflows/ci.yml`. The checks need Python 3.
+CMake stops with a clear message if the compiler is older or the target is 32-bit. It fetches and pins SDL3, the Vulkan headers, volk, Dear ImGui, FreeType and part of FFmpeg's libavcodec (`cmake/ffmpeg.cmake`). On Linux, SDL3 needs the X11, Wayland and sound development packages listed in `.github/workflows/ci.yml`. The checks need Python 3.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

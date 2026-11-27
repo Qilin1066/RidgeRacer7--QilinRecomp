@@ -48,8 +48,14 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The control-flow pass proves 293 of the 296 switches' sizes from the bound the code checks (264 before): the compare is found anywhere above its branch, stopping at anything else that writes the same CR field, and a switch's block may follow another's table or be entered by `bgt` then `b`. Every newly proven size equals the size found before; unit tests hold each rule.
 - The depth bounds test, as Vulkan's (the stored depth against the bounds, which are part of the pipeline); a GPU without it stops the game by name. The game uses it on its way to a race.
 - `RR7_SAVE_FRAME` takes a list of flips; `RR7_DRAWLOG` gives each draw's viewport, clip and scissor.
+- The settings menu, the other Qilin recomps' (Dear ImGui, fetched and pinned at WindWakerHD's commit, v1.93.0): F1 or Esc (a controller: Back and Start) opens it over the game, which pauses; Close and Quit top right; closing saves `ridgeracer7.ini` in the data folder. Controls (press-to-bind each DualShock 3 button and stick direction to keys, a pad's buttons or the mouse), Display (full screen, the display, whole multiples, fit or fill, smooth or sharp, the CRT look, vsync, the refresh's matching, the graphics device, frame times on F3 with the display's refresh), Game (the console's language, English or Japanese, which button confirms, its nickname, the user's name and the time zone, which `cellSysutilGetSystemParamInt` and `String` now give the game). The enhancements the renderer can't do yet are shown greyed out (`docs/runtime.md`).
+- The pause under the menu (`pause.*`): the RSX's thread at a flip, the vertical blank's before its handler and the sound mixer's are held, each where it holds no lock and runs none of the game's code; the vertical blank goes on from the next, not catching up.
+- `ridgeracer7_settings_test` (in `ctest`): the settings file read and written, bad lines refused by number, the controller built from the bindings (the triggers' pressure, the sticks' keys), the pause holding a thread and letting it go.
+- `host/`: `Display::pause_frame_times` and `refresh_hz`, from WindWakerHD's.
 
 ### Changed
+- The controller's layout is the settings' (`[controls]`), its defaults the keyboard layout `main.cpp` had; L2 and R2 bound to a pad's triggers keep their pressure.
+- `host/`: `present_again` no longer stops the frame times (as WindWakerHD's): showing the last picture again between the game's no longer drops the next frame time.
 - README rewritten to the layout shared by the QilinRecomp projects: what works and how to build and play it, without the development history.
 
 ### Checked

@@ -19,6 +19,7 @@
 #include <thread>
 
 #include "kernel.hpp"
+#include "pause.hpp"
 #include "qilin/rt/report.hpp"
 
 namespace rr7 {
@@ -295,6 +296,8 @@ void vblank_thread() {
     // (From the next blank on the shared clock.)
     const auto since = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - g_vblank_origin).count();
     for (uint64_t n = static_cast<uint64_t>(since) * 60 / 1001000000ull + 1;; ++n) {
+        // Held while the settings menu pauses the game (pause.hpp), then on from the next blank, not catching up.
+        if (hold_while_paused(HoldPoint::vertical_blank)) n = next_vertical_blank();
         std::this_thread::sleep_until(vblank_time(n));
         g_vblanks.store(n, std::memory_order_relaxed);
         if (const uint32_t handler = g_vblank_handler.load()) {

@@ -1,9 +1,11 @@
 // cellSysutil: the console's settings a game may read.
 //
-// These are what the settings menu's "Game" page will hold (the roadmap):
-// for now they are the fixed values below, a console set up in US English.
-// A parameter the game asks for that isn't here stops the game with its
-// number, so that none is answered blindly.
+// The language, which button confirms, the nickname, the user's name and the
+// time zone are the settings menu's "Game" page ([console] in the settings
+// file: settings.hpp, given before the game starts); the rest are the fixed
+// values below, a console set up in the United States. A parameter the game
+// asks for that isn't here stops the game with its number, so that none is
+// answered blindly.
 #include <algorithm>
 #include <cstring>
 #include <deque>
@@ -11,6 +13,7 @@
 #include <utility>
 
 #include "kernel.hpp"
+#include "settings.hpp"
 #include "qilin/rt/report.hpp"
 
 namespace rr7 {
@@ -21,29 +24,26 @@ namespace {
 constexpr uint32_t kLanguage = 0x0111, kEnterButton = 0x0112, kNickname = 0x0113, kDateFormat = 0x0114, kTimeFormat = 0x0115, kTimeZone = 0x0116,
                    kSummerTime = 0x0117, kParentalLevel = 0x0121, kUserName = 0x0131;
 
-struct ConsoleSettings {
-    int32_t language = 1;      // English (US); 0 is Japanese
-    int32_t enter_button = 1;  // cross confirms (0: circle, as on a Japanese console)
+// The fixed ones (the settings' are console_settings()). The date and time formats' numbers are kept as they were: their
+// meanings aren't confirmed by a public header, so they aren't offered as settings.
+struct FixedSettings {
     int32_t date_format = 2;   // month, day, year
-    int32_t time_format = 0;   // 12-hour
-    int32_t time_zone = 0;     // minutes from UTC
+    int32_t time_format = 0;   // the clock's format
     int32_t summer_time = 0;
     int32_t parental_level = 0;  // off
-    const char* nickname = "PS3";
-    const char* user_name = "User";
 };
-const ConsoleSettings g_settings;
+constexpr FixedSettings g_settings;
 
 // cellSysutilGetSystemParamInt(id, int* value)
 void cellSysutilGetSystemParamInt(Cpu& c) {
     const uint32_t id = static_cast<uint32_t>(c.r[3]), out = static_cast<uint32_t>(c.r[4]);
     int32_t value;
     switch (id) {
-    case kLanguage: value = g_settings.language; break;
-    case kEnterButton: value = g_settings.enter_button; break;
+    case kLanguage: value = console_settings().language; break;
+    case kEnterButton: value = console_settings().enter_button; break;
     case kDateFormat: value = g_settings.date_format; break;
     case kTimeFormat: value = g_settings.time_format; break;
-    case kTimeZone: value = g_settings.time_zone; break;
+    case kTimeZone: value = console_settings().time_zone; break;
     case kSummerTime: value = g_settings.summer_time; break;
     case kParentalLevel: value = g_settings.parental_level; break;
     default: qilin::rt::fatal("cellSysutilGetSystemParamInt: the game asks for system parameter %#x, which this runtime has no value for yet", id);
@@ -57,8 +57,8 @@ void cellSysutilGetSystemParamString(Cpu& c) {
     const uint32_t id = static_cast<uint32_t>(c.r[3]), buffer = static_cast<uint32_t>(c.r[4]), size = static_cast<uint32_t>(c.r[5]);
     const char* value;
     switch (id) {
-    case kNickname: value = g_settings.nickname; break;
-    case kUserName: value = g_settings.user_name; break;
+    case kNickname: value = console_settings().nickname.c_str(); break;
+    case kUserName: value = console_settings().user_name.c_str(); break;
     default: qilin::rt::fatal("cellSysutilGetSystemParamString: the game asks for system parameter %#x, which this runtime has no value for yet", id);
     }
     if (size == 0) {
@@ -227,7 +227,7 @@ constexpr NativeImport kImports[] = {
 
 }  // namespace
 
-int32_t console_time_zone_minutes() { return g_settings.time_zone; }
+int32_t console_time_zone_minutes() { return console_settings().time_zone; }
 int32_t console_summer_time_minutes() { return g_settings.summer_time; }
 
 bool take_dialog(std::string& text, uint32_t& buttons) {

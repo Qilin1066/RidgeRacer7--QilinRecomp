@@ -25,9 +25,11 @@
 #include <set>
 #include <thread>
 #include <vector>
-#include <string>
 
 #include "machine.hpp"
+#include "menu.hpp"
+#include "pause.hpp"
+#include "settings.hpp"
 #include "qilin/host/audio.hpp"
 #include <SDL3/SDL.h>
 
@@ -63,51 +65,29 @@ void write_bmp(uint64_t n, const uint8_t* rgba, uint32_t width, uint32_t height)
     qilin::rt::log("flip %llu written to %s", static_cast<unsigned long long>(n), name);
 }
 
-// The controller from the window's gamepad, and from the keyboard until the settings menu holds a layout (*the default
-// layout is a stated choice*: arrows the d-pad, Z cross, X circle, A square, S triangle, Q L1, W R1, 1 L2, 2 R2, Return
-// start, Backspace select). The gamepad's triggers are L2 and R2 with their pressure, so that a race's throttle and brake
-// can be held part way (down past a sixteenth; a key or a test's press is all the way). `pressed` adds buttons a test asks
-// for (RR7_PRESS).
-rr7::PadState read_pad(const qilin::host::Display& display, uint16_t pressed1, uint16_t pressed2) {
-    namespace host = qilin::host;
-    rr7::PadState pad;
-    const uint32_t b = display.buttons();
-    const auto key = [&](const char* name) { return display.key_down(display.key_code(name)); };
-    struct Map {
-        uint32_t host;
-        const char* key;
-        bool second;
-        uint16_t bit;
-        int pressure;  // its place among the pressures, or -1
-    };
-    static constexpr Map kMap[] = {
-        {host::kPadBack, "Backspace", false, 0x01, -1}, {host::kPadL3, nullptr, false, 0x02, -1},   {host::kPadR3, nullptr, false, 0x04, -1},
-        {host::kPadStart, "Return", false, 0x08, -1},   {host::kPadUp, "Up", false, 0x10, 2},        {host::kPadRight, "Right", false, 0x20, 0},
-        {host::kPadDown, "Down", false, 0x40, 3},       {host::kPadLeft, "Left", false, 0x80, 1},    {0, "1", true, 0x01, 10},
-        {0, "2", true, 0x02, 11},                       {host::kPadLB, "Q", true, 0x04, 8},          {host::kPadRB, "W", true, 0x08, 9},
-        {host::kPadY, "S", true, 0x10, 4},              {host::kPadB, "X", true, 0x20, 5},           {host::kPadA, "Z", true, 0x40, 6},
-        {host::kPadX, "A", true, 0x80, 7},
-    };
-    for (const Map& m : kMap) {
-        const bool down = (b & m.host) || (m.key && key(m.key)) || ((m.second ? pressed2 : pressed1) & m.bit);
-        if (!down) continue;
-        (m.second ? pad.digital2 : pad.digital1) |= m.bit;
-        if (m.pressure >= 0) pad.pressure[m.pressure] = 255;
-    }
-    float left = 0, right = 0;
-    display.triggers(left, right);
-    for (const auto& [pull, bit, place] : {std::tuple{left, uint16_t{0x01}, 10}, std::tuple{right, uint16_t{0x02}, 11}}) {
-        if (pull <= 1.0f / 16) continue;
-        pad.digital2 |= bit;
-        pad.pressure[place] = std::max(pad.pressure[place], static_cast<uint16_t>(std::lround(pull * 255.0f)));
-    }
-    const auto axis = [](float v) { return static_cast<uint16_t>(std::clamp(128.0f + v * 127.5f, 0.0f, 255.0f)); };
-    float x = 0, y = 0;
-    display.left_stick(x, y);
-    pad.left_x = axis(x), pad.left_y = axis(-y);
-    display.right_stick(x, y);
-    pad.right_x = axis(x), pad.right_y = axis(-y);
+// The controller from the window's gamepad and the keyboard, through the settings' bindings (settings.hpp). `pressed` adds
+// buttons a test asks for (RR7_PRESS).
+rr7::PadState read_pad(const qilin::host::Display& display, const rr7::ControlTable& controls, uint16_t pressed1, uint16_t pressed2) {
+    rr7::HostInput in;
+    in.buttons = display.buttons();
+    in.key_down = [&](int code) { return display.key_down(code); };
+    display.left_stick(in.left_x, in.left_y);
+    display.right_stick(in.right_x, in.right_y);
+    display.triggers(in.left_trigger, in.right_trigger);
+    rr7::PadState pad = rr7::compose(controls, in);
+    pad.digital1 |= pressed1, pad.digital2 |= pressed2;
     return pad;
+}
+
+// The bindings' table for the window's keys. A key the window system doesn't know by the name the settings give stops the
+// game, naming it, rather than leaving the control silently dead.
+rr7::ControlTable control_table(const qilin::host::Display& display, const rr7::Settings& settings, const std::filesystem::path& folder) {
+    std::vector<std::string> unknown;
+    rr7::ControlTable t = rr7::control_table(settings, [&](const std::string& name) { return display.key_code(name.c_str()); }, unknown);
+    if (!unknown.empty())
+        qilin::rt::fatal("%s: [controls] names a key the window system doesn't know: \"%s\" (SDL's key names: A, 1, Return, Left Shift, Keypad 8...)",
+                         rr7::settings_file(folder).string().c_str(), unknown.front().c_str());
+    return t;
 }
 
 // A development aid: RR7_PRESS=<button>@<flip>[,...] holds a button for six flips from that flip (cross, circle, square,
@@ -190,6 +170,10 @@ int main(int argc, char** argv) {
         std::filesystem::create_directories(info.hdd / "game", error);
         if (error) fatal("can't create %s: %s", (info.hdd / "game").string().c_str(), error.message().c_str());
     }
+    // The settings file (ridgeracer7.ini), in the data folder with the saves; the console's settings the game reads from it.
+    const std::filesystem::path data_folder = qilin::host::user_folder();
+    static rr7::Settings settings = rr7::load_settings(data_folder);
+    rr7::set_console_settings(rr7::console_of(settings));
     if (files->sfo.empty()) fatal("%s: no PARAM.SFO was found for this copy (give the disc's folder, the one holding PS3_GAME)", argv[1]);
     const auto sfo = qilin::Sfo::load(files->sfo);
     if (!sfo) fatal("%s", sfo.error().c_str());
@@ -206,6 +190,8 @@ int main(int argc, char** argv) {
     } else {
         rr7::set_audio_sink([](const int16_t* left_right, size_t frames) {
             static qilin::host::AudioOut out;
+            // Held while the settings menu pauses the game (pause.hpp): the game's sound ports aren't read on.
+            rr7::hold_while_paused(rr7::HoldPoint::sound);
             out.push(left_right, frames, 48000);
         });
     }
@@ -215,10 +201,17 @@ int main(int argc, char** argv) {
     o.title = "Ridge Racer 7";
     o.width = 1280, o.height = 720;
     o.headless = quiet;
+    o.fullscreen = settings.fullscreen && !quiet;
+    o.monitor = settings.monitor;
+    o.picture = rr7::picture_of(settings);
+    host::Gpu::prefer(settings.gpu);
     host::Display display(o);
     qilin::rt::log("graphics device: %s", display.device_name().c_str());
     static std::mutex queue;  // the GPU's queue: the renderer's draws and the window's presentation take turns on it
     rr7::renderer_start(display.gpu(), queue);
+    // The settings menu (F1 or Esc), over the game; none headless.
+    rr7::Menu menu(display, settings, data_folder, queue);
+    rr7::ControlTable controls = quiet ? rr7::ControlTable{} : control_table(display, settings, data_folder);
     // Each flip's picture, kept for the window until it is shown.
     static std::mutex frame_mutex;
     static std::vector<uint8_t> frame;
@@ -238,19 +231,23 @@ int main(int argc, char** argv) {
         return s;
     }();
     rr7::set_present_sink([](const rr7::Frame& f) {
-        const std::lock_guard lock(frame_mutex);
-        // (A picture on the GPU is kept as its number: the window shows it from there.)
-        if (f.rgba) frame.assign(f.rgba, f.rgba + size_t{f.width} * f.height * 4);
-        else frame.clear();
-        gpu_frame = f.gpu_frame;
-        frame_width = f.width, frame_height = f.height;
-        const uint64_t n = ++flips;
-        if (n == 1 || n % 600 == 0) qilin::rt::log("flip %llu: %ux%u", static_cast<unsigned long long>(n), f.width, f.height);
-        if (save_frames.contains(n)) {
-            std::vector<uint8_t> pixels;
-            if (!f.rgba) rr7::renderer_frame_pixels(f.gpu_frame, pixels);
-            write_bmp(n, f.rgba ? f.rgba : pixels.data(), f.width, f.height);
+        {
+            const std::lock_guard lock(frame_mutex);
+            // (A picture on the GPU is kept as its number: the window shows it from there.)
+            if (f.rgba) frame.assign(f.rgba, f.rgba + size_t{f.width} * f.height * 4);
+            else frame.clear();
+            gpu_frame = f.gpu_frame;
+            frame_width = f.width, frame_height = f.height;
+            const uint64_t n = ++flips;
+            if (n == 1 || n % 600 == 0) qilin::rt::log("flip %llu: %ux%u", static_cast<unsigned long long>(n), f.width, f.height);
+            if (save_frames.contains(n)) {
+                std::vector<uint8_t> pixels;
+                if (!f.rgba) rr7::renderer_frame_pixels(f.gpu_frame, pixels);
+                write_bmp(n, f.rgba ? f.rgba : pixels.data(), f.width, f.height);
+            }
         }
+        // The RSX's thread is held here, its picture handed over, while the settings menu pauses the game (pause.hpp).
+        rr7::hold_while_paused(rr7::HoldPoint::flip);
     });
     static rr7::GameInfo game_info = std::move(info);
     static const qilin::Elf* program = &*elf;
@@ -272,6 +269,13 @@ int main(int argc, char** argv) {
     const char* seconds = std::getenv("RR7_SECONDS");
     const auto ends = std::chrono::steady_clock::now() + std::chrono::seconds(seconds ? std::strtoull(seconds, nullptr, 10) : 0);
     while (display.poll()) {
+        menu.tick();
+        if (menu.quit_requested()) {
+            qilin::rt::log("quit from the settings menu");
+            std::fflush(nullptr);
+            rr7::exit_process(0);
+        }
+        if (menu.take_controls_changed()) controls = control_table(display, settings, data_folder);
         if (seconds && std::chrono::steady_clock::now() > ends) {
             const std::lock_guard lock(frame_mutex);
             if (gpu_frame >= 0) rr7::renderer_frame_pixels(gpu_frame, frame);
@@ -288,12 +292,12 @@ int main(int argc, char** argv) {
             const uint64_t now = flips;
             for (const Press& p : presses)
                 if (now >= p.flip && now < p.flip + 6) (p.second ? pressed2 : pressed1) |= p.bit;
-            if (quiet) {
+            if (quiet || menu.is_open()) {  // (the menu's input isn't the game's)
                 rr7::PadState pad;
                 pad.digital1 = pressed1, pad.digital2 = pressed2;
                 rr7::set_pad_state(pad);
             } else {
-                rr7::set_pad_state(read_pad(display, pressed1, pressed2));
+                rr7::set_pad_state(read_pad(display, controls, pressed1, pressed2));
             }
         }
         // A dialog of the system's that asks the player something: a message box of the host's, over the window.
@@ -323,6 +327,7 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
+        if (menu.is_open()) display.pause_frame_times();  // the pause isn't a frame time
         if (flips != shown) {
             int on_gpu = -1;
             {

@@ -7,9 +7,9 @@
 // structure itself and only goes to the system when it must wait. Here the
 // lock is a host object found by the id in the structure; the owner and
 // the recursion count are written back to the structure as the library
-// would leave them, in case anything reads them.
-#include <chrono>
-#include <condition_variable>
+// would leave them, in case anything reads them. Waiters are woken in the
+// attribute's order (first come, or by priority: kernel_sched.hpp), and
+// the one woken is handed the mutex.
 
 #include "kernel.hpp"
 #include "qilin/rt/report.hpp"
@@ -26,7 +26,7 @@ constexpr uint32_t kFifo = 1, kPriority = 2, kRetry = 4;               // ... an
 
 struct LwMutex {
     std::mutex mutex;
-    std::condition_variable freed;
+    WaitQueue waiters;
     uint32_t owner = 0;  // a thread id, or 0
     uint32_t count = 0;  // how many times the owner has it
     bool recursive = false;
@@ -48,6 +48,9 @@ void sys_lwmutex_create(Cpu& c) {
         return;
     }
     auto object = std::make_shared<LwMutex>();
+    WakeOrder order{};
+    wake_order(protocol, order);  // (a lightweight mutex's SYS_SYNC_RETRY is first come, first woken: a stated reading)
+    object->waiters = WaitQueue(order);
     object->recursive = recursive == kRecursive;
     const uint32_t id = g_lwmutexes.add(std::move(object));
     store32(lwmutex + kOwner, kFree);
@@ -89,6 +92,7 @@ void lock(Cpu& c, bool wait) {
         return;
     }
     const uint32_t me = current_thread();
+    Blocking blocking;  // (before the lock: the token is taken back once the lock is let go)
     std::unique_lock lock(object->mutex);
     if (object->owner == me) {
         if (!object->recursive) {
@@ -104,14 +108,17 @@ void lock(Cpu& c, bool wait) {
             c.r[3] = kEbusy;
             return;
         }
-        if (timeout) {
-            if (!object->freed.wait_for(lock, std::chrono::microseconds(timeout), [&] { return object->owner == 0; })) {
-                c.r[3] = kEtimedout;
-                return;
-            }
-        } else {
-            object->freed.wait(lock, [&] { return object->owner == 0; });
+        Waiter self;
+        self.thread = me;
+        object->waiters.push(self);
+        blocking.release();
+        if (!self.wait(lock, timeout)) {
+            object->waiters.remove(self);
+            c.r[3] = kEtimedout;
+            return;
         }
+        c.r[3] = kOk;  // (handed over by the unlock, which wrote the structure)
+        return;
     }
     object->owner = me;
     object->count = 1;
@@ -130,22 +137,27 @@ void sys_lwmutex_unlock(Cpu& c) {
         c.r[3] = kEsrch;
         return;
     }
-    {
-        const std::lock_guard lock(object->mutex);
-        if (object->owner != current_thread()) {
-            c.r[3] = kEperm;
-            return;
-        }
-        if (--object->count) {
-            store32(lwmutex + kRecursiveCount, object->count);
-            c.r[3] = kOk;
-            return;
-        }
+    const std::lock_guard lock(object->mutex);
+    if (object->owner != current_thread()) {
+        c.r[3] = kEperm;
+        return;
+    }
+    if (--object->count) {
+        store32(lwmutex + kRecursiveCount, object->count);
+        c.r[3] = kOk;
+        return;
+    }
+    if (Waiter* const w = object->waiters.pop()) {  // handed to the next waiter
+        object->owner = w->thread;
+        object->count = 1;
+        store32(lwmutex + kOwner, w->thread);
+        store32(lwmutex + kRecursiveCount, 1);
+        w->wake();
+    } else {
         object->owner = 0;
         store32(lwmutex + kOwner, kFree);
         store32(lwmutex + kRecursiveCount, 0);
     }
-    object->freed.notify_one();
     c.r[3] = kOk;
 }
 

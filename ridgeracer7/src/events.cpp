@@ -8,10 +8,12 @@
 // queue, is something to send from. The receive call returns the event in
 // registers r4 to r7, not through its pointer: the game's own code stores
 // them (read off the code after each `sc`).
+//
+// Threads waiting to receive are woken in the queue's order (first come, or
+// by priority: kernel_sched.hpp), and an event sent while one waits goes
+// straight to the one woken.
 #include "events.hpp"
 
-#include <chrono>
-#include <condition_variable>
 #include <deque>
 
 #include "kernel.hpp"
@@ -23,7 +25,7 @@ namespace {
 
 struct Queue {
     std::mutex mutex;
-    std::condition_variable arrived;
+    WaitQueue receivers;      // (while any waits, no event is queued: each goes to one of them)
     std::deque<Event> events;
     size_t capacity = 0;
     uint64_t key = 0;
@@ -40,6 +42,46 @@ struct Port {
 };
 ObjectTable<Port> g_ports(0x0E000001u);
 
+// Takes the next event from a queue, waiting for one (for `timeout` microseconds if that isn't 0).
+uint64_t receive(Queue& queue, Event& event, uint64_t timeout) {
+    Blocking blocking;  // (before the lock: the token is taken back once the lock is let go)
+    std::unique_lock lock(queue.mutex);
+    if (!queue.events.empty()) {
+        event = queue.events.front();
+        queue.events.pop_front();
+        return kOk;
+    }
+    if (queue.destroyed) return kEcanceled;
+    Waiter self;
+    self.thread = current_thread();
+    queue.receivers.push(self);
+    blocking.release();
+    if (!self.wait(lock, timeout)) {
+        queue.receivers.remove(self);
+        return kEtimedout;
+    }
+    if (self.status != kOk) return self.status;
+    event = {self.data[0], self.data[1], self.data[2], self.data[3]};
+    return kOk;
+}
+
+// Marks a queue destroyed: its waiting threads are woken with "cancelled".
+void cancel(Queue& queue) {
+    const std::lock_guard lock(queue.mutex);
+    queue.destroyed = true;
+    while (Waiter* const w = queue.receivers.pop()) {
+        w->status = kEcanceled;
+        w->wake();
+    }
+}
+
+// The waking order an event queue's attribute asks for (it begins with it); anything else stops the game, naming it.
+WakeOrder queue_order(uint32_t attribute) {
+    const uint32_t protocol = load32(attribute);
+    if (protocol != kSyncFifo && protocol != kSyncPriority) qilin::rt::fatal("sys_event_queue_create with protocol %u, which this runtime doesn't know", protocol);
+    return protocol == kSyncFifo ? WakeOrder::Fifo : WakeOrder::Priority;
+}
+
 // sys_event_queue_create(sys_event_queue_t* id, attribute*, key, size)
 void sys_event_queue_create(Cpu& c) {
     const uint32_t out = static_cast<uint32_t>(c.r[3]);
@@ -54,6 +96,7 @@ void sys_event_queue_create(Cpu& c) {
         return;
     }
     auto queue = std::make_shared<Queue>();
+    queue->receivers = WaitQueue(queue_order(static_cast<uint32_t>(c.r[4])));
     queue->capacity = static_cast<size_t>(size);
     queue->key = key;
     const uint32_t id = g_queues.add(std::move(queue));
@@ -73,11 +116,7 @@ void sys_event_queue_destroy(Cpu& c) {
         c.r[3] = kEsrch;
         return;
     }
-    {
-        const std::lock_guard lock(queue->mutex);
-        queue->destroyed = true;
-    }
-    queue->arrived.notify_all();
+    cancel(*queue);
     if (queue->key) {
         const std::lock_guard lock(g_keys_mutex);
         g_keys.erase(queue->key);
@@ -94,22 +133,12 @@ void sys_event_queue_receive(Cpu& c) {
         c.r[3] = kEsrch;
         return;
     }
-    std::unique_lock lock(queue->mutex);
-    const auto ready = [&] { return !queue->events.empty() || queue->destroyed; };
-    if (timeout) {
-        if (!queue->arrived.wait_for(lock, std::chrono::microseconds(timeout), ready)) {
-            c.r[3] = kEtimedout;
-            return;
-        }
-    } else {
-        queue->arrived.wait(lock, ready);
-    }
-    if (queue->events.empty()) {
-        c.r[3] = kEcanceled;
+    Event event;
+    const uint64_t result = receive(*queue, event, timeout);
+    if (result != kOk) {
+        c.r[3] = result;
         return;
     }
-    const Event event = queue->events.front();
-    queue->events.pop_front();
     c.r[4] = event.source;
     c.r[5] = event.data1;
     c.r[6] = event.data2;
@@ -215,24 +244,21 @@ constexpr NativeSystemCall kCalls[] = {
 uint64_t send_event(uint32_t queue_id, const Event& event) {
     const auto queue = g_queues.find(queue_id);
     if (!queue) return kEsrch;
-    {
-        const std::lock_guard lock(queue->mutex);
-        if (queue->events.size() >= queue->capacity) return kEbusy;
-        queue->events.push_back(event);
+    const std::lock_guard lock(queue->mutex);
+    if (Waiter* const w = queue->receivers.pop()) {
+        w->data[0] = event.source, w->data[1] = event.data1, w->data[2] = event.data2, w->data[3] = event.data3;
+        w->wake();
+        return kOk;
     }
-    queue->arrived.notify_one();
+    if (queue->events.size() >= queue->capacity) return kEbusy;
+    queue->events.push_back(event);
     return kOk;
 }
 
 uint64_t receive_event(uint32_t queue_id, Event& event) {
     const auto queue = g_queues.find(queue_id);
     if (!queue) return kEsrch;
-    std::unique_lock lock(queue->mutex);
-    queue->arrived.wait(lock, [&] { return !queue->events.empty() || queue->destroyed; });
-    if (queue->events.empty()) return kEcanceled;
-    event = queue->events.front();
-    queue->events.pop_front();
-    return kOk;
+    return receive(*queue, event, 0);
 }
 
 uint32_t make_event_queue(size_t capacity) {
@@ -244,11 +270,7 @@ uint32_t make_event_queue(size_t capacity) {
 void destroy_event_queue(uint32_t id) {
     const auto queue = g_queues.find(id);
     if (!queue) return;
-    {
-        const std::lock_guard lock(queue->mutex);
-        queue->destroyed = true;
-    }
-    queue->arrived.notify_all();
+    cancel(*queue);
     g_queues.remove(id);
 }
 

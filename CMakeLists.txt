@@ -119,12 +119,22 @@ target_compile_definitions(qilin PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 enable_testing()
 find_package(Threads REQUIRED)
 add_executable(ridgeracer7_runtime_io_test ridgeracer7/tests/runtime_io_test.cpp
-    ridgeracer7/src/fs.cpp ridgeracer7/src/threads.cpp)
+    ridgeracer7/src/fs.cpp ridgeracer7/src/threads.cpp ridgeracer7/src/kernel_sched.cpp)
 target_include_directories(ridgeracer7_runtime_io_test PRIVATE recomp/src runtime/include ridgeracer7/src)
 target_link_libraries(ridgeracer7_runtime_io_test PRIVATE qilin_warnings Threads::Threads)
 foreach(case open read-close threads)
     add_test(NAME ridgeracer7_runtime_io_${case} COMMAND ridgeracer7_runtime_io_test ${case})
     set_tests_properties(ridgeracer7_runtime_io_${case} PROPERTIES TIMEOUT 20)
+endforeach()
+# The scheduler and the synchronisation objects' waking orders, with guest memory stood in.
+add_executable(ridgeracer7_sched_test ridgeracer7/tests/sched_test.cpp
+    ridgeracer7/src/kernel_sched.cpp ridgeracer7/src/sync.cpp ridgeracer7/src/sync_calls.cpp ridgeracer7/src/events.cpp)
+target_include_directories(ridgeracer7_sched_test PRIVATE recomp/src runtime/include ridgeracer7/src)
+target_link_libraries(ridgeracer7_sched_test PRIVATE qilin_warnings Threads::Threads)
+foreach(case fast priority two-tokens switch-point yield blocking sleep lend free mutex-fifo mutex-priority semaphore-fifo
+        semaphore-priority lwmutex-fifo lwmutex-priority cond-priority cond-timeout events-fifo events-priority events-cancel stress)
+    add_test(NAME ridgeracer7_sched_${case} COMMAND ridgeracer7_sched_test ${case})
+    set_tests_properties(ridgeracer7_sched_${case} PROPERTIES TIMEOUT 30)
 endforeach()
 add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_game qilin_recomp qilin_warnings)
@@ -229,6 +239,7 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/gcm.cpp
     ridgeracer7/src/imports.cpp
     ridgeracer7/src/kernel.cpp
+    ridgeracer7/src/kernel_sched.cpp
     ridgeracer7/src/machine.cpp
     ridgeracer7/src/memory.cpp
     ridgeracer7/src/mempool.cpp

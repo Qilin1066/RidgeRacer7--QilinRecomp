@@ -140,10 +140,12 @@ inline void enter_single_mode() {
 // A value pinned in time against the float unit's mode changes. Float arithmetic is pure to a compiler, so it may be
 // moved across a change of the rounding mode (set_float_control): Apple's Clang did so on ARM64, which computed in the
 // mode before or after the one asked for. A volatile copy is never moved past another side effect: operands pinned after
-// a change and results before the next keep the arithmetic between them.
+// a change and results before the next keep the arithmetic between them. The copy has static storage (one a thread):
+// GCC removes a volatile local whose address never escapes, and then folded such arithmetic at compile time.
 template <typename T>
 inline T pinned(T v) {
-    volatile T kept = v;
+    static thread_local volatile T kept;
+    kept = v;
     return kept;
 }
 inline SpuReg pinned(const SpuReg& v) {

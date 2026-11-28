@@ -334,10 +334,13 @@ uint32_t ordinary_single() { return (static_cast<uint32_t>(rng()) & 0x807fffffu)
 #endif
 template <typename Report>
 DIFFTEST_NOINLINE void check_flushed(Report report) {
+    // (Through a volatile with static storage: GCC removes a volatile local whose address never escapes, and then
+    // folded these at compile time all the same.)
     const auto unseen = [](rt::Vec v) {
         rt::Vec r;
         for (unsigned i = 0; i < 4; ++i) {
-            volatile uint32_t w = v.w[i];
+            static thread_local volatile uint32_t w;
+            w = v.w[i];
             r.w[i] = w;
         }
         return r;

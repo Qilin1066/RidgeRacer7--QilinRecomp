@@ -214,6 +214,9 @@ public:
     Parker& operator=(const Parker&) = delete;
     // Waits until unpark() or `when` (time_point::max(): for ever). False if the time ran out first.
     bool park_until(std::chrono::steady_clock::time_point when);
+    // The same, ending on time to within microseconds as sleep_until_precisely does: parked until timer_floor() before
+    // `when`, then looking for a wake between a short spin and yields of the host core.
+    bool park_until_precisely(std::chrono::steady_clock::time_point when);
     void unpark();
 
 private:

@@ -147,7 +147,7 @@ void wait_for_grant(std::unique_lock<std::mutex>& lock, SchedThread* t) {
         if (const auto when = borrow_time(t); when > now) {
             t->wake_at = when;
             lock.unlock();
-            t->parker.park_until(when);
+            t->parker.park_until_precisely(when);  // (on time: the sound thread borrows at kPatience every 5.33 ms block)
             lock.lock();
             g_wakeups.fetch_add(1, std::memory_order_relaxed);
             continue;
@@ -486,6 +486,20 @@ bool Parker::park_until(std::chrono::steady_clock::time_point when) {
     return woken;
 }
 #endif
+
+bool Parker::park_until_precisely(std::chrono::steady_clock::time_point when) {
+    using Clock = std::chrono::steady_clock;
+    if (when == Clock::time_point::max()) return park_until(when);
+    for (const auto floor = timer_floor(); when - Clock::now() > floor;)
+        if (park_until(when - floor)) return true;
+    const auto spin_until = Clock::now() + std::chrono::microseconds(5);
+    for (auto t = Clock::now(); t < when; t = Clock::now()) {
+        if (park_until(Clock::time_point::min())) return true;  // (only a look: the time is past)
+        if (t < spin_until) cpu_relax();
+        else yield_host();
+    }
+    return park_until(Clock::time_point::min());
+}
 
 void Doorbell::begin() {
     if (waiting_.exchange(true, std::memory_order_seq_cst)) qilin::rt::fatal("two threads waited on one doorbell at once");

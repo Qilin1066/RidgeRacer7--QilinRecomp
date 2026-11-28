@@ -332,7 +332,7 @@ void lend_wakes() {
         check(took_us.load() >= 0, "the waiting thread was lent a token");
         check(woke <= 3, "a thread waiting for a lent token wakes only when it may borrow");
         if (priority == 1000) check(took_us.load() >= 50000 && took_us.load() < 80000, "a worse thread is lent a token after 50 ms");
-        else check(took_us.load() >= 250 && took_us.load() < 5000, "an equal thread is lent a token soon after 250 us");
+        else check(took_us.load() >= 250 && took_us.load() < 1000, "an equal thread is lent a token soon after 250 us");
     }
     check(rr7::free_core_tokens() == 0 && rr7::threads_waiting_for_core() == 0, "every lent token repaid");
     rr7::give_up_core();

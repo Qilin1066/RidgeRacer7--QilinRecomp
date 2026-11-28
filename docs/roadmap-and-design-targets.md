@@ -37,7 +37,7 @@ The requirements and scope are the same as the other Qilin recomps' (GBTGhoulies
 - **Files and saves:** the game's files are read where the player's copy is; nothing is converted offline. Saves and the game's hard-disk data (`cellSaveData`, `cellGame`-style calls in `libsysutil`) go to host folders in the game's data folder. **Open:** whether the game installs data to the hard disk and expects it there.
 - **Online:** the program links the PlayStation Network and matchmaking libraries. There is no service to talk to: the runtime answers as a console that is not signed in and has no network, and the online modes are out of scope.
 - **Platform layer:** SDL3 (window, events, pads, audio), the Vulkan headers and volk, Dear ImGui for the settings menu, all fetched by CMake at pinned versions and linked statically, as in the other recomps. Keep dependencies to the fewest possible.
-- **Portability rules:** no inline asm or host intrinsics in the runtime; ARM64 Linux builds from day one.
+- **Portability rules:** no inline asm. Host intrinsics (SSE, NEON) are allowed in the runtime's hot helpers, decided by the owner on 2026-11-28, on two conditions: a portable C++ version of the same helper sits beside every one (selectable at build time, as `QILIN_SPU_PORTABLE` does), and the differential tests pass with each. Low-end ARM64 boards are the reference, so every fast path wants its NEON or vectorisable form too, not only x86-64's. ARM64 Linux builds from day one.
 
 ## Hardware scope
 **Supported: 64-bit hosts with a Vulkan 1.3 driver.** In practice that means:

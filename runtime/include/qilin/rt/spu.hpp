@@ -5,11 +5,31 @@
 // channels and the stop instruction. A register is four words, word 0
 // first (the "preferred slot", which scalar code uses); bytes and
 // halfwords are numbered from the most significant end, as the SPU
-// numbers them. Everything is plain portable C++ on fixed-size arrays.
+// numbers them.
 //
 // Each helper is one instruction's meaning, written from the SPU's
 // instruction set as published (IBM's "SPU Instruction Set Architecture").
 // The integer part is here; floating point is in spu_fp.hpp.
+//
+// **The host's vector unit.** A register is also the host's 128-bit vector
+// (`SpuReg::v`, word 0 in its lowest lane), so lifted code, which keeps the
+// registers a function uses in locals (spu_lift.hpp), holds them in the
+// host's vector registers. On x86-64 the common helpers are SSE2, and the
+// byte shuffles (`shufb`, the whole-register byte shifts) SSSE3 where the
+// build may use it (`QILIN_SPU_SSSE3`: MSVC always, as every x86-64 CPU
+// the game could run on has it, checked when the first SPU thread starts;
+// GCC and Clang when built for it). Elsewhere, and for the rarer
+// instructions, the helpers are plain C++ on the four words. The two views
+// of a register are one union: type punning through a union is what GCC,
+// Clang and MSVC all define.
+//
+// **The local store is kept in the host's word order**: each aligned word
+// of it is a host `uint32_t` (on a little-endian host, the bytes of each
+// word reversed from the SPU's order), so a quadword's load or store is a
+// plain 16-byte copy into a register's words. SPU byte `a` is host byte
+// `ls_index(a)`. Whatever moves bytes between the local store and anything
+// in the SPU's byte order (memory transfers, the program's loading, the
+// system's reads and writes of it) goes through `ls_read` and `ls_write`.
 //
 // Runtime code: no std::format here.
 #pragma once
@@ -18,6 +38,29 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#define QILIN_SPU_SSE2 1
+#if !defined(QILIN_SPU_SSSE3)
+#if defined(__SSSE3__) || (defined(_MSC_VER) && !defined(__clang__))
+#define QILIN_SPU_SSSE3 1
+#else
+#define QILIN_SPU_SSSE3 0
+#endif
+#endif
+#if QILIN_SPU_SSSE3
+#include <tmmintrin.h>
+#endif
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+#else
+#define QILIN_SPU_SSE2 0
+#define QILIN_SPU_SSSE3 0
+#endif
 
 // The helpers are forced inline: lifted code is one call of them per instruction. The bulky ones, which loop over the
 // sixteen bytes, are left to the compiler with MSVC: forced into the lifted programs' longest functions they took MSVC
@@ -36,12 +79,22 @@
 #define QILIN_SPU_BULKY QILIN_SPU_INLINE
 #endif
 #endif
+// What lifted code reaches rarely, kept out of it.
+#if !defined(QILIN_SPU_COLD)
+#if defined(_MSC_VER)
+#define QILIN_SPU_COLD __declspec(noinline)
+#else
+#define QILIN_SPU_COLD __attribute__((noinline, cold))
+#endif
+#endif
 
 namespace qilin::rt {
 
 struct Spu;
 
-// Where lifted SPU code leaves what was known at build time.
+// Where lifted SPU code leaves what was known at build time. Lifted code keeps the registers a function uses in locals:
+// they are in `Spu::r` for `native_call` (and for every function the program calls), but not for the others, which
+// must not look at the registers.
 struct SpuHooks {
     uint32_t (*read_channel)(Spu&, uint32_t channel, uint32_t pc);               // rdch
     void (*write_channel)(Spu&, uint32_t channel, uint32_t value, uint32_t pc);  // wrch
@@ -53,21 +106,65 @@ struct SpuHooks {
     void (*native_call)(Spu&, uint32_t target, uint32_t pc);
 };
 
-struct SpuReg {
+union SpuReg {
     uint32_t w[4];
+#if QILIN_SPU_SSE2
+    __m128i v;
+#endif
 };
 
 inline constexpr uint32_t kSpuLocalStore = 0x40000;
 
 struct Spu {
     SpuReg r[128] = {};
-    uint8_t* ls = nullptr;  // the local store: kSpuLocalStore bytes, in the SPU's byte order
+    uint8_t* ls = nullptr;  // the local store: kSpuLocalStore bytes, in the host's word order (above)
     uint32_t fpscr[4] = {};
     const SpuHooks* hooks = nullptr;
     void* owner = nullptr;  // the runtime's own object for this SPU
 };
 
 namespace spu {
+
+// ---- the local store's order ----
+// Where SPU byte `a` of the local store is.
+inline constexpr uint32_t kLsSwizzle = std::endian::native == std::endian::little ? 3u : 0u;
+constexpr uint32_t ls_index(uint32_t a) { return a ^ kLsSwizzle; }
+// `n` bytes in the SPU's order to and from the local store at SPU address `at` (within it).
+inline void ls_write(uint8_t* ls, uint32_t at, const uint8_t* from, size_t n) {
+    if constexpr (kLsSwizzle == 0) {
+        std::memcpy(ls + at, from, n);
+    } else {
+        for (; n && (at & 3); --n) ls[ls_index(at++)] = *from++;
+        for (; n >= 4; n -= 4, at += 4, from += 4) {
+            uint32_t w;
+            std::memcpy(&w, from, 4);
+            w = std::byteswap(w);
+            std::memcpy(ls + at, &w, 4);
+        }
+        for (; n; --n) ls[ls_index(at++)] = *from++;
+    }
+}
+inline void ls_read(const uint8_t* ls, uint32_t at, uint8_t* to, size_t n) {
+    if constexpr (kLsSwizzle == 0) {
+        std::memcpy(to, ls + at, n);
+    } else {
+        for (; n && (at & 3); --n) *to++ = ls[ls_index(at++)];
+        for (; n >= 4; n -= 4, at += 4, to += 4) {
+            uint32_t w;
+            std::memcpy(&w, ls + at, 4);
+            w = std::byteswap(w);
+            std::memcpy(to, &w, 4);
+        }
+        for (; n; --n) *to++ = ls[ls_index(at++)];
+    }
+}
+// An aligned word of the local store (as the SPU reads it).
+inline uint32_t ls_word(const uint8_t* ls, uint32_t at) {
+    uint32_t w;
+    std::memcpy(&w, ls + at, 4);
+    return w;
+}
+inline void set_ls_word(uint8_t* ls, uint32_t at, uint32_t w) { std::memcpy(ls + at, &w, 4); }
 
 // ---- elements ----
 // The floating-point status and control register: the bits the instruction set defines, word by word (bits 20-23 the
@@ -84,6 +181,29 @@ QILIN_SPU_INLINE SpuReg fscrrd(const Spu& s) {
     return v;
 }
 
+#if QILIN_SPU_SSE2
+QILIN_SPU_INLINE SpuReg vec(__m128i v) {
+    SpuReg r;
+    r.v = v;
+    return r;
+}
+#endif
+// A register of four words, word 0 first.
+QILIN_SPU_INLINE SpuReg quad(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3) {
+#if QILIN_SPU_SSE2
+    return vec(_mm_setr_epi32(static_cast<int>(w0), static_cast<int>(w1), static_cast<int>(w2), static_cast<int>(w3)));
+#else
+    return {{w0, w1, w2, w3}};
+#endif
+}
+// A word in the preferred slot, the rest zeroes.
+QILIN_SPU_INLINE SpuReg scalar(uint32_t w0) {
+#if QILIN_SPU_SSE2
+    return vec(_mm_cvtsi32_si128(static_cast<int>(w0)));
+#else
+    return {{w0, 0, 0, 0}};
+#endif
+}
 QILIN_SPU_INLINE uint32_t byte(const SpuReg& v, unsigned i) { return (v.w[i >> 2] >> (24 - 8 * (i & 3))) & 0xffu; }
 QILIN_SPU_INLINE void set_byte(SpuReg& v, unsigned i, uint32_t b) {
     const unsigned shift = 24 - 8 * (i & 3);
@@ -123,29 +243,36 @@ QILIN_SPU_BULKY SpuReg bytes(const SpuReg& a, const SpuReg& b, F f) {
     }
     return r;
 }
-QILIN_SPU_INLINE SpuReg splat(uint32_t word) { return {{word, word, word, word}}; }
+QILIN_SPU_INLINE SpuReg splat(uint32_t word) {
+#if QILIN_SPU_SSE2
+    return vec(_mm_set1_epi32(static_cast<int>(word)));
+#else
+    return {{word, word, word, word}};
+#endif
+}
 QILIN_SPU_INLINE uint32_t sext16(uint32_t h) { return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(h))); }
 
 // ---- the local store ----
-// A quadword's address: within the local store, at a multiple of 16.
+// A quadword's address: within the local store, at a multiple of 16. Its four words are a register's, in order.
 QILIN_SPU_INLINE uint32_t quad_address(uint32_t a) { return a & 0x3fff0u; }
-QILIN_SPU_INLINE SpuReg load(const Spu& s, uint32_t address) {
-    const uint8_t* const p = s.ls + quad_address(address);
+QILIN_SPU_INLINE SpuReg load(const uint8_t* ls, uint32_t address) {
+#if QILIN_SPU_SSE2
+    return vec(_mm_loadu_si128(reinterpret_cast<const __m128i*>(ls + quad_address(address))));
+#else
     SpuReg r;
-    for (unsigned i = 0; i < 4; ++i) {
-        uint32_t w;
-        std::memcpy(&w, p + 4 * i, 4);
-        r.w[i] = std::endian::native == std::endian::little ? std::byteswap(w) : w;
-    }
+    std::memcpy(r.w, ls + quad_address(address), 16);
     return r;
+#endif
 }
-QILIN_SPU_INLINE void store(Spu& s, uint32_t address, const SpuReg& v) {
-    uint8_t* const p = s.ls + quad_address(address);
-    for (unsigned i = 0; i < 4; ++i) {
-        const uint32_t w = std::endian::native == std::endian::little ? std::byteswap(v.w[i]) : v.w[i];
-        std::memcpy(p + 4 * i, &w, 4);
-    }
+QILIN_SPU_INLINE void store(uint8_t* ls, uint32_t address, const SpuReg& v) {
+#if QILIN_SPU_SSE2
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(ls + quad_address(address)), v.v);
+#else
+    std::memcpy(ls + quad_address(address), v.w, 16);
+#endif
 }
+QILIN_SPU_INLINE SpuReg load(const Spu& s, uint32_t address) { return load(s.ls, address); }
+QILIN_SPU_INLINE void store(Spu& s, uint32_t address, const SpuReg& v) { store(s.ls, address, v); }
 
 // ---- constants ----
 // fsmbi: each of 16 bits makes a byte of ones or zeros, the top bit the first byte.
@@ -158,7 +285,7 @@ inline constexpr std::array<uint32_t, 16> kByteMasks = [] {
     return masks;
 }();
 QILIN_SPU_INLINE SpuReg fsmbi(uint32_t bits) {
-    return {{kByteMasks[(bits >> 12) & 0xfu], kByteMasks[(bits >> 8) & 0xfu], kByteMasks[(bits >> 4) & 0xfu], kByteMasks[bits & 0xfu]}};
+    return quad(kByteMasks[(bits >> 12) & 0xfu], kByteMasks[(bits >> 8) & 0xfu], kByteMasks[(bits >> 4) & 0xfu], kByteMasks[bits & 0xfu]);
 }
 QILIN_SPU_INLINE SpuReg fsmb(const SpuReg& a) { return fsmbi(a.w[0] & 0xffffu); }
 QILIN_SPU_INLINE SpuReg fsmh(const SpuReg& a) {
@@ -186,11 +313,24 @@ QILIN_SPU_BULKY SpuReg gbh(const SpuReg& a) {
 QILIN_SPU_INLINE SpuReg gb(const SpuReg& a) { return {{((a.w[0] & 1u) << 3) | ((a.w[1] & 1u) << 2) | ((a.w[2] & 1u) << 1) | (a.w[3] & 1u), 0, 0, 0}}; }
 
 // ---- arithmetic ----
-QILIN_SPU_INLINE SpuReg a(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return p + q; }); }
-QILIN_SPU_INLINE SpuReg ah(const SpuReg& x, const SpuReg& y) { return halves(x, y, [](uint32_t p, uint32_t q) { return p + q; }); }
+#if QILIN_SPU_SSE2
+#define QILIN_SPU_VECTOR(scalar_form, vector_form) return vector_form
+#else
+#define QILIN_SPU_VECTOR(scalar_form, vector_form) return scalar_form
+#endif
+QILIN_SPU_INLINE SpuReg a(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return p + q; }), vec(_mm_add_epi32(x.v, y.v)));
+}
+QILIN_SPU_INLINE SpuReg ah(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(halves(x, y, [](uint32_t p, uint32_t q) { return p + q; }), vec(_mm_add_epi16(x.v, y.v)));
+}
 // sf, sfh: "subtract from": b - a.
-QILIN_SPU_INLINE SpuReg sf(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return q - p; }); }
-QILIN_SPU_INLINE SpuReg sfh(const SpuReg& x, const SpuReg& y) { return halves(x, y, [](uint32_t p, uint32_t q) { return q - p; }); }
+QILIN_SPU_INLINE SpuReg sf(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return q - p; }), vec(_mm_sub_epi32(y.v, x.v)));
+}
+QILIN_SPU_INLINE SpuReg sfh(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(halves(x, y, [](uint32_t p, uint32_t q) { return q - p; }), vec(_mm_sub_epi16(y.v, x.v)));
+}
 // addx, sfx: with the carry in the lowest bit of the target's old value. cg, bg, cgx, bgx: the carry out, or "no borrow".
 QILIN_SPU_INLINE SpuReg addx(const SpuReg& x, const SpuReg& y, const SpuReg& t) {
     return {{x.w[0] + y.w[0] + (t.w[0] & 1u), x.w[1] + y.w[1] + (t.w[1] & 1u), x.w[2] + y.w[2] + (t.w[2] & 1u), x.w[3] + y.w[3] + (t.w[3] & 1u)}};
@@ -237,32 +377,49 @@ QILIN_SPU_BULKY SpuReg sumb(const SpuReg& x, const SpuReg& y) {
 }
 // Sign extensions: of the lower byte of each halfword, halfword of each word, word of each doubleword.
 QILIN_SPU_INLINE SpuReg xsbh(const SpuReg& x) {
-    return halves(x, [](uint32_t h) { return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(h))); });
+    QILIN_SPU_VECTOR(halves(x, [](uint32_t h) { return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(h))); }),
+                     vec(_mm_srai_epi16(_mm_slli_epi16(x.v, 8), 8)));
 }
-QILIN_SPU_INLINE SpuReg xshw(const SpuReg& x) { return words(x, [](uint32_t p) { return sext16(p); }); }
+QILIN_SPU_INLINE SpuReg xshw(const SpuReg& x) { QILIN_SPU_VECTOR(words(x, [](uint32_t p) { return sext16(p); }), vec(_mm_srai_epi32(_mm_slli_epi32(x.v, 16), 16))); }
 QILIN_SPU_INLINE SpuReg xswd(const SpuReg& x) {
     return {{static_cast<uint32_t>(static_cast<int32_t>(x.w[1]) >> 31), x.w[1], static_cast<uint32_t>(static_cast<int32_t>(x.w[3]) >> 31), x.w[3]}};
 }
 
 // ---- logic ----
-QILIN_SPU_INLINE SpuReg and_(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return p & q; }); }
-QILIN_SPU_INLINE SpuReg andc(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return p & ~q; }); }
-QILIN_SPU_INLINE SpuReg or_(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return p | q; }); }
-QILIN_SPU_INLINE SpuReg orc(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return p | ~q; }); }
-QILIN_SPU_INLINE SpuReg xor_(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return p ^ q; }); }
-QILIN_SPU_INLINE SpuReg nand(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return ~(p & q); }); }
-QILIN_SPU_INLINE SpuReg nor(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return ~(p | q); }); }
-QILIN_SPU_INLINE SpuReg eqv(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return ~(p ^ q); }); }
+#if QILIN_SPU_SSE2
+QILIN_SPU_INLINE __m128i ones() { return _mm_set1_epi32(-1); }
+#endif
+QILIN_SPU_INLINE SpuReg and_(const SpuReg& x, const SpuReg& y) { QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return p & q; }), vec(_mm_and_si128(x.v, y.v))); }
+QILIN_SPU_INLINE SpuReg andc(const SpuReg& x, const SpuReg& y) { QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return p & ~q; }), vec(_mm_andnot_si128(y.v, x.v))); }
+QILIN_SPU_INLINE SpuReg or_(const SpuReg& x, const SpuReg& y) { QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return p | q; }), vec(_mm_or_si128(x.v, y.v))); }
+QILIN_SPU_INLINE SpuReg orc(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return p | ~q; }), vec(_mm_or_si128(x.v, _mm_xor_si128(y.v, ones()))));
+}
+QILIN_SPU_INLINE SpuReg xor_(const SpuReg& x, const SpuReg& y) { QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return p ^ q; }), vec(_mm_xor_si128(x.v, y.v))); }
+QILIN_SPU_INLINE SpuReg nand(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return ~(p & q); }), vec(_mm_xor_si128(_mm_and_si128(x.v, y.v), ones())));
+}
+QILIN_SPU_INLINE SpuReg nor(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return ~(p | q); }), vec(_mm_xor_si128(_mm_or_si128(x.v, y.v), ones())));
+}
+QILIN_SPU_INLINE SpuReg eqv(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return ~(p ^ q); }), vec(_mm_xor_si128(_mm_xor_si128(x.v, y.v), ones())));
+}
 QILIN_SPU_INLINE SpuReg orx(const SpuReg& x) { return {{x.w[0] | x.w[1] | x.w[2] | x.w[3], 0, 0, 0}}; }
 // selb: each bit from b where the mask c is set, from a where it is clear.
 QILIN_SPU_INLINE SpuReg selb(const SpuReg& x, const SpuReg& y, const SpuReg& c) {
+#if QILIN_SPU_SSE2
+    return vec(_mm_or_si128(_mm_and_si128(c.v, y.v), _mm_andnot_si128(c.v, x.v)));
+#else
     SpuReg r;
     for (unsigned i = 0; i < 4; ++i) r.w[i] = (c.w[i] & y.w[i]) | (~c.w[i] & x.w[i]);
     return r;
+#endif
 }
 // shufb: each byte of c picks a byte of a (0-15) or b (16-31), or is a constant: 10xxxxxx 0x00, 110xxxxx 0xff, 111xxxxx 0x80.
-// (Built a word at a time, each byte read straight from its word.)
-QILIN_SPU_BULKY SpuReg shufb(const SpuReg& x, const SpuReg& y, const SpuReg& c) {
+// (Built a word at a time, each byte read straight from its word; with SSSE3, by the host's byte shuffle: SPU byte j is
+// host byte j ^ 3 of the vector, so a control byte's pick is the host's index once its low two bits are flipped.)
+QILIN_SPU_BULKY SpuReg shufb_words(const SpuReg& x, const SpuReg& y, const SpuReg& c) {
     SpuReg r;
     for (unsigned i = 0; i < 4; ++i) {
         uint32_t w = 0;
@@ -277,9 +434,24 @@ QILIN_SPU_BULKY SpuReg shufb(const SpuReg& x, const SpuReg& y, const SpuReg& c) 
     }
     return r;
 }
+#if QILIN_SPU_SSSE3
+QILIN_SPU_INLINE SpuReg shufb(const SpuReg& x, const SpuReg& y, const SpuReg& c) {
+    const __m128i index = _mm_xor_si128(_mm_and_si128(c.v, _mm_set1_epi8(0x0f)), _mm_set1_epi8(0x03));
+    const __m128i from_b = _mm_cmpeq_epi8(_mm_and_si128(c.v, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
+    const __m128i picked = _mm_or_si128(_mm_and_si128(from_b, _mm_shuffle_epi8(y.v, index)), _mm_andnot_si128(from_b, _mm_shuffle_epi8(x.v, index)));
+    // The constants: 0x80 and up (negative as signed bytes); 0xc0 and up are ones, and 0xe0 and up 0x80.
+    const __m128i special = _mm_cmplt_epi8(c.v, _mm_setzero_si128());
+    const __m128i from_c0 = _mm_and_si128(special, _mm_cmpgt_epi8(c.v, _mm_set1_epi8(-65)));
+    const __m128i from_e0 = _mm_and_si128(special, _mm_cmpgt_epi8(c.v, _mm_set1_epi8(-33)));
+    const __m128i constant = _mm_xor_si128(from_c0, _mm_and_si128(from_e0, _mm_set1_epi8(0x7f)));
+    return vec(_mm_or_si128(_mm_andnot_si128(special, picked), constant));
+}
+#else
+QILIN_SPU_INLINE SpuReg shufb(const SpuReg& x, const SpuReg& y, const SpuReg& c) { return shufb_words(x, y, c); }
+#endif
 
 // ---- shifts and rotates of elements ----
-// The count is each element's own in the register forms (`n` is then that register), or the same constant splatted.
+// The count is each element's own in the register forms (`n` is then that register).
 QILIN_SPU_INLINE SpuReg shlh(const SpuReg& x, const SpuReg& n) {
     return halves(x, n, [](uint32_t p, uint32_t c) { return (c & 0x1fu) > 15 ? 0u : p << (c & 0x1fu); });
 }
@@ -318,6 +490,23 @@ QILIN_SPU_INLINE SpuReg rotma(const SpuReg& x, const SpuReg& n) {
         return static_cast<uint32_t>(static_cast<int32_t>(p) >> (by > 31 ? 31 : by));
     });
 }
+// The immediate forms: one count `c` (the instruction's field) for every element, so a shift of the whole vector. The
+// host's shifts give zero (or the sign) for a count past the element's width, as the SPU's do.
+#if QILIN_SPU_SSE2
+QILIN_SPU_INLINE __m128i shift_count(uint32_t c) { return _mm_cvtsi32_si128(static_cast<int>(c)); }
+#endif
+QILIN_SPU_INLINE SpuReg shlhi(const SpuReg& x, uint32_t c) { QILIN_SPU_VECTOR(shlh(x, splat((c & 0xffffu) * 0x10001u)), vec(_mm_sll_epi16(x.v, shift_count(c & 0x1fu)))); }
+QILIN_SPU_INLINE SpuReg shli(const SpuReg& x, uint32_t c) { QILIN_SPU_VECTOR(shl(x, splat(c)), vec(_mm_sll_epi32(x.v, shift_count(c & 0x3fu)))); }
+QILIN_SPU_INLINE SpuReg rothi(const SpuReg& x, uint32_t c) {
+    QILIN_SPU_VECTOR(roth(x, splat((c & 0xffffu) * 0x10001u)), vec(_mm_or_si128(_mm_sll_epi16(x.v, shift_count(c & 0xfu)), _mm_srl_epi16(x.v, shift_count(16 - (c & 0xfu))))));
+}
+QILIN_SPU_INLINE SpuReg roti(const SpuReg& x, uint32_t c) {
+    QILIN_SPU_VECTOR(rot(x, splat(c)), vec(_mm_or_si128(_mm_sll_epi32(x.v, shift_count(c & 0x1fu)), _mm_srl_epi32(x.v, shift_count(32 - (c & 0x1fu))))));
+}
+QILIN_SPU_INLINE SpuReg rothmi(const SpuReg& x, uint32_t c) { QILIN_SPU_VECTOR(rothm(x, splat((c & 0xffffu) * 0x10001u)), vec(_mm_srl_epi16(x.v, shift_count((0u - c) & 0x1fu)))); }
+QILIN_SPU_INLINE SpuReg rotmi(const SpuReg& x, uint32_t c) { QILIN_SPU_VECTOR(rotm(x, splat(c)), vec(_mm_srl_epi32(x.v, shift_count((0u - c) & 0x3fu)))); }
+QILIN_SPU_INLINE SpuReg rotmahi(const SpuReg& x, uint32_t c) { QILIN_SPU_VECTOR(rotmah(x, splat((c & 0xffffu) * 0x10001u)), vec(_mm_sra_epi16(x.v, shift_count((0u - c) & 0x1fu)))); }
+QILIN_SPU_INLINE SpuReg rotmai(const SpuReg& x, uint32_t c) { QILIN_SPU_VECTOR(rotma(x, splat(c)), vec(_mm_sra_epi32(x.v, shift_count((0u - c) & 0x3fu)))); }
 
 // ---- shifts and rotates of the whole register ----
 // Left by bits (0 to 7), with what leaves the top lost (shift) or brought round (rotate).
@@ -354,8 +543,19 @@ QILIN_SPU_INLINE SpuQuad quad_right(SpuQuad q, unsigned bits) {
     if (bits >= 64) return {0, q.hi >> (bits - 64)};
     return {q.hi >> bits, (q.lo >> bits) | (q.hi << (64 - bits))};
 }
-// Left by bytes: 16 or more leaves nothing of a shift; a rotate's count is 0 to 15.
+#if QILIN_SPU_SSSE3
+// The host's index of each byte of the vector as the SPU numbers it (host byte h is SPU byte h ^ 3).
+QILIN_SPU_INLINE __m128i spu_byte_numbers() { return _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12); }
+// Each result byte j from SPU byte `pick(j)` of x, or zero where pick is negative or 16 and more (with the mask).
+QILIN_SPU_INLINE SpuReg pick_bytes(const SpuReg& x, __m128i pick) { return vec(_mm_shuffle_epi8(x.v, _mm_xor_si128(pick, _mm_set1_epi8(3)))); }
+#endif
+// Left by bytes: 16 or more leaves nothing of a shift; a rotate's count is 0 to 15. Right by bytes: a shift, 0 to 31.
 QILIN_SPU_BULKY SpuReg shift_left_bytes(const SpuReg& x, unsigned count, bool rotate) {
+#if QILIN_SPU_SSSE3
+    const __m128i pick = _mm_add_epi8(spu_byte_numbers(), _mm_set1_epi8(static_cast<char>(count)));
+    if (rotate) return pick_bytes(x, _mm_and_si128(pick, _mm_set1_epi8(15)));
+    return pick_bytes(x, _mm_or_si128(pick, _mm_cmpgt_epi8(pick, _mm_set1_epi8(15))));  // (count is below 32: no overflow)
+#else
     if (rotate) {
         const unsigned bits = 8 * (count & 15u);
         if (bits == 0) return x;
@@ -363,8 +563,15 @@ QILIN_SPU_BULKY SpuReg shift_left_bytes(const SpuReg& x, unsigned count, bool ro
         return from_quad({left.hi | right.hi, left.lo | right.lo});
     }
     return count >= 16 ? SpuReg{} : from_quad(quad_left(as_quad(x), 8 * count));
+#endif
 }
-QILIN_SPU_BULKY SpuReg shift_right_bytes(const SpuReg& x, unsigned count) { return count >= 16 ? SpuReg{} : from_quad(quad_right(as_quad(x), 8 * count)); }
+QILIN_SPU_BULKY SpuReg shift_right_bytes(const SpuReg& x, unsigned count) {
+#if QILIN_SPU_SSSE3
+    return pick_bytes(x, _mm_sub_epi8(spu_byte_numbers(), _mm_set1_epi8(static_cast<char>(count))));  // (below 0: the top bit set)
+#else
+    return count >= 16 ? SpuReg{} : from_quad(quad_right(as_quad(x), 8 * count));
+#endif
+}
 QILIN_SPU_INLINE SpuReg shlqbi(const SpuReg& x, uint32_t n) { return shift_left_bits(x, n & 7u, false); }
 QILIN_SPU_INLINE SpuReg shlqby(const SpuReg& x, uint32_t n) { return shift_left_bytes(x, n & 0x1fu, false); }
 QILIN_SPU_INLINE SpuReg shlqbybi(const SpuReg& x, uint32_t n) { return shift_left_bytes(x, (n >> 3) & 0x1fu, false); }
@@ -376,29 +583,82 @@ QILIN_SPU_INLINE SpuReg rotqmby(const SpuReg& x, uint32_t n) { return shift_righ
 QILIN_SPU_INLINE SpuReg rotqmbybi(const SpuReg& x, uint32_t n) { return shift_right_bytes(x, (0u - (n >> 3)) & 0x1fu); }
 
 // ---- compares: all ones where true ----
-QILIN_SPU_INLINE SpuReg ceq(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return p == q ? 0xffffffffu : 0u; }); }
+#if QILIN_SPU_SSE2
+// (Unsigned compares as signed ones, with the top bits flipped.)
+QILIN_SPU_INLINE __m128i flip(__m128i v, int top) { return _mm_xor_si128(v, _mm_set1_epi32(top)); }
+#endif
+QILIN_SPU_INLINE SpuReg ceq(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return p == q ? 0xffffffffu : 0u; }), vec(_mm_cmpeq_epi32(x.v, y.v)));
+}
 QILIN_SPU_INLINE SpuReg cgt(const SpuReg& x, const SpuReg& y) {
-    return words(x, y, [](uint32_t p, uint32_t q) { return static_cast<int32_t>(p) > static_cast<int32_t>(q) ? 0xffffffffu : 0u; });
+    QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return static_cast<int32_t>(p) > static_cast<int32_t>(q) ? 0xffffffffu : 0u; }),
+                     vec(_mm_cmpgt_epi32(x.v, y.v)));
 }
-QILIN_SPU_INLINE SpuReg clgt(const SpuReg& x, const SpuReg& y) { return words(x, y, [](uint32_t p, uint32_t q) { return p > q ? 0xffffffffu : 0u; }); }
-QILIN_SPU_INLINE SpuReg ceqh(const SpuReg& x, const SpuReg& y) { return halves(x, y, [](uint32_t p, uint32_t q) { return p == q ? 0xffffu : 0u; }); }
+QILIN_SPU_INLINE SpuReg clgt(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(words(x, y, [](uint32_t p, uint32_t q) { return p > q ? 0xffffffffu : 0u; }),
+                     vec(_mm_cmpgt_epi32(flip(x.v, static_cast<int>(0x80000000u)), flip(y.v, static_cast<int>(0x80000000u)))));
+}
+QILIN_SPU_INLINE SpuReg ceqh(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(halves(x, y, [](uint32_t p, uint32_t q) { return p == q ? 0xffffu : 0u; }), vec(_mm_cmpeq_epi16(x.v, y.v)));
+}
 QILIN_SPU_INLINE SpuReg cgth(const SpuReg& x, const SpuReg& y) {
-    return halves(x, y, [](uint32_t p, uint32_t q) { return static_cast<int16_t>(p) > static_cast<int16_t>(q) ? 0xffffu : 0u; });
+    QILIN_SPU_VECTOR(halves(x, y, [](uint32_t p, uint32_t q) { return static_cast<int16_t>(p) > static_cast<int16_t>(q) ? 0xffffu : 0u; }),
+                     vec(_mm_cmpgt_epi16(x.v, y.v)));
 }
-QILIN_SPU_INLINE SpuReg clgth(const SpuReg& x, const SpuReg& y) { return halves(x, y, [](uint32_t p, uint32_t q) { return p > q ? 0xffffu : 0u; }); }
-QILIN_SPU_INLINE SpuReg ceqb(const SpuReg& x, const SpuReg& y) { return bytes(x, y, [](uint32_t p, uint32_t q) { return p == q ? 0xffu : 0u; }); }
+QILIN_SPU_INLINE SpuReg clgth(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(halves(x, y, [](uint32_t p, uint32_t q) { return p > q ? 0xffffu : 0u; }), vec(_mm_cmpgt_epi16(flip(x.v, static_cast<int>(0x80008000u)), flip(y.v, static_cast<int>(0x80008000u)))));
+}
+QILIN_SPU_INLINE SpuReg ceqb(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(bytes(x, y, [](uint32_t p, uint32_t q) { return p == q ? 0xffu : 0u; }), vec(_mm_cmpeq_epi8(x.v, y.v)));
+}
 QILIN_SPU_INLINE SpuReg cgtb(const SpuReg& x, const SpuReg& y) {
-    return bytes(x, y, [](uint32_t p, uint32_t q) { return static_cast<int8_t>(p) > static_cast<int8_t>(q) ? 0xffu : 0u; });
+    QILIN_SPU_VECTOR(bytes(x, y, [](uint32_t p, uint32_t q) { return static_cast<int8_t>(p) > static_cast<int8_t>(q) ? 0xffu : 0u; }), vec(_mm_cmpgt_epi8(x.v, y.v)));
 }
-QILIN_SPU_INLINE SpuReg clgtb(const SpuReg& x, const SpuReg& y) { return bytes(x, y, [](uint32_t p, uint32_t q) { return p > q ? 0xffu : 0u; }); }
+QILIN_SPU_INLINE SpuReg clgtb(const SpuReg& x, const SpuReg& y) {
+    QILIN_SPU_VECTOR(bytes(x, y, [](uint32_t p, uint32_t q) { return p > q ? 0xffu : 0u; }), vec(_mm_cmpgt_epi8(flip(x.v, static_cast<int>(0x80808080u)), flip(y.v, static_cast<int>(0x80808080u)))));
+}
 
 // ---- masks for inserting one element with shufb (cbd, chd, cwd, cdd and their indexed forms) ----
-// The mask takes every byte from the second operand, but for the element at `address`'s place in a quadword, taken from the first's preferred slot.
-QILIN_SPU_BULKY SpuReg insertion_mask(uint32_t address, unsigned size) {
-    SpuReg r{{0x10111213u, 0x14151617u, 0x18191a1bu, 0x1c1d1e1fu}};
-    const unsigned at = address & 0xfu & ~(size - 1);
-    for (unsigned i = 0; i < size; ++i) set_byte(r, at + i, size == 8 ? i : 4 - size + i);
-    return r;
+// The mask takes every byte from the second operand, but for the element at `address`'s place in a quadword, taken from
+// the first's preferred slot. (Of a table: by the element's size and the address's last four bits.)
+inline constexpr auto kInsertionMasks = [] {
+    std::array<std::array<std::array<uint32_t, 4>, 16>, 4> masks{};
+    for (unsigned k = 0; k < 4; ++k)
+        for (unsigned address = 0; address < 16; ++address) {
+            std::array<uint32_t, 4>& r = masks[k][address];
+            r = {0x10111213u, 0x14151617u, 0x18191a1bu, 0x1c1d1e1fu};
+            const unsigned size = 1u << k, at = address & ~(size - 1);
+            for (unsigned i = 0; i < size; ++i) {
+                const unsigned b = at + i, shift = 24 - 8 * (b & 3), value = size == 8 ? i : 4 - size + i;
+                r[b >> 2] = (r[b >> 2] & ~(0xffu << shift)) | (value << shift);
+            }
+        }
+    return masks;
+}();
+QILIN_SPU_INLINE SpuReg insertion_mask(uint32_t address, unsigned size) {
+    const std::array<uint32_t, 4>& m = kInsertionMasks[size == 1 ? 0 : size == 2 ? 1 : size == 4 ? 2 : 3][address & 0xfu];
+#if QILIN_SPU_SSE2
+    return vec(_mm_loadu_si128(reinterpret_cast<const __m128i*>(m.data())));
+#else
+    return {{m[0], m[1], m[2], m[3]}};
+#endif
+}
+
+#undef QILIN_SPU_VECTOR
+
+// Whether this host can run what the helpers were built to use (SSSE3, where QILIN_SPU_SSSE3 is set without the
+// compiler having been told the host has it): the runtime asks before the first SPU program runs.
+inline bool host_has_ssse3() {
+#if QILIN_SPU_SSE2 && defined(_MSC_VER)
+    int info[4];
+    __cpuid(info, 1);
+    return (info[2] & (1 << 9)) != 0;
+#elif QILIN_SPU_SSE2
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    return __get_cpuid(1, &a, &b, &c, &d) && (c & (1u << 9)) != 0;
+#else
+    return true;
+#endif
 }
 
 }  // namespace spu

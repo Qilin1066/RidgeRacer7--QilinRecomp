@@ -33,8 +33,10 @@
 // double compares (which the game doesn't use), are outside the lifter's
 // slice.
 //
-// The helpers here are left to the compiler to inline or not: forced into every one of the game's 13,000 uses,
-// they made the lifted SPU code take over twenty minutes to compile. (What that costs at run time is to be measured.)
+// The exact ways here are left to the compiler to inline or not: forced into every one of the game's 13,000 uses,
+// they made the lifted SPU code take over twenty minutes to compile. On x86-64 the add, subtract, multiply and fused
+// forms are the host's float unit, forced inline (a few vector instructions), with the exact way out of line for the
+// rare lanes it can't stand in for; the compares are vector instructions too.
 //
 // **The host's float unit, where it can stand in (x86-64).** The SPU's single precision is IEEE's with truncation, no
 // denormals, +0 for every zero and no infinities or NaNs: a host float unit set to round toward zero, with denormals
@@ -159,25 +161,43 @@ inline uint32_t fused32(uint32_t a, uint32_t b, uint32_t c, bool negate_product,
 }
 #if QILIN_SPU_HOST_SINGLE
 // The host's result, put right: zeros made +0, and the lanes the host can't stand in for (an operand's exponent 255, the
-// result's 254 or more) done again by `exact(lane)`.
-inline __m128i exponents(__m128i v) { return _mm_and_si128(_mm_srli_epi32(v, 23), _mm_set1_epi32(0xff)); }
-template <typename Exact>
-inline SpuReg host_result(__m128 result, __m128i bad_operands, Exact exact) {
-    __m128i r = _mm_castps_si128(result);
+// result's 254 or more) done again the exact way, out of line (they are rare).
+QILIN_SPU_INLINE __m128i exponents(__m128i v) { return _mm_and_si128(_mm_srli_epi32(v, 23), _mm_set1_epi32(0xff)); }
+enum class HostOp : uint8_t { Add, Subtract, Multiply, Fused, FusedNegateProduct, FusedNegateAddend };
+// (The vectors in the host's vector registers, so that lifted code keeps its own there around the call.)
+#if defined(_MSC_VER)
+#define QILIN_SPU_VECTORCALL __vectorcall
+#else
+#define QILIN_SPU_VECTORCALL
+#endif
+// `result` with the lanes in `lanes` done the exact way.
+QILIN_SPU_COLD inline __m128i QILIN_SPU_VECTORCALL exact_lanes(__m128i result, __m128i x, __m128i y, __m128i z, int lanes, HostOp op) {
+    SpuReg out = vec(result);
+    const SpuReg a = vec(x), b = vec(y), c = vec(z);
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!(lanes & (1 << i))) continue;
+        switch (op) {
+        case HostOp::Add: out.w[i] = add32(a.w[i], b.w[i], false); break;
+        case HostOp::Subtract: out.w[i] = add32(a.w[i], b.w[i], true); break;
+        case HostOp::Multiply: out.w[i] = multiply32(a.w[i], b.w[i]); break;
+        case HostOp::Fused: out.w[i] = fused32(a.w[i], b.w[i], c.w[i], false, false); break;
+        case HostOp::FusedNegateProduct: out.w[i] = fused32(a.w[i], b.w[i], c.w[i], true, false); break;
+        case HostOp::FusedNegateAddend: out.w[i] = fused32(a.w[i], b.w[i], c.w[i], false, true); break;
+        }
+    }
+    return out.v;
+}
+QILIN_SPU_INLINE SpuReg host_result(__m128 result, __m128i bad_operands, HostOp op, __m128i a, __m128i b, __m128i c) {
+    const __m128i r = _mm_castps_si128(result);
     const __m128i e = exponents(r);
     const __m128i bad = _mm_or_si128(bad_operands, _mm_cmpgt_epi32(e, _mm_set1_epi32(253)));
-    r = _mm_andnot_si128(_mm_cmpeq_epi32(e, _mm_setzero_si128()), r);
-    SpuReg out;
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(out.w), r);
-    if (const int lanes = _mm_movemask_ps(_mm_castsi128_ps(bad)))
-        for (unsigned i = 0; i < 4; ++i)
-            if (lanes & (1 << i)) out.w[i] = exact(i);
-    return out;
+    const __m128i out = _mm_andnot_si128(_mm_cmpeq_epi32(e, _mm_setzero_si128()), r);
+    if (const int lanes = _mm_movemask_ps(_mm_castsi128_ps(bad))) return vec(exact_lanes(out, a, b, c, lanes, op));
+    return vec(out);
 }
-inline __m128i load(const SpuReg& v) { return _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.w)); }
-inline __m128i top_exponent(__m128i v) { return _mm_cmpeq_epi32(exponents(v), _mm_set1_epi32(0xff)); }
+QILIN_SPU_INLINE __m128i top_exponent(__m128i v) { return _mm_cmpeq_epi32(exponents(v), _mm_set1_epi32(0xff)); }
 // a * b + c (with `negate_product` c - a * b, with `negate_addend` a * b - c), in double precision.
-inline __m128 fused_host(__m128i a, __m128i b, __m128i c, bool negate_product, bool negate_addend) {
+QILIN_SPU_INLINE __m128 fused_host(__m128i a, __m128i b, __m128i c, bool negate_product, bool negate_addend) {
     const __m128 x = _mm_castsi128_ps(a), y = _mm_castsi128_ps(b), z = _mm_castsi128_ps(c);
     const auto half = [&](__m128d px, __m128d py, __m128d pz) {
         __m128d product = _mm_mul_pd(px, py);
@@ -188,52 +208,39 @@ inline __m128 fused_host(__m128i a, __m128i b, __m128i c, bool negate_product, b
     const __m128d high = half(_mm_cvtps_pd(_mm_movehl_ps(x, x)), _mm_cvtps_pd(_mm_movehl_ps(y, y)), _mm_cvtps_pd(_mm_movehl_ps(z, z)));
     return _mm_movelh_ps(_mm_cvtpd_ps(low), _mm_cvtpd_ps(high));
 }
-#endif
+// Without the float unit's stand-in (the differential test), every lane the exact way.
+QILIN_SPU_INLINE SpuReg exact(HostOp op, const SpuReg& a, const SpuReg& b, const SpuReg& c) { return vec(exact_lanes(_mm_setzero_si128(), a.v, b.v, c.v, 15, op)); }
 
-inline SpuReg fa(const SpuReg& a, const SpuReg& b) {
-#if QILIN_SPU_HOST_SINGLE
-    if (t_single_mode) {
-        const __m128i x = load(a), y = load(b);
-        return host_result(_mm_add_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(y)), _mm_or_si128(top_exponent(x), top_exponent(y)),
-                           [&](unsigned i) { return add32(a.w[i], b.w[i], false); });
-    }
-#endif
-    return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, false); });
+QILIN_SPU_INLINE SpuReg fa(const SpuReg& a, const SpuReg& b) {
+    if (!t_single_mode) return exact(HostOp::Add, a, b, b);
+    return host_result(_mm_add_ps(_mm_castsi128_ps(a.v), _mm_castsi128_ps(b.v)), _mm_or_si128(top_exponent(a.v), top_exponent(b.v)), HostOp::Add, a.v, b.v, b.v);
 }
-inline SpuReg fs(const SpuReg& a, const SpuReg& b) {
-#if QILIN_SPU_HOST_SINGLE
-    if (t_single_mode) {
-        const __m128i x = load(a), y = load(b);
-        return host_result(_mm_sub_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(y)), _mm_or_si128(top_exponent(x), top_exponent(y)),
-                           [&](unsigned i) { return add32(a.w[i], b.w[i], true); });
-    }
-#endif
-    return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, true); });
+QILIN_SPU_INLINE SpuReg fs(const SpuReg& a, const SpuReg& b) {
+    if (!t_single_mode) return exact(HostOp::Subtract, a, b, b);
+    return host_result(_mm_sub_ps(_mm_castsi128_ps(a.v), _mm_castsi128_ps(b.v)), _mm_or_si128(top_exponent(a.v), top_exponent(b.v)), HostOp::Subtract, a.v, b.v, b.v);
 }
-inline SpuReg fm(const SpuReg& a, const SpuReg& b) {
-#if QILIN_SPU_HOST_SINGLE
-    if (t_single_mode) {
-        const __m128i x = load(a), y = load(b);
-        return host_result(_mm_mul_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(y)), _mm_or_si128(top_exponent(x), top_exponent(y)),
-                           [&](unsigned i) { return multiply32(a.w[i], b.w[i]); });
-    }
-#endif
-    return words(a, b, [](uint32_t p, uint32_t q) { return multiply32(p, q); });
+QILIN_SPU_INLINE SpuReg fm(const SpuReg& a, const SpuReg& b) {
+    if (!t_single_mode) return exact(HostOp::Multiply, a, b, b);
+    return host_result(_mm_mul_ps(_mm_castsi128_ps(a.v), _mm_castsi128_ps(b.v)), _mm_or_si128(top_exponent(a.v), top_exponent(b.v)), HostOp::Multiply, a.v, b.v, b.v);
 }
+QILIN_SPU_INLINE SpuReg fused(const SpuReg& a, const SpuReg& b, const SpuReg& c, bool negate_product, bool negate_addend) {
+    const HostOp op = negate_product ? HostOp::FusedNegateProduct : negate_addend ? HostOp::FusedNegateAddend : HostOp::Fused;
+    if (!t_single_mode) return exact(op, a, b, c);
+    return host_result(fused_host(a.v, b.v, c.v, negate_product, negate_addend), _mm_or_si128(_mm_or_si128(top_exponent(a.v), top_exponent(b.v)), top_exponent(c.v)), op,
+                       a.v, b.v, c.v);
+}
+#else
+inline SpuReg fa(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, false); }); }
+inline SpuReg fs(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return add32(p, q, true); }); }
+inline SpuReg fm(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return multiply32(p, q); }); }
 inline SpuReg fused(const SpuReg& a, const SpuReg& b, const SpuReg& c, bool negate_product, bool negate_addend) {
-#if QILIN_SPU_HOST_SINGLE
-    if (t_single_mode) {
-        const __m128i x = load(a), y = load(b), z = load(c);
-        return host_result(fused_host(x, y, z, negate_product, negate_addend), _mm_or_si128(_mm_or_si128(top_exponent(x), top_exponent(y)), top_exponent(z)),
-                           [&](unsigned i) { return fused32(a.w[i], b.w[i], c.w[i], negate_product, negate_addend); });
-    }
-#endif
     return {{fused32(a.w[0], b.w[0], c.w[0], negate_product, negate_addend), fused32(a.w[1], b.w[1], c.w[1], negate_product, negate_addend),
              fused32(a.w[2], b.w[2], c.w[2], negate_product, negate_addend), fused32(a.w[3], b.w[3], c.w[3], negate_product, negate_addend)}};
 }
-inline SpuReg fma(const SpuReg& a, const SpuReg& b, const SpuReg& c) { return fused(a, b, c, false, false); }
-inline SpuReg fms(const SpuReg& a, const SpuReg& b, const SpuReg& c) { return fused(a, b, c, false, true); }
-inline SpuReg fnms(const SpuReg& a, const SpuReg& b, const SpuReg& c) { return fused(a, b, c, true, false); }
+#endif
+QILIN_SPU_INLINE SpuReg fma(const SpuReg& a, const SpuReg& b, const SpuReg& c) { return fused(a, b, c, false, false); }
+QILIN_SPU_INLINE SpuReg fms(const SpuReg& a, const SpuReg& b, const SpuReg& c) { return fused(a, b, c, false, true); }
+QILIN_SPU_INLINE SpuReg fnms(const SpuReg& a, const SpuReg& b, const SpuReg& c) { return fused(a, b, c, true, false); }
 
 // ---- compares: every word with a zero exponent is the one zero ----
 inline int64_t ordered(uint32_t w) {
@@ -241,6 +248,21 @@ inline int64_t ordered(uint32_t w) {
     const int64_t magnitude = w & 0x7fffffffu;
     return (w >> 31) ? -magnitude : magnitude;
 }
+#if QILIN_SPU_SSE2
+// The same order as signed words: zero for a zero exponent, the magnitude with the sign's (as ordered()).
+QILIN_SPU_INLINE __m128i ordered_words(__m128i w, bool magnitude) {
+    const __m128i zero = _mm_cmpeq_epi32(_mm_and_si128(w, _mm_set1_epi32(0x7f800000)), _mm_setzero_si128());
+    const __m128i m = _mm_andnot_si128(zero, w);
+    const __m128i size = _mm_and_si128(m, _mm_set1_epi32(0x7fffffff));
+    if (magnitude) return size;
+    const __m128i sign = _mm_srai_epi32(m, 31);
+    return _mm_sub_epi32(_mm_xor_si128(size, sign), sign);
+}
+QILIN_SPU_INLINE SpuReg fceq(const SpuReg& a, const SpuReg& b) { return vec(_mm_cmpeq_epi32(ordered_words(a.v, false), ordered_words(b.v, false))); }
+QILIN_SPU_INLINE SpuReg fcgt(const SpuReg& a, const SpuReg& b) { return vec(_mm_cmpgt_epi32(ordered_words(a.v, false), ordered_words(b.v, false))); }
+QILIN_SPU_INLINE SpuReg fcmeq(const SpuReg& a, const SpuReg& b) { return vec(_mm_cmpeq_epi32(ordered_words(a.v, true), ordered_words(b.v, true))); }
+QILIN_SPU_INLINE SpuReg fcmgt(const SpuReg& a, const SpuReg& b) { return vec(_mm_cmpgt_epi32(ordered_words(a.v, true), ordered_words(b.v, true))); }
+#else
 inline SpuReg fceq(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return ordered(p) == ordered(q) ? 0xffffffffu : 0u; }); }
 inline SpuReg fcgt(const SpuReg& a, const SpuReg& b) { return words(a, b, [](uint32_t p, uint32_t q) { return ordered(p) > ordered(q) ? 0xffffffffu : 0u; }); }
 inline SpuReg fcmeq(const SpuReg& a, const SpuReg& b) {
@@ -249,6 +271,7 @@ inline SpuReg fcmeq(const SpuReg& a, const SpuReg& b) {
 inline SpuReg fcmgt(const SpuReg& a, const SpuReg& b) {
     return words(a, b, [](uint32_t p, uint32_t q) { return ordered(p & 0x7fffffffu) > ordered(q & 0x7fffffffu) ? 0xffffffffu : 0u; });
 }
+#endif
 
 // ---- conversions with whole numbers: `scale` is the number of bits after the binary point (0 to 127) ----
 inline SpuReg csflt(const SpuReg& a, int scale) {

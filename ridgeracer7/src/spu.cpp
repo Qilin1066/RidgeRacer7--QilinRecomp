@@ -78,10 +78,6 @@ uint32_t be32(const uint8_t* p) {
     std::memcpy(&v, p, 4);
     return std::endian::native == std::endian::little ? std::byteswap(v) : v;
 }
-void put_be32(uint8_t* p, uint32_t v) {
-    if constexpr (std::endian::native == std::endian::little) v = std::byteswap(v);
-    std::memcpy(p, &v, 4);
-}
 uint32_t be16(const uint8_t* p) { return (uint32_t{p[0]} << 8) | p[1]; }
 
 // ---------------------------------------------------------------- programs and local stores
@@ -282,11 +278,16 @@ std::string guest_string(uint32_t address, size_t most) {
 
 // ---------------------------------------------------------------- memory transfers
 
-uint8_t* local(Thread& t, uint32_t address, uint32_t size, uint32_t pc) {
+// The local store is in the host's word order (spu.hpp): bytes go to and from it through ls_write and ls_read.
+uint32_t local(Thread& t, uint32_t address, uint32_t size, uint32_t pc) {
     if (address > kSpuLocalStore || size > kSpuLocalStore - address)
         fatal("SPU thread %s: a transfer of %u bytes at %05x of its memory, which runs off the end (at %05x)", t.name.c_str(), size, address, pc);
-    return t.ls.data() + address;
+    return address;
 }
+void to_local(Thread& t, uint32_t address, const uint8_t* from, uint32_t size, uint32_t pc) {
+    qilin::rt::spu::ls_write(t.ls.data(), local(t, address, size, pc), from, size);
+}
+void from_local(Thread& t, uint32_t address, uint8_t* to, uint32_t size, uint32_t pc) { qilin::rt::spu::ls_read(t.ls.data(), local(t, address, size, pc), to, size); }
 uint8_t* shared(Thread& t, uint32_t address, uint32_t size, uint32_t pc) {
     if (t.eah != 0) fatal("SPU thread %s: a transfer to an address above 4 GiB (at %05x)", t.name.c_str(), pc);
     if (size > 0xffffffffu - address) fatal("SPU thread %s: a transfer of %u bytes at %08x, which runs off the end of memory (at %05x)", t.name.c_str(), size, address, pc);
@@ -304,23 +305,23 @@ void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
     // Bits 0 and 1 ask that the command wait for others of its tag: commands are done at once and in order here, so they say nothing.
     switch (command & ~3u) {
     case 0x40:  // get: the game's memory to the SPU's
-        std::memcpy(local(t, t.lsa, t.size, pc), shared(t, t.eal, t.size, pc), t.size);
+        to_local(t, t.lsa, shared(t, t.eal, t.size, pc), t.size, pc);
         return;
     case 0x20:  // put: the SPU's to the game's
-        std::memcpy(shared(t, t.eal, t.size, pc), local(t, t.lsa, t.size, pc), t.size);
+        from_local(t, t.lsa, shared(t, t.eal, t.size, pc), t.size, pc);
         return;
     case 0x44: case 0x24: {  // get and put by a list: pairs of (size, address), in the SPU's memory at `eal`, `size` bytes of them
         const bool get = (command & ~3u) == 0x44;
         uint32_t at = t.lsa;
-        const uint8_t* const list = local(t, t.eal & 0x3fff8u, t.size, pc);
+        const uint32_t list = local(t, t.eal & 0x3fff8u, t.size, pc);
         for (uint32_t i = 0; i + 8 <= t.size; i += 8) {
-            const uint32_t first = be32(list + i), address = be32(list + i + 4);
+            const uint32_t first = qilin::rt::spu::ls_word(t.ls.data(), list + i), address = qilin::rt::spu::ls_word(t.ls.data(), list + i + 4);
             const uint32_t bytes = first & 0x7fffu;
             if (first & 0x80000000u) fatal("SPU thread %s: a transfer list that asks to stall and notify, which this runtime doesn't provide yet (at %05x)", t.name.c_str(), pc);
             // Each piece lies in the SPU's memory where its address's low four bits put it within a quadword.
             at = (at & ~15u) | (address & 15u);
-            if (get) std::memcpy(local(t, at, bytes, pc), shared(t, address, bytes, pc), bytes);
-            else std::memcpy(shared(t, address, bytes, pc), local(t, at, bytes, pc), bytes);
+            if (get) to_local(t, at, shared(t, address, bytes, pc), bytes, pc);
+            else from_local(t, at, shared(t, address, bytes, pc), bytes, pc);
             at = (at + bytes + 15u) & ~15u;
         }
         return;
@@ -329,7 +330,7 @@ void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
         const std::lock_guard lock(g_atomic);
         t.reserved_at = t.eal & ~127u;
         std::memcpy(t.reserved_data.data(), shared(t, t.reserved_at, 128, pc), 128);
-        std::memcpy(local(t, t.lsa & 0x3ff80u, 128, pc), t.reserved_data.data(), 128);
+        to_local(t, t.lsa & 0x3ff80u, t.reserved_data.data(), 128, pc);
         t.reserved = true;
         t.atomic_status = 4;
         return;
@@ -339,7 +340,7 @@ void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
         const uint32_t line = t.eal & ~127u;
         uint8_t* const there = shared(t, line, 128, pc);
         if (t.reserved && t.reserved_at == line && std::memcmp(there, t.reserved_data.data(), 128) == 0) {
-            std::memcpy(there, local(t, t.lsa & 0x3ff80u, 128, pc), 128);
+            from_local(t, t.lsa & 0x3ff80u, there, 128, pc);
             t.atomic_status = 0;
             g_atomic_changed.notify_all();
         } else {
@@ -355,7 +356,7 @@ void transfer_command(Thread& t, uint32_t command, uint32_t pc) {
     case 0xB0: case 0xB8: {  // put the line whatever happened (the second form reports nothing)
         {
             const std::lock_guard lock(g_atomic);
-            std::memcpy(shared(t, t.eal & ~127u, 128, pc), local(t, t.lsa & 0x3ff80u, 128, pc), 128);
+            from_local(t, t.lsa & 0x3ff80u, shared(t, t.eal & ~127u, 128, pc), 128, pc);
             if ((command & ~3u) == 0xB0) t.atomic_status = 2;
             t.reserved = false;
             g_atomic_changed.notify_all();
@@ -587,6 +588,9 @@ TaskHosts& task_hosts() {
 
 // The program's memory as the system leaves it for a new thread: its segments, zeroes elsewhere, the arguments in $3 to $6.
 void prepare(Thread& t) {
+    // (The SPU helpers' shuffles need SSSE3 when built to assume it: spu.hpp.)
+    static const bool host_fits = qilin::rt::spu::host_has_ssse3() || !QILIN_SPU_SSSE3;
+    if (!host_fits) fatal("this computer's processor lacks SSSE3, which the SPU programs' translation is built to use");
     t.ls.renew();
     uint8_t* const ls = t.ls.data();
     const uint8_t* const file = guest_memory() + t.program->address;
@@ -594,7 +598,7 @@ void prepare(Thread& t) {
         if (segment.type != 1 || segment.memory_size == 0) continue;  // (1: a segment to load)
         if (segment.address > kSpuLocalStore || segment.memory_size > kSpuLocalStore - segment.address)
             fatal("SPU program %s has a segment outside an SPU's memory", t.name.c_str());
-        std::memcpy(ls + segment.address, file + segment.offset, segment.file_size);
+        qilin::rt::spu::ls_write(ls, segment.address, file + segment.offset, segment.file_size);
     }
     t.spu = Spu{};
     t.spu.ls = ls;
@@ -609,7 +613,7 @@ void prepare(Thread& t) {
         // 0x1C0, the taskset's workload number in 0x1D0's last word, and at 0x2FB8 the address of a context: +152 non-zero
         // in a task, +184 the taskset's 64-bit address, +196 the kernel's entry, +208 the DMA tag the kernel lends the library, +212 the task.
         // *The tag (31) and +152's value (1) are stated choices.*
-        const auto put = [ls](uint32_t at, uint32_t v) { put_be32(ls + at, v); };
+        const auto put = [ls](uint32_t at, uint32_t v) { qilin::rt::spu::set_ls_word(ls, at, v); };
         put(0x1c4, t.setup.spurs);
         put(0x1dc, t.setup.workload);
         put(0x2fb8, kTaskContext);
@@ -825,12 +829,12 @@ void local_store_word(Cpu& c, bool write) {
         c.r[3] = kEinval;
         return;
     }
-    uint8_t* const p = thread->ls.data() + address;
+    uint8_t* const p = thread->ls.data();
     if (write) {
-        for (uint32_t i = 0; i < bytes; ++i) p[i] = static_cast<uint8_t>(c.r[5] >> (8 * (bytes - 1 - i)));
+        for (uint32_t i = 0; i < bytes; ++i) p[qilin::rt::spu::ls_index(address + i)] = static_cast<uint8_t>(c.r[5] >> (8 * (bytes - 1 - i)));
     } else {
         uint64_t value = 0;
-        for (uint32_t i = 0; i < bytes; ++i) value = (value << 8) | p[i];
+        for (uint32_t i = 0; i < bytes; ++i) value = (value << 8) | p[qilin::rt::spu::ls_index(address + i)];
         store64(static_cast<uint32_t>(c.r[5]), value);
     }
     c.r[3] = kOk;

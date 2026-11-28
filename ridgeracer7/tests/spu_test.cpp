@@ -52,7 +52,15 @@ void put32(std::vector<uint8_t>& b, size_t at, uint32_t v) {
     for (int i = 0; i < 4; ++i) b[at + static_cast<size_t>(i)] = static_cast<uint8_t>(v >> (24 - 8 * i));
 }
 void put16(std::vector<uint8_t>& b, size_t at, uint16_t v) { b[at] = static_cast<uint8_t>(v >> 8), b[at + 1] = static_cast<uint8_t>(v); }
-uint32_t get32(const uint8_t* p) { return (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) | p[3]; }
+uint32_t be32(const uint8_t* p) { return (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) | p[3]; }
+// The local store is in the host's word order (qilin/rt/spu.hpp): its bytes and words as the SPU sees them.
+using qilin::rt::spu::ls_index;
+uint32_t get32(const uint8_t* ls, uint32_t at) { return qilin::rt::spu::ls_word(ls, at); }
+bool same(const uint8_t* ls, uint32_t at, const uint8_t* bytes, uint32_t n) {
+    std::vector<uint8_t> seen(n);
+    qilin::rt::spu::ls_read(ls, at, seen.data(), n);
+    return std::memcmp(seen.data(), bytes, n) == 0;
+}
 
 // An SPU program: code at 0x3000 (the bytes 0..255, standing for code: only their place in the local store is looked at),
 // data at 0x4000 (16 bytes in the file, 0x1000 in memory: the rest zeroes), a name note, the sections. Laid out as the
@@ -103,9 +111,9 @@ void dma(Spu& s, uint32_t ls, uint32_t ea, uint32_t size, uint32_t command) {
 // What a new thread's local store must be: the segments, zeroes everywhere else.
 bool fresh(const Spu& s) {
     for (uint32_t i = 0; i < kCodeBytes; ++i)
-        if (s.ls[kCodeAt + i] != i) return false;
+        if (s.ls[ls_index(kCodeAt + i)] != i) return false;
     for (uint32_t i = 0; i < kDataFile; ++i)
-        if (s.ls[kDataAt + i] != 0xd0 + i) return false;
+        if (s.ls[ls_index(kDataAt + i)] != 0xd0 + i) return false;
     const auto zero = [&](uint32_t from, uint32_t to) { return std::all_of(s.ls + from, s.ls + to, [](uint8_t b) { return b == 0; }); };
     // (Below 0x3000 a task's kernel data is: checked apart.)
     return zero(0x3000 + kCodeBytes, kDataAt) && zero(kDataAt + kDataFile, qilin::rt::kSpuLocalStore) && zero(0, 0x1c0);
@@ -123,25 +131,25 @@ void task_program(Spu& s, uint32_t target, uint32_t) {
     check(target == kCodeAt, "a task starts at its entry");
     check(fresh(s), "a task's local store holds its program and zeroes");
     check(s.r[3].w[0] == 0x11111111u && s.r[3].w[3] == 0x44444444u && s.r[4].w[0] == 0 && s.r[4].w[1] == 0x5555u, "a task's $3 and $4");
-    check(get32(s.ls + 0x1c4) == kSpurs && get32(s.ls + 0x2fb8) == 0x2d00 && get32(s.ls + 0x2d00 + 196) == 0x2e00 && get32(s.ls + 0x2d00 + 188) == kTaskset,
+    check(get32(s.ls, 0x1c4) == kSpurs && get32(s.ls, 0x2fb8) == 0x2d00 && get32(s.ls, 0x2d00 + 196) == 0x2e00 && get32(s.ls, 0x2d00 + 188) == kTaskset,
           "the SPURS kernel's data in a task's local store");
     // A get and a put.
     dma(s, 0x5000, kSource, 32, 0x40);
-    check(std::memcmp(s.ls + 0x5000, memory.data() + kSource, 32) == 0, "a get");
-    for (uint32_t i = 0; i < 32; ++i) s.ls[0x6000 + i] = static_cast<uint8_t>(0x80 + i);
+    check(same(s.ls, 0x5000, memory.data() + kSource, 32), "a get");
+    for (uint32_t i = 0; i < 32; ++i) s.ls[ls_index(0x6000 + i)] = static_cast<uint8_t>(0x80 + i);
     dma(s, 0x6000, kTarget, 32, 0x20);
     check(memory[kTarget] == 0x80 && memory[kTarget + 31] == 0x80 + 31, "a put");
     // A list: 8 bytes from kSource + 4, then 20 from kSource + 0x23, each to where its address's low four bits put it.
     const uint32_t list = 0x7000;
     const uint32_t elements[4] = {8, kSource + 4, 20, kSource + 0x23};
     for (uint32_t i = 0; i < 4; ++i)
-        for (uint32_t k = 0; k < 4; ++k) s.ls[list + 4 * i + k] = static_cast<uint8_t>(elements[i] >> (24 - 8 * k));
+        for (uint32_t k = 0; k < 4; ++k) s.ls[ls_index(list + 4 * i + k)] = static_cast<uint8_t>(elements[i] >> (24 - 8 * k));
     dma(s, 0x8000, list, 16, 0x44);
-    check(std::memcmp(s.ls + 0x8004, memory.data() + kSource + 4, 8) == 0 && std::memcmp(s.ls + 0x8013, memory.data() + kSource + 0x23, 20) == 0, "a get by a list");
+    check(same(s.ls, 0x8004, memory.data() + kSource + 4, 8) && same(s.ls, 0x8013, memory.data() + kSource + 0x23, 20), "a get by a list");
     // And back by a list, elsewhere.
     const uint32_t back[4] = {8, kListTarget + 4, 20, kListTarget + 0x23};
     for (uint32_t i = 0; i < 4; ++i)
-        for (uint32_t k = 0; k < 4; ++k) s.ls[list + 4 * i + k] = static_cast<uint8_t>(back[i] >> (24 - 8 * k));
+        for (uint32_t k = 0; k < 4; ++k) s.ls[ls_index(list + 4 * i + k)] = static_cast<uint8_t>(back[i] >> (24 - 8 * k));
     dma(s, 0x8000, list, 16, 0x24);
     check(std::memcmp(memory.data() + kListTarget + 4, memory.data() + kSource + 4, 8) == 0 &&
               std::memcmp(memory.data() + kListTarget + 0x23, memory.data() + kSource + 0x23, 20) == 0,
@@ -150,8 +158,8 @@ void task_program(Spu& s, uint32_t target, uint32_t) {
     for (;;) {
         dma(s, 0x9000, kLine, 128, 0xD0);
         check(rdch(s, 27) == 4, "the line is reserved");
-        const uint32_t count = get32(s.ls + 0x9000) + 1;
-        for (int k = 0; k < 4; ++k) s.ls[0x9000 + k] = static_cast<uint8_t>(count >> (24 - 8 * k));
+        const uint32_t count = get32(s.ls, 0x9000) + 1;
+        for (int k = 0; k < 4; ++k) s.ls[ls_index(0x9000 + k)] = static_cast<uint8_t>(count >> (24 - 8 * k));
         dma(s, 0x9000, kLine, 128, 0xB4);
         if (rdch(s, 27) == 0) break;
     }
@@ -213,7 +221,7 @@ void tasks() {
     // Many at once.
     for (uint32_t i = 0; i < 24; ++i) rr7::start_spu_task(setup(i));
     wait_exits(64);
-    check(get32(memory.data() + kLine) == 64, "every task's atomic increment counted once");
+    check(be32(memory.data() + kLine) == 64, "every task's atomic increment counted once");
 }
 
 void syscall(uint32_t number, Cpu& c) {
@@ -275,7 +283,7 @@ void bench() {
 
 namespace rr7 {
 uint8_t* guest_memory() { return memory.data(); }
-uint32_t load32(uint32_t address) { return get32(memory.data() + address); }
+uint32_t load32(uint32_t address) { return be32(memory.data() + address); }
 uint64_t load64(uint32_t address) { return (uint64_t{load32(address)} << 32) | load32(address + 4); }
 void store32(uint32_t address, uint32_t value) {
     for (int i = 0; i < 4; ++i) memory[address + static_cast<uint32_t>(i)] = static_cast<uint8_t>(value >> (24 - 8 * i));

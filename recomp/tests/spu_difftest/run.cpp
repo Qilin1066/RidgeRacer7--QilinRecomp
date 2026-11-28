@@ -130,13 +130,18 @@ size_t check_estimates(std::mt19937& rng, size_t count, size_t& worst_reciprocal
 int main(int argc, char** argv) {
     const int states = argc > 1 ? std::atoi(argv[1]) : 64;
     std::mt19937 rng(20061111);
-    // Two local stores with the same random contents.
+    // Two local stores with the same random contents: the lifted code's in the host's word order (spu.hpp), the
+    // reference's in the SPU's byte order.
     std::vector<uint8_t> ls_lifted(qilin::rt::kSpuLocalStore), ls_reference(qilin::rt::kSpuLocalStore);
-    for (size_t i = 0; i < ls_lifted.size(); i += 4) {
-        const uint32_t v = rng();
-        std::memcpy(&ls_lifted[i], &v, 4);
-    }
-    ls_reference = ls_lifted;
+    for (size_t i = 0; i < ls_reference.size(); ++i) ls_reference[i] = static_cast<uint8_t>(rng());
+    const auto copy_reference = [&] { qilin::rt::spu::ls_write(ls_lifted.data(), 0, ls_reference.data(), ls_reference.size()); };
+    const auto same_stores = [&] {
+        for (uint32_t i = 0; i < qilin::rt::kSpuLocalStore; i += 4)
+            if (qilin::rt::spu::ls_word(ls_lifted.data(), i) != ((uint32_t{ls_reference[i]} << 24) | (uint32_t{ls_reference[i + 1]} << 16) | (uint32_t{ls_reference[i + 2]} << 8) | ls_reference[i + 3]))
+                return false;
+        return true;
+    };
+    copy_reference();
 
     size_t disagreements = 0, runs = 0, stores = 0, halts = 0;
     for (size_t k = 0; k < kCaseCount; ++k) {
@@ -191,9 +196,9 @@ int main(int argc, char** argv) {
             halts += ref.halted;
             if (ref.stored || (qilin::spu::spec(in.op).flags & qilin::spu::kStore)) {
                 ++stores;
-                if (std::memcmp(ls_lifted.data(), ls_reference.data(), ls_lifted.size()) != 0) {
+                if (!same_stores()) {
                     fail("the local store", 0, ref.stored_at);
-                    ls_lifted = ls_reference;
+                    copy_reference();
                 }
             }
         }

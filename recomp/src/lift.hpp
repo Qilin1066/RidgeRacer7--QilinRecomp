@@ -16,9 +16,11 @@
 // silently (docs/recompiler-core.md).
 #pragma once
 
+#include <bitset>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,15 @@
 #include "ppu.hpp"
 
 namespace qilin {
+
+// What a lifted function may do to the guest's registers, as its callers see it (lift.cpp, "what a callee reads and
+// writes"): those it may read before writing them, and those it may write, each as one of the lifter's locals (r0-r31,
+// f0-f31, v0-v31, cr0-cr7, lr, ctr, so, ov, ca, in that order). Its callees' effects are part of its own.
+inline constexpr size_t kRegisterSlots = 109;
+struct RegisterEffects {
+    std::bitset<kRegisterSlots> reads, writes;
+};
+using EffectsTable = std::unordered_map<uint32_t, RegisterEffects>;
 
 struct LiftInput {
     uint32_t start = 0;
@@ -36,6 +47,9 @@ struct LiftInput {
     std::function<bool(uint32_t)> is_function;  // a known function start (tail and call targets)
     bool keep_pc = false;                       // note each instruction's address in Cpu::pc before it touches memory (for finding faults: slower)
     bool keep_registers = false;                // and write the registers back to the Cpu there too, so a fault's report can show them (slower still)
+    // The program's functions' effects (register_effects): a call to one of them writes back and reads again only what
+    // it may read or write. Without (or with keep_registers), every call syncs every register.
+    const EffectsTable* effects = nullptr;
 };
 
 struct Lifted {
@@ -45,6 +59,7 @@ struct Lifted {
     uint32_t why_at = 0;
     bool catches = false;     // has landing pads, so its body is in a try (docs/recompiler-core.md, "C++ exceptions")
     unsigned eh_returns = 0;  // __builtin_eh_return epilogues in it (the guest's unwinder), each lifted as a GuestUnwind throw
+    unsigned narrowed = 0;    // calls whose sync its callee's effects narrowed
 };
 
 std::string fn_name(uint32_t address);  // "fn_00010200"
@@ -56,5 +71,11 @@ Lifted lift(const LiftInput& f);
 
 // The input for one of Cfg's functions.
 LiftInput lift_input(const Cfg& cfg, const Function& f);
+
+// Every function's effects over the whole program, to a fixed point over its calls. A function that may call through a
+// register, call the system, call a hook, throw (__builtin_eh_return's epilogue), or that has landing pads, or that
+// calls a function not among `functions` or not lifted, may read and write everything. (A trap doesn't come back:
+// what it would read is nobody's.) Functions that aren't lifted have no entry.
+EffectsTable register_effects(const std::vector<LiftInput>& functions);
 
 }  // namespace qilin

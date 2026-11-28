@@ -4,7 +4,15 @@
 #include <cstddef>
 #include <cstdint>
 
+// The differential test checks the exact mode of the floating-point helpers (fp.hpp, QILIN_FP_EXACT): the relaxed
+// mode, the game's, has its own checks (run.cpp, "relaxed floating point").
+#if defined(QILIN_FP_EXACT) && !QILIN_FP_EXACT
+#error "the differential test runs the exact floating point (QILIN_FP_EXACT 1)"
+#endif
+#undef QILIN_FP_EXACT
+#define QILIN_FP_EXACT 1
 #include "qilin/rt/cpu.hpp"
+static_assert(qilin::rt::fp::kExact, "qilin/rt/cpu.hpp was included before cases.hpp, in the relaxed mode");
 
 namespace difftest {
 

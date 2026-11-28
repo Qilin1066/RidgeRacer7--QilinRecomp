@@ -1,4 +1,5 @@
 // Unit tests: no game files needed. Run by ctest.
+#include <bitset>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -83,7 +84,19 @@ void test_lift_dataflow() {
     CHECK(has(sync, "c.r[3] = r3; c.lr = lr;  fn_00010100(c);") && !has(sync, "c.r[4] = r4") && has(sync, "\n     return;\n"));
     // Changed on one path to the call and not on the other: written back (the paths' union).
     const std::string paths = lifted({0x2f830000, 0x419e0008, 0x38a00001, bl(0x1000c), 0x4e800020});
-    CHECK(has(paths, "c.r[5] = r5;") && has(paths, "(cr7 << 0)") && !has(paths, "c.r[3] = r3"));
+    CHECK(has(paths, "c.r[5] = r5;") && !has(paths, "c.r[3] = r3"));
+    // The field itself is lazy there: every read of it folds, so the compare keeps only its operands and the
+    // write-back forms the field from them.
+    CHECK(has(paths, "(compare_s(static_cast<int64_t>(k7a), static_cast<int64_t>(k7b), so) << 0)") && !has(paths, "cr7 = compare_s"));
+    // Not where the field's local is read (mcrf cr6,cr7), nor where a read doesn't fold (after a call): set at the compare.
+    const std::string copied = lifted({0x2f830000, 0x4f1c0000, 0x419e0008, 0x38800001, 0x4e800020});
+    CHECK(has(copied, "cr7 = compare_s(") && has(copied, "cr6 = cr7;") && has(copied, "(cr7 << 0)"));
+    CHECK(has(after, "cr7 = compare_s("));
+    // A CR logical operation reads its own field's local (it changes one bit of it): set at the compare there.
+    CHECK(has(fp, "cr7 = fp::fcompare("));
+    // A floating-point compare and branch, alone: lazy, formed at the write-back.
+    const std::string fcmp = lifted({0xff811000, 0x419e0008, 0x38800001, 0x4e800020});
+    CHECK(has(fcmp, "(fp::fcompare(k7x, k7y) << 0)") && !has(fcmp, "cr7 = fp::fcompare("));
 }
 
 // ---------------------------------------------------------------- SHA-256
@@ -1328,6 +1341,53 @@ void test_rsx_spirv() {
 // ---------------------------------------------------------------- the lifter and C++ exceptions
 // (The unwinding program in the differential test runs them; these hold the shapes the lifter takes and refuses.)
 
+// ---------------------------------------------------------------- what a callee reads and writes
+// register_effects over a few functions, and a call narrowed by them (lift.cpp). The differential test's programs of
+// three functions check the results; these check the shapes.
+void test_lift_effects() {
+    const auto input = [](uint32_t at, std::vector<uint32_t> words) {
+        LiftInput in;
+        in.start = at;
+        for (size_t i = 0; i < words.size(); ++i) in.insns.emplace_back(at + 4 * static_cast<uint32_t>(i), ppu::decode(words[i]));
+        in.is_function = [](uint32_t a) { return a == 0x10100 || a == 0x10200 || a == 0x10300 || a == 0x10400; };
+        return in;
+    };
+    const auto has = [](const std::string& text, std::string_view what) { return text.find(what) != std::string::npos; };
+    const std::vector<LiftInput> program = {
+        input(0x10200, {0x38a30001, 0x4e800020}),  // leaf: addi r5,r3,1; blr
+        input(0x10100, {0x48000101, 0x4e800020}),  // mid: bl leaf; blr
+        input(0x10300, {0x44000002, 0x4e800020}),  // sc; blr
+        input(0x10400, {0x4bfffd01, 0x4e800020}),  // bl mid (from 0x10400); blr
+    };
+    const EffectsTable effects = register_effects(program);
+    const auto slots = [](std::initializer_list<size_t> bits) {
+        std::bitset<kRegisterSlots> b;
+        for (const size_t n : bits) b.set(n);
+        return b;
+    };
+    constexpr size_t kLr = 104;
+    CHECK(effects.size() == 4);
+    CHECK(effects.at(0x10200).reads == slots({3}) && effects.at(0x10200).writes == slots({5}));
+    CHECK(effects.at(0x10100).reads == slots({3}) && effects.at(0x10100).writes == slots({5, kLr}));  // (bl sets LR)
+    CHECK(effects.at(0x10300).reads.all() && effects.at(0x10300).writes.all());                        // a system call: everything
+    CHECK(effects.at(0x10400).reads == slots({3}) && effects.at(0x10400).writes == slots({5, kLr}));
+    // A call to a function not among them: everything.
+    const EffectsTable alone = register_effects({input(0x10100, {0x48000101, 0x4e800020})});
+    CHECK(alone.at(0x10100).reads.all() && alone.at(0x10100).writes.all());
+    // The caller: addi r3,r3,1; addi r4,r4,1; bl leaf; addi r6,r5,0; blr. Before the call only r3 is written back (r4
+    // and LR wait for the return), after it only r5 is read again.
+    LiftInput caller = input(0x10000, {0x38630001, 0x38840001, 0x480001f9, 0x38c50000, 0x4e800020});
+    caller.effects = &effects;
+    const Lifted narrowed = lift(caller);
+    CHECK(narrowed.ok && narrowed.narrowed == 1);
+    CHECK(has(narrowed.code, "c.r[3] = r3;  fn_00010200(c); r5 = c.r[5]; ") && has(narrowed.code, "c.r[4] = r4;") && has(narrowed.code, "c.lr = lr;"));
+    CHECK(!has(narrowed.code, "r4 = c.r[4];") || has(narrowed.code, "uint64_t r4 = c.r[4];"));
+    // Without the effects (or with --registers), the call syncs everything.
+    caller.effects = nullptr;
+    const Lifted full = lift(caller);
+    CHECK(full.ok && full.narrowed == 0 && has(full.code, "fn_00010200(c); r3 = c.r[3]; r4 = c.r[4]; r5 = c.r[5]; r6 = c.r[6]; lr = c.lr;"));
+}
+
 void test_lift_exceptions() {
     const auto input = [](std::vector<uint32_t> words, std::vector<uint32_t> pads = {}) {
         LiftInput in;
@@ -1366,6 +1426,7 @@ void test_lift_exceptions() {
 }
 
 int main() {
+    test_lift_effects();
     test_lift_exceptions();
     test_lift_dataflow();
     test_sha256();

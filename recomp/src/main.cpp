@@ -945,6 +945,18 @@ int cmd_lift(const Args& a) {
     size_t lifted = 0, words = 0, lifted_words = 0, catching = 0, pads = 0, eh_returns = 0, unwinders = 0;
     std::vector<std::string> code;
     std::string declarations, stubs, table;
+    // What each function may read and write of the registers (lift.hpp), for its callers' calls: not with --registers,
+    // whose reports want every register in the Cpu.
+    std::vector<LiftInput> inputs;
+    for (const auto& [start, f] : cfg->functions()) {
+        inputs.push_back(lift_input(*cfg, f));
+        inputs.back().keep_pc = a.keep_pc;
+        inputs.back().keep_registers = a.keep_registers;
+    }
+    const EffectsTable effects = a.keep_registers ? EffectsTable{} : register_effects(inputs);
+    size_t narrowed = 0, calls_known = 0;
+    for (const auto& [address, e] : effects) calls_known += e.reads.count() < kRegisterSlots || e.writes.count() < kRegisterSlots;
+    size_t which = 0;
     for (const auto& [start, f] : cfg->functions()) {
         if (a.out) table += std::format("    {{0x{:08X}u, &{}}},\n", start, fn_name(start));
         words += f.words;
@@ -954,10 +966,10 @@ int cmd_lift(const Args& a) {
         if (!f.pads_beyond.empty())
             throw Failure{std::format("the function at {:#x} ends at {:#x}, before its landing pad at {:#x}: the lifter can't enter it there", start, f.bound,
                                       f.pads_beyond[0])};
-        LiftInput input = lift_input(*cfg, f);
-        input.keep_pc = a.keep_pc;
-        input.keep_registers = a.keep_registers;
+        LiftInput& input = inputs[which++];
+        if (!a.keep_registers) input.effects = &effects;
         const Lifted l = lift(input);
+        narrowed += l.narrowed;
         if (l.ok) {
             ++lifted;
             lifted_words += f.words;
@@ -983,6 +995,8 @@ int cmd_lift(const Args& a) {
     }
     std::ranges::sort(reasons, [](const Reason& x, const Reason& y) { return x.functions > y.functions; });
     std::println("{} of {} functions lifted ({} of {} instructions)", lifted, cfg->functions().size(), lifted_words, words);
+    std::println("calls: {} of the lifted functions read and write less than everything; {} calls sync only what their callee may read or write",
+                 calls_known, narrowed);
     std::println("C++ exceptions: {} functions with {} landing pads, each enterable at its pads; {} __builtin_eh_return epilogues in {} functions (the unwinder)",
                  catching, pads, eh_returns, unwinders);
     // Landing pads with no epilogue to reach them: the unwinder's shape isn't the one the lifter knows, and a throw

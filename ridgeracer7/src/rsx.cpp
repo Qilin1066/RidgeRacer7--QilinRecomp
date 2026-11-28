@@ -341,7 +341,7 @@ void act(uint32_t method, uint32_t argument, uint32_t at) {
         return;
     case 0x0068:  // NV406E_SEMAPHORE_ACQUIRE: wait until the game has made it this value
         renderer_flush("a semaphore wait");
-        for (const uint32_t address = label_address(r.label, at); load32(address) != argument;) std::this_thread::yield();
+        rsx_wait_word(label_address(r.label, at), argument, true, std::chrono::steady_clock::now());
         return;
     case 0x1d70:  // BACK_END_WRITE_SEMAPHORE_RELEASE: write the label at SET_SEMAPHORE_OFFSET once everything drawn so far is in the surface.
         renderer_flush("a back-end semaphore");
@@ -440,10 +440,11 @@ void serve() {
                 idle_flushed = true;
             }
             if (g_survey && std::chrono::steady_clock::now() > g_survey_ends) end_survey();
-            // Nothing to do. (The console's RSX is told when put moves; here the game's own code moves it
-            // in memory, so it is watched: closely at first, then at a millisecond's remove.)
-            if (++idle < 2000) std::this_thread::yield();
-            else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // Nothing to do. (The console's RSX is told when put moves; here the game's own code moves it in memory, so it is
+            // waited for as rsx_wait_word does it, gcm.hpp: woken when it moves, or soon after; until the idle flush is due.)
+            if (idle++ == 0) rsx_get_moved();  // (the command buffer's callback may wait for the RSX to have stopped)
+            rsx_wait_word(control, put, false, idle_since,
+                          !idle_flushed ? idle_since + std::chrono::milliseconds(2) : g_survey ? g_survey_ends : std::chrono::steady_clock::time_point::max());
             continue;
         }
         idle = 0;
@@ -457,7 +458,7 @@ void serve() {
         if (header == 0 && after_transfer) {
             const auto from = std::chrono::steady_clock::now();
             uint32_t now = 0;
-            while ((now = load32(address)) == 0 && std::chrono::steady_clock::now() - from < std::chrono::milliseconds(250)) std::this_thread::yield();
+            now = rsx_wait_word(address, 0, false, from, from + std::chrono::milliseconds(250));
             static int logged = 0;
             if (logged < 20) {
                 ++logged;
@@ -474,7 +475,7 @@ void serve() {
             if (next == r.get) {  // to itself: the game's way of holding the RSX here until it writes over it
                 renderer_flush("a jump to itself");
                 if (g_survey && std::chrono::steady_clock::now() > g_survey_ends) end_survey();
-                std::this_thread::yield();
+                rsx_wait_word(address, header, false, std::chrono::steady_clock::now(), g_survey ? g_survey_ends : std::chrono::steady_clock::time_point::max());
                 continue;
             }
         } else if ((header & 3) == 1) {  // a jump, as made later
@@ -503,6 +504,7 @@ void serve() {
         after_transfer = transferred;
         r.get = next;
         store32(control + 4, next);
+        if (transferred) rsx_get_moved();  // (the command buffer's callback may wait for get to leave a piece)
     }
 }
 

@@ -3,6 +3,7 @@
 // Runtime code: no std::format.
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 
 namespace rr7 {
@@ -45,5 +46,21 @@ uint32_t flip_mode();
 // one to come, and a wait until the nth has come.
 uint64_t next_vertical_blank();
 void wait_for_vertical_blank(uint64_t n);
+
+// The RSX's thread waits without spinning (gcm.cpp). What it waits for is a word in guest memory the game's own code
+// writes (put, a label, a jump being written over), so it can't be told of each store: it spins briefly, then parks a
+// tenth of a millisecond at a time for 2 ms, then a millisecond at a time; and is woken at once by any guest thread's
+// call into the system (rsx_poke) that finds the word as wanted, and by the runtime's own writes of put.
+//
+// Waits until the word at `address` is `value` (with `equal`) or isn't (without), or `until` passes; `since` is when the
+// RSX began waiting for it. Returns the word.
+uint32_t rsx_wait_word(uint32_t address, uint32_t value, bool equal, std::chrono::steady_clock::time_point since,
+                       std::chrono::steady_clock::time_point until = std::chrono::steady_clock::time_point::max());
+// A guest thread calls into the system (kernel.cpp): if the RSX waits for a word that has come, it is woken. One load
+// when the RSX isn't waiting.
+void rsx_poke();
+// The RSX has moved `get` by a jump, call or return, or run out of commands: the command buffer's callback, if it waits
+// for the RSX to leave a piece of the buffer, looks again.
+void rsx_get_moved();
 
 }  // namespace rr7

@@ -56,6 +56,16 @@ struct Gcm {
 };
 Gcm g;
 
+// The RSX's waits (gcm.hpp's rsx_wait_word): the word it waits for, for rsx_poke to look at.
+Doorbell g_rsx_bell;
+std::atomic<uint32_t> g_rsx_address{0}, g_rsx_value{0};
+std::atomic<bool> g_rsx_equal{false};
+// The command buffer's callback's wait for the RSX to leave a piece, which the RSX rings for every time get jumps
+// (rsx_get_moved): it parks for long. (Its timeout only bounds a ring missed, which the code below has no case of.)
+Doorbell g_get_bell;
+constexpr WaitPlan kRungEveryTime{.spin = std::chrono::microseconds(20), .nap = std::chrono::milliseconds(100),
+                                  .napping = std::chrono::microseconds(0), .park = std::chrono::milliseconds(100)};
+
 // Room for `words` more commands in the context, as the game's own code makes it: through the context's callback.
 // (Used by the functions here that put commands in the stream.)
 bool reserve(Cpu& c, uint32_t context, uint32_t words) {
@@ -97,13 +107,20 @@ void command_buffer_callback(Cpu& c) {
     }
     store32(current, 0x20000000u | begin);  // a jump
     store32(control, begin);                // put
-    Blocking blocking;  // (the core token, if the RSX keeps it waiting: the RSX may be waiting on another guest thread)
-    for (int spins = 0;; ++spins) {
+    rsx_poke();                             // (the RSX may be waiting for put to move)
+    // The RSX leaves the piece by a jump (the one just written, or one written when the piece was last filled), which
+    // rings g_get_bell; or it has taken the jump and waits there (get == begin): the piece is free.
+    const auto left = [&] {
         const uint32_t get = load32(control + 4);
-        if (get < next || get > end) break;
-        if (get == begin) break;  // it has taken the jump and waits there: the piece is free
-        if (spins == 64) blocking.release();
-        std::this_thread::yield();
+        return get < next || get > end || get == begin;
+    };
+    if (!left()) {
+        Blocking blocking;  // (the core token, if the RSX keeps it waiting: the RSX may be waiting on another guest thread)
+        const auto since = std::chrono::steady_clock::now();
+        if (!g_get_bell.wait(left, since, since + kRungEveryTime.spin, kRungEveryTime)) {
+            blocking.release();
+            g_get_bell.wait(left, since, std::chrono::steady_clock::time_point::max(), kRungEveryTime);
+        }
     }
     store32(context, io + begin);
     store32(context + 4, io + end);
@@ -300,7 +317,7 @@ void vblank_thread() {
     for (uint64_t n = static_cast<uint64_t>(since) * 60 / 1001000000ull + 1;; ++n) {
         // Held while the settings menu pauses the game (pause.hpp), then on from the next blank, not catching up.
         if (hold_while_paused(HoldPoint::vertical_blank)) n = next_vertical_blank();
-        std::this_thread::sleep_until(vblank_time(n));
+        sleep_until_precisely(vblank_time(n));  // (a plain sleep on Windows is late by up to a millisecond or more)
         g_vblanks.store(n, std::memory_order_relaxed);
         if (const uint32_t handler = g_vblank_handler.load()) {
             cpu.r[3] = 1;
@@ -346,7 +363,27 @@ uint64_t next_vertical_blank() {
     return static_cast<uint64_t>(since) * 60 / 1001000000ull + 1;
 }
 
-void wait_for_vertical_blank(uint64_t n) { std::this_thread::sleep_until(vblank_time(n)); }
+void wait_for_vertical_blank(uint64_t n) { sleep_until_precisely(vblank_time(n)); }
+
+uint32_t rsx_wait_word(uint32_t address, uint32_t value, bool equal, std::chrono::steady_clock::time_point since,
+                       std::chrono::steady_clock::time_point until) {
+    uint32_t word = load32(address);
+    if ((word == value) == equal) return word;
+    // (Set before the doorbell is marked waited on, which rsx_poke looks at first.)
+    g_rsx_address.store(address, std::memory_order_relaxed);
+    g_rsx_value.store(value, std::memory_order_relaxed);
+    g_rsx_equal.store(equal, std::memory_order_relaxed);
+    g_rsx_bell.wait([&] { return ((word = load32(address)) == value) == equal; }, since, until);
+    return word;
+}
+
+void rsx_poke() {
+    if (!g_rsx_bell.waited_on()) return;
+    if ((load32(g_rsx_address.load(std::memory_order_relaxed)) == g_rsx_value.load(std::memory_order_relaxed)) == g_rsx_equal.load(std::memory_order_relaxed))
+        g_rsx_bell.ring();
+}
+
+void rsx_get_moved() { g_get_bell.ring(); }
 
 uint32_t rsx_io_address(uint32_t offset) { return offset < g.setup.io_size ? g.setup.io_address + offset : 0; }
 

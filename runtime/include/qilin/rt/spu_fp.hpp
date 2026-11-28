@@ -137,7 +137,23 @@ inline void enter_single_mode() {
     enter_single_mode(mode);
 }
 
-// For its own lifetime, the float unit as it is by default (round to nearest, denormals kept).
+// A value pinned in time against the float unit's mode changes. Float arithmetic is pure to a compiler, so it may be
+// moved across a change of the rounding mode (set_float_control): Apple's Clang did so on ARM64, which computed in the
+// mode before or after the one asked for. A volatile copy is never moved past another side effect: operands pinned after
+// a change and results before the next keep the arithmetic between them.
+template <typename T>
+inline T pinned(T v) {
+    volatile T kept = v;
+    return kept;
+}
+inline SpuReg pinned(const SpuReg& v) {
+    SpuReg r;
+    for (unsigned i = 0; i < 4; ++i) r.w[i] = pinned(v.w[i]);
+    return r;
+}
+
+// For its own lifetime, the float unit as it is by default (round to nearest, denormals kept). Arithmetic meant to run
+// under it pins its operands and results (pinned, above).
 struct NearestMode {
 #if QILIN_SPU_HOST_SINGLE
     FloatControl saved;
@@ -542,7 +558,7 @@ inline SpuReg doubles(const SpuReg& a, const SpuReg& b, F f) {
         const uint64_t x = pair(a, i), y = pair(b, i);
         uint64_t bits = kDefaultNan64;
         if (!nan64(x) && !nan64(y)) {
-            const double value = f(operand64(x), operand64(y));
+            const double value = pinned(f(pinned(operand64(x)), pinned(operand64(y))));
             if (value == value) bits = std::bit_cast<uint64_t>(value);
         }
         r.w[2 * i] = static_cast<uint32_t>(bits >> 32);
@@ -576,7 +592,7 @@ inline SpuReg frds(const SpuReg& a) {
     SpuReg r;
     for (unsigned i = 0; i < 2; ++i) {
         const uint64_t d = pair(a, i);
-        r.w[2 * i] = nan64(d) ? 0x7fc00000u : std::bit_cast<uint32_t>(static_cast<float>(operand64(d)));
+        r.w[2 * i] = nan64(d) ? 0x7fc00000u : pinned(std::bit_cast<uint32_t>(static_cast<float>(pinned(operand64(d)))));
         r.w[2 * i + 1] = 0;
     }
     return r;

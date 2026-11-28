@@ -321,8 +321,10 @@ PipelineKey PipelineCache::key(const Draw& d, const qilin::rt::TranslatedShader&
         logic = *op;
     }
     // The RSX's colour mask is blue bit 0, green 8, red 16, alpha 24.
-    const uint32_t write_mask = ((d.color_mask >> 16) & 1 ? VK_COLOR_COMPONENT_R_BIT : 0u) | ((d.color_mask >> 8) & 1 ? VK_COLOR_COMPONENT_G_BIT : 0u) |
-                                (d.color_mask & 1 ? VK_COLOR_COMPONENT_B_BIT : 0u) | ((d.color_mask >> 24) & 1 ? VK_COLOR_COMPONENT_A_BIT : 0u);
+    constexpr VkColorComponentFlags kR = VK_COLOR_COMPONENT_R_BIT, kG = VK_COLOR_COMPONENT_G_BIT, kB = VK_COLOR_COMPONENT_B_BIT,
+                                    kA = VK_COLOR_COMPONENT_A_BIT, kNone = 0;
+    const uint32_t write_mask = ((d.color_mask >> 16) & 1 ? kR : kNone) | ((d.color_mask >> 8) & 1 ? kG : kNone) |
+                                (d.color_mask & 1 ? kB : kNone) | ((d.color_mask >> 24) & 1 ? kA : kNone);
     PipelineKey k{};
     k[0] = static_cast<uint32_t>(vs.key), k[1] = static_cast<uint32_t>(vs.key >> 32), k[2] = static_cast<uint32_t>(fs.key), k[3] = static_cast<uint32_t>(fs.key >> 32);
     k[4] = forms.vertex | forms.fragment << 8 | topology_class(topology) << 16 | static_cast<uint32_t>(rasterising.mode) << 20 | uint32_t{d.depth_surface} << 24 |

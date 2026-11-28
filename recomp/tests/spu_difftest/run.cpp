@@ -117,8 +117,11 @@ size_t check_relaxed(std::mt19937& rng, size_t count, size_t& fused_differ) {
     const auto run = [](fp::FloatMode mode, const SpuReg& a, const SpuReg& b, const SpuReg& c) {
         const fp::FloatControl saved = fp::float_control();
         fp::enter_single_mode(mode);
-        const Results r{fp::fa(a, b), fp::fs(a, b), fp::fm(a, b), {fp::fma(a, b, c), fp::fnms(a, b, c), fp::fms(a, b, c)},
-                        {fp::fceq(a, b), fp::fcgt(a, b), fp::fcmeq(a, b), fp::fcmgt(a, b)}};
+        // (Operands and results pinned, so that the arithmetic runs in the mode just set: fp::pinned.)
+        const SpuReg x = fp::pinned(a), y = fp::pinned(b), z = fp::pinned(c);
+        const Results r{fp::pinned(fp::fa(x, y)), fp::pinned(fp::fs(x, y)), fp::pinned(fp::fm(x, y)),
+                        {fp::pinned(fp::fma(x, y, z)), fp::pinned(fp::fnms(x, y, z)), fp::pinned(fp::fms(x, y, z))},
+                        {fp::pinned(fp::fceq(x, y)), fp::pinned(fp::fcgt(x, y)), fp::pinned(fp::fcmeq(x, y)), fp::pinned(fp::fcmgt(x, y))}};
         fp::set_float_control(saved);
         return r;
     };

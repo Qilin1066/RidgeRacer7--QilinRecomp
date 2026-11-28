@@ -420,12 +420,14 @@ std::atomic<uint64_t> g_host_yields{0};
 }  // namespace
 
 std::chrono::nanoseconds timer_floor() {
-    // (The median of nine of the shortest timed sleeps, and a tenth more for the timer's jitter.)
+    // (The median of nine timed sleeps of 50 us, and a tenth more for the timer's jitter. Not 1 us: on some hosts a
+    // request that short comes back at once, though a real sleep then wakes on the timer's grid, half a millisecond on
+    // Windows, so the floor came out tiny and every short sleep overslept.)
     static const std::chrono::nanoseconds floor = [] {
         std::array<std::chrono::nanoseconds, 9> took{};
         for (auto& t : took) {
             const auto from = std::chrono::steady_clock::now();
-            timer_sleep_until(from + std::chrono::microseconds(1));
+            timer_sleep_until(from + std::chrono::microseconds(50));
             t = std::chrono::steady_clock::now() - from;
         }
         std::ranges::sort(took);

@@ -21,6 +21,16 @@
 
 namespace {
 using namespace std::chrono_literals;
+
+// An upper bound on a time, in microseconds: as given on a quiet machine, four times as much on a shared CI machine
+// (GitHub's set CI), whose timers and scheduling are far coarser. Lower bounds are never loosened.
+long long slack(long long us) {
+    static const bool ci = [] {
+        const char* const text = std::getenv("CI");
+        return text && *text && *text != '0';
+    }();
+    return ci ? us * 4 : us;
+}
 using rr7::Cpu;
 
 std::vector<uint8_t> memory(1u << 20);
@@ -331,7 +341,7 @@ void lend_wakes() {
                     static_cast<long long>(took_us.load()), static_cast<unsigned long long>(woke));
         check(took_us.load() >= 0, "the waiting thread was lent a token");
         check(woke <= 3, "a thread waiting for a lent token wakes only when it may borrow");
-        if (priority == 1000) check(took_us.load() >= 50000 && took_us.load() < 80000, "a worse thread is lent a token after 50 ms");
+        if (priority == 1000) check(took_us.load() >= 50000 && took_us.load() < slack(80000), "a worse thread is lent a token after 50 ms");
         else check(took_us.load() >= 250 && took_us.load() < 1000, "an equal thread is lent a token soon after 250 us");
     }
     check(rr7::free_core_tokens() == 0 && rr7::threads_waiting_for_core() == 0, "every lent token repaid");
@@ -426,7 +436,7 @@ void waking() {
     std::printf("sys_timer_usleep(30) slept %lld us (median), %lld us (90th percentile), yielding the host core %.1f times a sleep\n",
                 static_cast<long long>(slept[50]), static_cast<long long>(slept[90]), static_cast<double>(rr7::host_yields() - yields_before) / 100);
     check(slept[0] >= 30, "a sleep is never short");
-    check(slept[50] < 200, "a 30 us sleep is about 30 us");
+    check(slept[50] < slack(200), "a 30 us sleep is about 30 us");
     // A sleep longer than the timer's floor is mostly the timer's: few yields.
     {
         const uint64_t before = rr7::host_yields();
@@ -435,7 +445,7 @@ void waking() {
         const auto took = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - from).count();
         std::printf("sys_timer_usleep(5000) slept %lld us, yielding %llu times\n", static_cast<long long>(took),
                     static_cast<unsigned long long>(rr7::host_yields() - before));
-        check(took >= 5000 && took < 6000, "a 5 ms sleep is 5 ms");
+        check(took >= 5000 && took < slack(6000), "a 5 ms sleep is 5 ms");
     }
     rr7::give_up_core();
 

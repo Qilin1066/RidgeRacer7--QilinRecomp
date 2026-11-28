@@ -83,7 +83,19 @@ void test_lift_dataflow() {
     CHECK(has(sync, "c.r[3] = r3; c.lr = lr;  fn_00010100(c);") && !has(sync, "c.r[4] = r4") && has(sync, "\n     return;\n"));
     // Changed on one path to the call and not on the other: written back (the paths' union).
     const std::string paths = lifted({0x2f830000, 0x419e0008, 0x38a00001, bl(0x1000c), 0x4e800020});
-    CHECK(has(paths, "c.r[5] = r5;") && has(paths, "(cr7 << 0)") && !has(paths, "c.r[3] = r3"));
+    CHECK(has(paths, "c.r[5] = r5;") && !has(paths, "c.r[3] = r3"));
+    // The field itself is lazy there: every read of it folds, so the compare keeps only its operands and the
+    // write-back forms the field from them.
+    CHECK(has(paths, "(compare_s(static_cast<int64_t>(k7a), static_cast<int64_t>(k7b), so) << 0)") && !has(paths, "cr7 = compare_s"));
+    // Not where the field's local is read (mcrf cr6,cr7), nor where a read doesn't fold (after a call): set at the compare.
+    const std::string copied = lifted({0x2f830000, 0x4f1c0000, 0x419e0008, 0x38800001, 0x4e800020});
+    CHECK(has(copied, "cr7 = compare_s(") && has(copied, "cr6 = cr7;") && has(copied, "(cr7 << 0)"));
+    CHECK(has(after, "cr7 = compare_s("));
+    // A CR logical operation reads its own field's local (it changes one bit of it): set at the compare there.
+    CHECK(has(fp, "cr7 = fp::fcompare("));
+    // A floating-point compare and branch, alone: lazy, formed at the write-back.
+    const std::string fcmp = lifted({0xff811000, 0x419e0008, 0x38800001, 0x4e800020});
+    CHECK(has(fcmp, "(fp::fcompare(k7x, k7y) << 0)") && !has(fcmp, "cr7 = fp::fcompare("));
 }
 
 // ---------------------------------------------------------------- SHA-256

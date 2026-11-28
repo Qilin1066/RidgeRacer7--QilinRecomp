@@ -257,6 +257,8 @@ private:
         }
         for (unsigned n = 0; n < 32; ++n)
             if (saved_bool_[n]) p += std::format("    bool kb{} = false;\n", n);
+        for (unsigned n = 0; n < 8; ++n)
+            if (lazy_[n] && selector_[n]) p += std::format("    uint32_t kf{} = 0u;\n", n);
         return p;
     }
 
@@ -272,7 +274,12 @@ private:
     // the read is a compare of one kind (signed integers, unsigned integers, floating point) or a CR logical
     // operation: the compare's operands are kept in locals (k7a and k7b; k7x and k7y; kb30) and the branch is
     // `if (k7a == k7b)`, which the compiler makes one compare and jump. Otherwise the bit is read from the field's
-    // local. The field's local is still set at each compare, for the reads that can't fold and the write-backs.
+    // local. The field's local is set at each compare for the reads that can't fold and the write-backs, unless every
+    // read of the field there is (a lazy field): every bit read folds, nothing reads the local itself (mfcr, mcrf, a CR
+    // logical operation's own field), and at each write-back where it may have changed the field's reaching
+    // definitions are all compares of one kind. Then the compares only keep their operands, and the write-back forms
+    // the field from them (compare_s(k7a, k7b, so)): a compare and branch in a loop costs no more than that, where
+    // before the field was built on every pass for the one write-back at the loop's exit.
     struct Site {
         enum Kind : uint8_t {
             kLeave,   // the function leaves (a return, a tail call, a trap, a throw): written back, nothing after
@@ -289,6 +296,7 @@ private:
         Fold kind;        // kSigned, kUnsigned, kFloat (a field's bits) or kBool (one bit)
         unsigned target;  // the field, or for kBool the bit
         std::string a, b;
+        std::string field = {};  // a compare's assignment of its field (`cr7 = compare_s(...);`), left out where the field is lazy
     };
 
     // A sync site's placeholder (its write-back).
@@ -309,6 +317,13 @@ private:
             for (unsigned i = 0; i < (kind == kFloat ? 4u : 3u); ++i) defs_[k_][4 * target + i] = kind;  // (an integer compare's SO bit isn't kept)
         saves_.push_back({kind, target, std::move(a), std::move(b)});
         return std::format("@K{}@", saves_.size() - 1);
+    }
+    // A compare: its field set to `value` (unless the field turns out lazy), and its operands noted as saves() does.
+    // The placeholder @F n.field@ counts as an assignment of the field for the dataflow.
+    std::string compare_into(Fold kind, unsigned field, const std::string& value, std::string a, std::string b) {
+        const std::string keep = saves(kind, field, std::move(a), std::move(b));
+        saves_.back().field = std::format("{} = {};", CR(field), value);
+        return std::format("@F{}.{}@{}", saves_.size() - 1, field, keep);
     }
 
     // The local a name in the lifted text is, or -1.
@@ -341,13 +356,18 @@ private:
         default: return -1;
         }
     }
-    // The locals a piece of lifted text assigns: `x = `, `x -= ` and the like, and the carry's out-parameter `, ca)`.
-    static Locals assigned(std::string_view s) {
+    // The locals a piece of lifted text assigns: `x = `, `x -= ` and the like, and the carry's out-parameter `, ca)`;
+    // and, unless `compares` is false, the fields of the compares' placeholders.
+    static Locals assigned(std::string_view s, bool compares = true) {
         Locals out;
         const auto word = [](char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'; };
         for (size_t i = 0; i < s.size();) {
-            if (s[i] == '@') {  // a placeholder
+            if (s[i] == '@') {  // a placeholder; a compare's field (@F n.field@) is an assignment
                 const size_t end = s.find('@', i + 1);
+                if (compares && i + 1 < s.size() && s[i + 1] == 'F' && end != std::string_view::npos) {
+                    const size_t dot = s.find('.', i);
+                    if (dot != std::string_view::npos && dot + 2 == end) out.set(kCrAt + static_cast<size_t>(s[dot + 1] - '0'));
+                }
                 i = end == std::string_view::npos ? s.size() : end + 1;
                 continue;
             }
@@ -391,12 +411,9 @@ private:
             return static_cast<size_t>(std::ranges::lower_bound(f_.insns, a, {}, &std::pair<uint32_t, Insn>::first) - f_.insns.begin());
         };
         // Successors, and each instruction's text cut at its sync sites.
-        struct Event {
-            int site;     // or -1: a piece of text, which assigns `defs`
-            Locals defs;
-        };
         std::vector<std::vector<size_t>> succ(n);
-        std::vector<std::vector<Event>> events(n);
+        std::vector<std::vector<Event>>& events = events_;
+        events.assign(n, {});
         std::vector<Locals> assigns(n);
         std::vector<bool> reloads(n);
         for (size_t k = 0; k < n; ++k) {
@@ -473,6 +490,7 @@ private:
             }
         }
         fold_ = std::move(fold_in);
+        lazy_fields(assigns);
         const Locals all = declared();
         for (const Locals& d : site_dirty_)
             if ((d & ~all).any()) {
@@ -480,6 +498,98 @@ private:
                 return false;
             }
         return true;
+    }
+
+    // Does a bit read fold (bit_text below)? Unreached code doesn't count against a lazy field.
+    static bool folds(Fold kind, unsigned bit) {
+        return kind == kUnreached || kind == kFloat || kind == kBool || ((kind == kSigned || kind == kUnsigned) && (bit & 3) != 3);
+    }
+    // The kind a field's local can be formed from at a write-back, or kOpaque: all its bits' reaching definitions
+    // compares of one kind (an integer compare's SO bit is the `so` it was made with: see lazy_fields).
+    static Fold field_kind(const std::array<Fold, 32>& fold, unsigned field) {
+        const Fold k = fold[4 * field];
+        if (k == kUnreached) return fold[4 * field + 1] == kUnreached && fold[4 * field + 2] == kUnreached ? kUnreached : kOpaque;
+        if (k != kSigned && k != kUnsigned && k != kFloat) return kOpaque;
+        for (unsigned i = 1; i < (k == kFloat ? 4u : 3u); ++i)
+            if (fold[4 * field + i] != k) return kOpaque;
+        return k;
+    }
+    // Which fields are lazy (see "the dataflow"), and how each write-back forms them. Where compares and the field as
+    // the Cpu held it (at the start, after a call) both reach a write-back, or compares of different kinds, a small
+    // local says which (kf7: 0 the field's local, else the kind of the last compare); the compiler sees it constant
+    // on each path, so it costs nothing on them.
+    static unsigned kind_code(Fold kind) { return kind == kSigned ? 1u : kind == kUnsigned ? 2u : 3u; }
+    void lazy_fields(const std::vector<Locals>& assigns) {
+        bool has_compare[8] = {}, int_compare[8] = {};
+        for (const Save& v : saves_)
+            if (!v.field.empty()) {
+                has_compare[v.target] = true;
+                int_compare[v.target] |= v.kind != kFloat;
+                kinds_[v.target] |= 1u << kind_code(v.kind);
+            }
+        for (unsigned f = 0; f < 8; ++f) lazy_[f] = has_compare[f];
+        // An integer compare's SO bit is XER's SO when it ran: the write-back's `so` is that one unless the function
+        // sets SO itself (mtxer) somewhere.
+        bool sets_so = false;
+        for (const Locals& a : assigns) sets_so |= a[kSoAt];
+        for (unsigned f = 0; f < 8; ++f)
+            if (sets_so && int_compare[f]) lazy_[f] = false;
+        site_kind_.assign(sites_.size(), {});
+        const auto word = [](char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'; };
+        for (size_t k = 0; k < text_.size(); ++k) {
+            const std::string_view t = text_[k];
+            // Any other assignment of the field (mtcrf, mcrf, a CR logical operation, a vector compare's CR6).
+            const Locals literal = assigned(t, false);
+            for (unsigned f = 0; f < 8; ++f)
+                if (literal[kCrAt + f]) lazy_[f] = false;
+            // Bit reads that don't fold, and the field's local read by name (outside the placeholders, as anything
+            // but the target of a plain assignment).
+            for (size_t i = 0; i < t.size(); ++i) {
+                if (t[i] == '@') {
+                    const size_t end = t.find('@', i + 1);
+                    if (end == std::string_view::npos) break;
+                    if (t[i + 1] == 'T' || t[i + 1] == 'V') {
+                        const std::string_view body = t.substr(i + 2, end - i - 2);
+                        const unsigned bit = static_cast<unsigned>(std::stoul(std::string(body.substr(body.find('.') + 1))));
+                        if (!folds(fold_[k][bit], bit)) lazy_[bit >> 2] = false;
+                    }
+                    i = end;
+                    continue;
+                }
+                if (t.substr(i, 2) != "cr" || i + 2 >= t.size() || t[i + 2] < '0' || t[i + 2] > '7') continue;
+                if ((i > 0 && (word(t[i - 1]) || t[i - 1] == '.' || t[i - 1] == ':')) || (i + 3 < t.size() && word(t[i + 3]))) continue;
+                size_t j = i + 3;
+                while (j < t.size() && t[j] == ' ') ++j;
+                const bool assignment = j < t.size() && t[j] == '=' && (j + 1 >= t.size() || t[j + 1] != '=');
+                if (!assignment) lazy_[t[i + 2] - '0'] = false;
+            }
+            // The write-backs: the fields' reaching definitions there (the instruction's own, if it assigned the
+            // field before the site).
+            std::array<Fold, 32> after = fold_[k];
+            for (unsigned field = 0; field < 8; ++field)
+                if (assigns[k][kCrAt + field])
+                    for (unsigned i = 0; i < 4; ++i) after[4 * field + i] = kOpaque;
+            for (unsigned bit = 0; bit < 32; ++bit)
+                if (defs_[k][bit] != kUnreached) after[bit] = defs_[k][bit];
+            Locals before;
+            for (const Event& e : events_[k]) {
+                if (e.site < 0) {
+                    before |= e.defs;
+                    continue;
+                }
+                const size_t site = static_cast<size_t>(e.site);
+                for (unsigned field = 0; field < 8; ++field) {
+                    if (!site_dirty_[site][kCrAt + field]) continue;
+                    const Fold kind = field_kind(before[kCrAt + field] ? after : fold_[k], field);
+                    site_kind_[site][field] = kind;
+                    if (kind == kOpaque) selector_[field] = true;
+                }
+            }
+        }
+        for (unsigned f = 0; f < 8; ++f)
+            if (lazy_[f])
+                for (const Save& v : saves_)
+                    if (!v.field.empty() && v.target == f) (v.kind == kFloat ? saved_float_ : saved_int_)[f] = true;
     }
 
     // A read of condition-register bit `bit` at the current instruction: as a truth value (`truth`) or as 0 or 1.
@@ -518,7 +628,8 @@ private:
 
     // The placeholders, filled in.
     std::string expand(const std::string& code) {
-        const auto write_back = [&](const Locals& d) {
+        const auto write_back = [&](size_t site) {
+            const Locals& d = site_dirty_[site];
             std::string s;
             for (const unsigned n : gprs_)
                 if (d[n]) s += std::format("c.r[{0}] = r{0}; ", n);
@@ -531,7 +642,20 @@ private:
             for (const unsigned n : crs_)
                 if (d[kCrAt + n]) {
                     keep &= ~(15u << (28 - 4 * n));
-                    merged += std::format("{}(cr{} << {})", merged.empty() ? "" : " | ", n, 28 - 4 * n);
+                    std::string value = std::format("cr{}", n);
+                    if (lazy_[n]) {
+                        const auto formed = [&](Fold kind) {
+                            return kind == kSigned ? std::format("compare_s(static_cast<int64_t>(k{0}a), static_cast<int64_t>(k{0}b), so)", n)
+                                 : kind == kUnsigned ? std::format("compare_u(k{0}a, k{0}b, so)", n)
+                                                     : std::format("fp::fcompare(k{0}x, k{0}y)", n);
+                        };
+                        const Fold kind = site_kind_[site][n];
+                        if (kind == kSigned || kind == kUnsigned || kind == kFloat) value = formed(kind);
+                        else if (kind == kOpaque)
+                            for (const Fold k : {kFloat, kUnsigned, kSigned})
+                                if (kinds_[n] & (1u << kind_code(k))) value = std::format("(kf{} == {}u ? {} : {})", n, kind_code(k), formed(k), value);
+                    }
+                    merged += std::format("{}({} << {})", merged.empty() ? "" : " | ", value, 28 - 4 * n);
                 }
             if (!merged.empty()) s += keep ? std::format("c.cr = (c.cr & {}) | {}; ", hex32(keep), merged) : std::format("c.cr = {}; ", merged);
             const std::pair<const char*, unsigned> specials[] = {{"lr", kLrAt}, {"ctr", kCtrAt}};
@@ -547,6 +671,8 @@ private:
         for (const unsigned n : fprs_) read_again += std::format("f{0} = c.f[{0}]; ", n);
         for (const unsigned n : vrs_) read_again += std::format("v{0} = c.v[{0}]; ", n);
         for (const unsigned n : crs_) read_again += std::format("cr{0} = (c.cr >> {1}) & 15u; ", n, 28 - 4 * n);
+        for (unsigned n = 0; n < 8; ++n)
+            if (lazy_[n] && selector_[n]) read_again += std::format("kf{} = 0u; ", n);
         for (const char* s : {"lr", "ctr"})
             if (specials_.contains(s)) read_again += std::format("{0} = c.{0}; ", s);
         for (const char* s : {"so", "ov", "ca"})
@@ -567,7 +693,13 @@ private:
                     continue;
                 }
                 switch (kind) {
-                case 'S': out += write_back(site_dirty_[std::stoul(body)]); break;
+                case 'S': out += write_back(std::stoul(body)); break;
+                case 'F': {
+                    const Save& v = saves_[std::stoul(body.substr(0, body.find('.')))];
+                    if (!lazy_[v.target]) out += " " + v.field;
+                    else if (selector_[v.target]) out += std::format(" kf{} = {}u;", v.target, kind_code(v.kind));
+                    break;
+                }
                 case 'L': out += read_again; break;
                 case 'T': case 'V': {
                     const size_t dot = body.find('.');
@@ -638,8 +770,7 @@ private:
         const auto result = [&](unsigned dst, std::string expr, bool record = false) {
             std::string s = std::format("{} = {};", R(dst), expr);
             if (record_form || record) {
-                s += std::format(" {} = record(r{}, {});", CR(0), dst, SO());
-                s += saves(kSigned, 0, std::format("r{}", dst), "0");
+                s += compare_into(kSigned, 0, std::format("record(r{}, {})", dst, SO()), std::format("r{}", dst), "0");
             }
             line(s);
         };
@@ -766,7 +897,7 @@ private:
                                 : in.op == Op::cmpli ? std::format("{}u", in.uimm())
                                 : in.l() ? (is_signed ? s64(b) : R(b)) : (is_signed ? s32(b) : u32(b));
             const unsigned field = in.crfd();
-            line(std::format("{} = compare_{}({}, {}, {});{}", CR(field), is_signed ? 's' : 'u', x, y, SO(), saves(is_signed ? kSigned : kUnsigned, field, x, y)));
+            line(compare_into(is_signed ? kSigned : kUnsigned, field, std::format("compare_{}({}, {}, {})", is_signed ? 's' : 'u', x, y, SO()), x, y));
             return true;
         }
 
@@ -957,7 +1088,7 @@ private:
         case Op::fnmsubs: fp3("fnmsubs"); return true;
         case Op::fsel: fp3("fsel"); return true;
         case Op::fcmpu: case Op::fcmpo:  // (they differ in the exceptions they raise, which are not kept)
-            line(std::format("{} = fp::fcompare({}, {});{}", CR(in.crfd()), F(a), F(b), saves(kFloat, in.crfd(), F(a), F(b))));
+            line(compare_into(kFloat, in.crfd(), std::format("fp::fcompare({}, {})", F(a), F(b)), F(a), F(b)));
             return true;
 
         // ---------------------------------------------------------------- VMX (vmx.hpp)
@@ -1136,6 +1267,15 @@ private:
     std::vector<Locals> site_dirty_;              // what each sync site writes back
     std::vector<Save> saves_;
     bool saved_int_[8] = {}, saved_float_[8] = {}, saved_bool_[32] = {};
+    bool lazy_[8] = {};                            // fields formed only where written back (lazy_fields)
+    bool selector_[8] = {};                        // ... with a local (kf7) saying from what, at some write-back
+    unsigned kinds_[8] = {};                       // the kinds of compare into each field (1 << kind_code)
+    std::vector<std::array<Fold, 8>> site_kind_;  // at each sync site, each field's reaching compares' kind
+    struct Event {
+        int site;     // or -1: a piece of text, which assigns `defs`
+        Locals defs;
+    };
+    std::vector<std::vector<Event>> events_;      // each instruction's text cut at its sync sites
     bool memory_ = false;
     size_t k_ = 0;                                // the instruction being emitted
     std::set<uint32_t> present_, labels_;

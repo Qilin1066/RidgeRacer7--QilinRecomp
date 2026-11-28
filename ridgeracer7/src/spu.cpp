@@ -53,6 +53,7 @@
 #include "events.hpp"
 #include "kernel.hpp"
 #include "machine.hpp"
+#include "qilin/host/audio.hpp"
 #include "qilin/rt/report.hpp"
 #include "qilin/rt/spu.hpp"
 #include "qilin/rt/spu_fp.hpp"
@@ -519,6 +520,8 @@ void finish(Thread& t, uint32_t cause, uint32_t status) {
 void run_thread(std::shared_ptr<Thread> thread) {
     Thread& t = *thread;
     set_current_thread(t.id);
+    // The sound core runs every sound period (5.33 ms), on the sound's critical path: above the other threads.
+    if (t.program->image.name == "bnusCoreSpu.elf") qilin::host::set_audio_thread_priority(qilin::host::AudioThread::worker);
     qilin::rt::spu::enter_single_mode();  // (the host's float unit for its single precision: spu_fp.hpp)
     const Clock::time_point started = Clock::now();
     // (A task's time, from its start to its end, however it ends.)

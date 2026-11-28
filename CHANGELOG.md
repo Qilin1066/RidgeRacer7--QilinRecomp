@@ -5,6 +5,10 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ## [Unreleased]
 
 ### Added
+- The lifter's dataflow (`docs/recompiler-core.md`, "Lifted code's speed"): a call, return or trap writes back only the registers, CR fields and XER bits that may have changed; a branch whose CR bit comes only from compares of one kind reads the compare's operands (`if (k7a == k7b)`); memory goes through a local base. The lifted text is 8% smaller; `lifted_022` compiles in 6.1 s and 400 MB with MSVC (13.4 s, 615 MB before), `lifted_020` in 21.2 s and 776 MB (33.8 s, 871 MB).
+- Calls through a register find their function in a dense index (`runtime/include/qilin/rt/dispatch.hpp`): one load, where the binary search took about 35 ns.
+- VMX's `vmaddfp` and `vnmsubfp` take four plain elements at once, rounded once by a halfway test (`fp::rounds_once_to_single`, also before the scalar fused forms' two-sum); `vperm` and `vsldoi` work on words. Bit-exact as before.
+- The differential test runs 400 random programs with branches and calls, and 400,000 operands built to round on a halfway point; `qilin_tests` checks the dataflow's shapes.
 - The file system (`cellFs...`): the console's mount points as folders of the host's, with the hard disk in the port's own data folder (`docs/runtime.md`).
 - The game data utility (`cellGameDataCheckCreate2`), and a `PARAM.SFO` writer beside the reader.
 - The start of SPURS: the instance, event-queue attachment, tasksets.

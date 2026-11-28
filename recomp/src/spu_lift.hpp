@@ -10,6 +10,9 @@
 // vector registers. Each instruction is one call of a helper in
 // runtime/include/qilin/rt/spu.hpp; constants are folded within a block
 // (`ilhu` then `iohl` is one constant), and the compiler's moves are copies.
+// A register whose preferred word is read has that word in a local of its
+// own too (`p3`), made from its operands' words where that is cheaper than
+// from the vector: sums, compares, and the word a pointer points at.
 //
 // A program's functions call each other by name. A branch through a
 // register goes to `call(s, target, pc)`, which the program's file defines:

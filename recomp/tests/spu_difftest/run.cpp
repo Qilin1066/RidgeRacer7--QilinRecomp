@@ -1,7 +1,12 @@
 // qilin_spu_difftest: every case the generator wrote, run from many states
 // as lifted code and by the reference, and compared: all 128 registers, the
 // quadword stored (and, for a store, the whole local store), what was
-// written to a channel, a stop's code, whether a halt fired.
+// written to a channel, a stop's code, whether a halt fired. The lifted side
+// runs in both exact ways of single precision (spu_fp.hpp: `whole`, and
+// `exact` with the host's float unit set for it), every other run each. The
+// relaxed way is checked apart, against the exact one (check_relaxed).
+#include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -75,6 +80,105 @@ int compare_square(uint64_t m, uint64_t x, int power) {
         return high < limit ? -1 : high > limit || (low & 0xffffffffu) ? 1 : 0;
     }
     return high || (low & 0xffffffffu) >= (uint64_t{1} << power) ? ((high == 0 && (low & 0xffffffffu) == (uint64_t{1} << power)) ? 0 : 1) : -1;
+}
+
+// The lifted side's function, in one of the ways of single precision, its float unit set for it while it runs (and put
+// back for the reference, whose double precision wants the default).
+void run_lifted(void (*fn)(Spu&), Spu& spu, fp::FloatMode mode) {
+#if QILIN_SPU_HOST_SINGLE
+    const fp::FloatControl saved = fp::float_control();
+    fp::enter_single_mode(mode);
+    fn(spu);
+    fp::set_float_control(saved);
+#else
+    fp::enter_single_mode(mode);
+    fn(spu);
+#endif
+}
+
+// The relaxed way (spu_fp.hpp) against the exact one, as the top of spu_fp.hpp says it is: on ordinary numbers (normal
+// ones whose results stay normal, and zeros and denormals, which are zero to both) the same bit for bit for an add,
+// subtract, multiply and the compares, and for a fused form the same or, where the host has no fused multiply-add of its
+// own, within two units of the last place of the larger of the product and the addend; and different, as it says, past
+// the host's range. Returns how many broke that; `fused_differ` is how many fused results were not the same.
+size_t check_relaxed(std::mt19937& rng, size_t count, size_t& fused_differ) {
+    fused_differ = 0;
+#if QILIN_SPU_HOST_SINGLE
+    size_t broken = 0;
+    const auto ordinary = [&]() -> uint32_t {
+        const uint32_t sign = rng() & 0x80000000u, fraction = rng() & 0x007fffffu;
+        if (rng() % 16 == 0) return sign | (rng() % 2 ? fraction : 0u);                          // a zero or a denormal
+        return sign | ((70u + static_cast<uint32_t>(rng() % 115)) << 23) | fraction;  // exponents 70 to 184: products stay in range
+    };
+    // Each operation in a way: the float unit set for it, and put back after.
+    struct Results {
+        SpuReg add, subtract, multiply, fused[3], compares[4];
+    };
+    const auto run = [](fp::FloatMode mode, const SpuReg& a, const SpuReg& b, const SpuReg& c) {
+        const fp::FloatControl saved = fp::float_control();
+        fp::enter_single_mode(mode);
+        const Results r{fp::fa(a, b), fp::fs(a, b), fp::fm(a, b), {fp::fma(a, b, c), fp::fnms(a, b, c), fp::fms(a, b, c)},
+                        {fp::fceq(a, b), fp::fcgt(a, b), fp::fcmeq(a, b), fp::fcmgt(a, b)}};
+        fp::set_float_control(saved);
+        return r;
+    };
+    // (A single as a double, a zero exponent zero.)
+    const auto value = [](uint32_t w) { return static_cast<double>(std::bit_cast<float>((w & 0x7f800000u) ? w : (w & 0x80000000u))); };
+    for (size_t n = 0; n < count; ++n) {
+        SpuReg a, b, c;
+        for (unsigned i = 0; i < 4; ++i) a.w[i] = ordinary(), b.w[i] = ordinary(), c.w[i] = ordinary();
+        // Now and then the same magnitudes, for the compares' equalities and the sums that cancel.
+        if (rng() % 8 == 0) b.w[rng() % 4] = a.w[rng() % 4] ^ (rng() & 0x80000000u);
+        if (rng() % 8 == 0) c.w[rng() % 4] = fp::multiply32(a.w[rng() % 4], b.w[rng() % 4]) ^ 0x80000000u;
+        const Results exact = run(fp::FloatMode::whole, a, b, c), relaxed = run(fp::FloatMode::relaxed, a, b, c);
+        for (unsigned i = 0; i < 4; ++i) {
+            const auto same = [&](const char* what, const SpuReg& e, const SpuReg& r) {
+                if (e.w[i] != r.w[i] && broken++ < 10) std::printf("FAIL relaxed %s of %08x %08x: exact %08x, relaxed %08x\n", what, a.w[i], b.w[i], e.w[i], r.w[i]);
+            };
+            same("fa", exact.add, relaxed.add);
+            same("fs", exact.subtract, relaxed.subtract);
+            same("fm", exact.multiply, relaxed.multiply);
+            for (unsigned k = 0; k < 4; ++k) same("compare", exact.compares[k], relaxed.compares[k]);
+            for (unsigned k = 0; k < 3; ++k) {
+                if (exact.fused[k].w[i] == relaxed.fused[k].w[i]) continue;
+                ++fused_differ;
+                const double product = value(a.w[i]) * value(b.w[i]), addend = value(c.w[i]);  // (exact in double precision)
+                int e = 0;
+                std::frexp(std::fmax(std::fabs(product), std::fabs(addend)), &e);
+                const double unit = std::ldexp(1.0, e - 24);  // the last place of a single as large
+                if (std::fabs(value(exact.fused[k].w[i]) - value(relaxed.fused[k].w[i])) > 2 * unit && broken++ < 10)
+                    std::printf("FAIL relaxed fused form %u of %08x %08x %08x: exact %08x, relaxed %08x\n", k, a.w[i], b.w[i], c.w[i], exact.fused[k].w[i],
+                                relaxed.fused[k].w[i]);
+            }
+        }
+    }
+    // Where it differs, as the top of spu_fp.hpp says: past the host's range.
+    struct Known {
+        const char* what;
+        uint32_t a, b, exact, relaxed;
+        bool multiply;
+    };
+    static constexpr Known kKnown[] = {
+        {"2^127 * 4, which the SPU saturates and the host stops at the largest float", 0x7f000000u, 0x40800000u, 0x7fffffffu, 0x7f7fffffu, true},
+        {"2^128 * 0.5, a number to the SPU and infinity to the host", 0x7f800000u, 0x3f000000u, 0x7f000000u, 0x7f800000u, true},
+        {"the largest float doubled, the SPU's next binade", 0x7f7fffffu, 0x7f7fffffu, 0x7fffffffu, 0x7f7fffffu, false},
+    };
+    for (const Known& k : kKnown) {
+        const Results exact = run(fp::FloatMode::whole, fp::splat(k.a), fp::splat(k.b), fp::splat(0)),
+                      relaxed = run(fp::FloatMode::relaxed, fp::splat(k.a), fp::splat(k.b), fp::splat(0));
+        const uint32_t e = (k.multiply ? exact.multiply : exact.add).w[0], r = (k.multiply ? relaxed.multiply : relaxed.add).w[0];
+        if ((e != k.exact || r != k.relaxed) && broken++ < 10) std::printf("FAIL relaxed, %s: exact %08x, relaxed %08x\n", k.what, e, r);
+    }
+    {  // A NaN to the host is a number to the SPU: 1.5 * 2^128 is more than 1 there, and nothing is to the host.
+        const Results exact = run(fp::FloatMode::whole, fp::splat(0x7fc00000u), fp::splat(0x3f800000u), fp::splat(0)),
+                      relaxed = run(fp::FloatMode::relaxed, fp::splat(0x7fc00000u), fp::splat(0x3f800000u), fp::splat(0));
+        if ((exact.compares[1].w[0] != 0xffffffffu || relaxed.compares[1].w[0] != 0) && broken++ < 10) std::printf("FAIL relaxed fcgt of a NaN to the host\n");
+    }
+    return broken;
+#else
+    (void)rng, (void)count;
+    return 0;
+#endif
 }
 
 size_t check_estimates(std::mt19937& rng, size_t count, size_t& worst_reciprocal, size_t& worst_root) {
@@ -194,11 +298,11 @@ int main(int argc, char** argv) {
         const Case& c = kCases[k];
         const qilin::spu::Insn in = qilin::spu::decode(c.word);
         const bool is_float = (qilin::spu::spec(in.op).flags & qilin::spu::kFloat) != 0;
-        for (int n = 0; n < (is_float ? 4 * states : states); ++n) {
+        for (int n = 0; n < (is_float ? 8 * states : states); ++n) {
             Spu spu;
             State ref{};
             seed(spu, ref, is_float);
-            c.fn(spu);
+            run_lifted(c.fn, spu, n & 1 ? fp::FloatMode::exact : fp::FloatMode::whole);
             if (!step(ref, in, c.pc)) {
                 std::printf("the reference doesn't know %s (%08x)\n", qilin::spu::disasm(in, c.pc).c_str(), c.word);
                 return 1;
@@ -219,7 +323,7 @@ int main(int argc, char** argv) {
             Spu spu;
             State ref{};
             seed(spu, ref, false);
-            p.fn(spu);
+            run_lifted(p.fn, spu, n & 1 ? fp::FloatMode::exact : fp::FloatMode::whole);
             if (!run_program(ref, p.words, p.count)) {
                 std::printf("the reference can't run program %zu to its end\n", k);
                 return 1;
@@ -230,6 +334,19 @@ int main(int argc, char** argv) {
             });
         }
     }
+    size_t fused_differ = 0;
+    const size_t relaxed_broken = check_relaxed(rng, 1000000, fused_differ);
+    if (relaxed_broken) {
+        std::printf("spu difftest: the relaxed way breaks its bounds %zu times\n", relaxed_broken);
+        return 1;
+    }
+#if QILIN_SPU_HOST_SINGLE
+    std::printf("spu difftest: the relaxed way keeps its bounds over 1000000 vectors of ordinary numbers (%zu fused results not the same, all within two units), "
+                "and differs where it says\n",
+                fused_differ);
+#else
+    std::printf("spu difftest: no host float unit for single precision here: every way is the whole numbers'\n");
+#endif
     size_t worst_reciprocal = 0, worst_root = 0;
     const size_t broken = check_estimates(rng, 2000000, worst_reciprocal, worst_root);
     if (broken) {

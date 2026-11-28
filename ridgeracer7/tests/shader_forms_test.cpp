@@ -124,6 +124,34 @@ CgProgram vertex_writing(std::initializer_list<std::pair<uint32_t, uint32_t>> wr
     return vp;
 }
 
+// MOV o[0], c[k] (c[A0.x + k] where `indexed`) for each read given, the last one the end: a vertex program reading constants.
+CgProgram vertex_reading_constants(std::initializer_list<std::pair<uint32_t, bool>> reads) {
+    const uint32_t s0 = 3u | (0x1bu << 8);  // c[...], swizzle xyzw
+    CgProgram vp;
+    vp.vertex = true;
+    vp.header = {2, 0, 1, 1, 0, 0};
+    size_t i = 0;
+    for (const auto& [constant, indexed] : reads) {
+        const bool last = ++i == reads.size();
+        const uint32_t w[4] = {(1u << 30) | (0x3fu << 15) | (7u << 10) | (0x1bu << 2), (uint32_t{kVecMov} << 22) | (constant << 12) | (s0 >> 9), (s0 & 0x1ff) << 23,
+                               (0xfu << 13) | (indexed ? 2u : 0u) | (last ? 1u : 0u)};
+        for (const uint32_t v : w) put_be32(vp.microcode, v);
+    }
+    return vp;
+}
+
+void test_constants_read() {
+    // The constants a vertex program reads, for the renderer to give it only those: [first, end), all 468 if any is indexed.
+    const auto some = translate(vertex_reading_constants({{7, false}, {3, false}, {12, false}}));
+    CHECK(some && some->constants_first == 3 && some->constants_end == 13);
+    const auto last = translate(vertex_reading_constants({{467, false}}));
+    CHECK(last && last->constants_first == 467 && last->constants_end == 468);
+    const auto indexed = translate(vertex_reading_constants({{5, false}, {8, true}}));
+    CHECK(indexed && indexed->constants_first == 0 && indexed->constants_end == 468);
+    const auto none = translate(vertex_writing({{0, 0xf}}));
+    CHECK(none && none->constants_first == 0 && none->constants_end == 0);
+}
+
 void test_two_sided() {
     // The two-sided form: the back colour at location 3 (BFC0) for COL0, 4 (BFC1) for COL1, and FrontFacing to choose.
     const auto plain = translate(fragment_reading(1));
@@ -183,6 +211,7 @@ int main() {
     test_flat();
     test_two_sided();
     test_clip();
+    test_constants_read();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

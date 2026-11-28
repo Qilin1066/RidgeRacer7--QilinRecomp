@@ -286,6 +286,7 @@ struct Renderer {
     // constants are at `constants_version`.
     VkDeviceSize constants_at = 0;
     uint64_t constants_batch = UINT64_MAX, constants_version = 0;
+    uint32_t constants_first = 0, constants_end = 0;  // the constants it holds, [first, end)
     uint32_t sets_used = 0;  // texture sets taken from the batch's pool
     // The batch's texture sets by what they hold: a draw with the textures an earlier draw in the batch had binds that
     // draw's set again (a set is never written after it is first bound), rather than take and write another.
@@ -544,14 +545,16 @@ bool renderer_started() { return g_renderer != nullptr; }
 
 namespace {
 
-// Room in the batch's arena: an offset, aligned for any use (uniform buffers' alignment the strictest).
-VkDeviceSize arena_take(Renderer& r, VkDeviceSize size) {
+// Room in the batch's arena: an offset, aligned for any use (uniform buffers' alignment the strictest). `written`: how much of
+// it the CPU writes (counted: renderer_counters).
+VkDeviceSize arena_take(Renderer& r, VkDeviceSize size, VkDeviceSize written) {
     const VkDeviceSize at = (r.arena_used + r.align - 1) / r.align * r.align;
     if (at + size > r.arena.size) fatal("the renderer's arena is full mid-draw (a draw's needs are checked before it starts)");
     r.arena_used = at + size;
-    g_stats.arena_bytes += size;
+    g_stats.arena_bytes += written;
     return at;
 }
+VkDeviceSize arena_take(Renderer& r, VkDeviceSize size) { return arena_take(r, size, size); }
 uint8_t* arena_at(Renderer& r, VkDeviceSize offset) { return static_cast<uint8_t*>(r.arena.mapped) + offset; }
 
 void end_rendering(Renderer& r) {
@@ -1426,11 +1429,18 @@ void renderer_draw(const Draw& d) {
         std::memcpy(arena_at(r, index_at), index_list.data(), index_list.size() * 4);
     }
     // The constants.
-    // (The vertex constants copied again only when the game has changed them since the batch's last copy.)
-    if (r.constants_batch != r.flushes || r.constants_version != d.constants_version) {
-        r.constants_at = arena_take(r, kVertexConstants * 16);
-        std::memcpy(arena_at(r, r.constants_at), d.vertex_constants, kVertexConstants * 16);
-        r.constants_batch = r.flushes, r.constants_version = d.constants_version;
+    // (The vertex constants the program reads, at their places in a block of all 468 whose start is the descriptor's offset:
+    // copied again only when the game has changed them since the batch's last copy, or the program reads some it hasn't,
+    // and then with those the last copy had too.)
+    const uint32_t constants_first = vs.constants_end ? std::min<uint32_t>(vs.constants_first, kVertexConstants) : 0;
+    const uint32_t constants_end = vs.constants_end ? std::min<uint32_t>(vs.constants_end, kVertexConstants) : kVertexConstants;
+    const bool same_constants = r.constants_batch == r.flushes && r.constants_version == d.constants_version;
+    if (!same_constants || constants_first < r.constants_first || constants_end > r.constants_end) {
+        const uint32_t from = same_constants ? std::min(constants_first, r.constants_first) : constants_first;
+        const uint32_t to = same_constants ? std::max(constants_end, r.constants_end) : constants_end;
+        r.constants_at = arena_take(r, kVertexConstants * 16, VkDeviceSize{to - from} * 16);
+        std::memcpy(arena_at(r, r.constants_at + VkDeviceSize{from} * 16), d.vertex_constants + 4 * from, size_t{to - from} * 16);
+        r.constants_batch = r.flushes, r.constants_version = d.constants_version, r.constants_first = from, r.constants_end = to;
     }
     const VkDeviceSize vertex_constants_at = r.constants_at;
     VkDeviceSize fragment_constants_at = 0;

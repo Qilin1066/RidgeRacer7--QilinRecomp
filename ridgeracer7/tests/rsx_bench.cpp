@@ -586,13 +586,16 @@ int main(int argc, char** argv) {
         run_frame(s, acts, bytes);  // (a frame first, for the caches: textures decoded, pipelines made)
         if (touch && depth == Depth::draw) rr7::renderer_guest_access(rr7::kRsxLocal + kColour, uint64_t{kPitch} * kHeight * 2);
         g_digesting = false;
-        const Clock::time_point start = Clock::now();
+        // Each frame's time: the best and the median are given (other work on the computer only ever makes a frame slower).
+        std::vector<double> times;
         for (uint32_t i = 0; i < frames; ++i) {
+            const Clock::time_point start = Clock::now();
             run_frame(s, acts, bytes);
             if (touch && depth == Depth::draw) rr7::renderer_guest_access(rr7::kRsxLocal + kColour, uint64_t{kPitch} * kHeight * 2);
+            times.push_back(static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count()) / 1e3);
         }
-        const double us = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count()) / 1e3 / frames;
-        std::printf("  %-48s %9.1f us a frame (%.3f us a draw)\n", what, us, us / kDraws);
+        std::sort(times.begin(), times.end());
+        std::printf("  %-48s best %8.1f us, median %8.1f us a frame (%.3f us a draw)\n", what, times.front(), times[times.size() / 2], times.front() / kDraws);
         g_digesting = true;
     };
     time(Depth::parse, "commands only (rsx_state.hpp: run_command)");

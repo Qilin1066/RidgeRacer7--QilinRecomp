@@ -16,21 +16,23 @@ namespace rr7 {
 // R, G, B, A in the image, as a texture of the same bytes decodes (textures.hpp: the renderer copies a surface's image to a
 // texture's on the GPU, so the two must agree); F_X32 (13) is a big-endian float. (As words, on a little-endian host as
 // load32 and store32 assume: A8R8G8B8 is a rotation by a byte, a float a byte swap.)
-inline void pixels_to_host(uint32_t format, const uint8_t* from, uint8_t* to, size_t pixels) {
-    for (size_t i = 0; i < pixels; ++i, from += 4, to += 4) {
+// (One loop for each, so that the compiler can make each a run of vector shuffles.)
+template <class Word>
+void map_words(const uint8_t* from, uint8_t* to, size_t pixels, Word word) {
+    for (size_t i = 0; i < pixels; ++i) {
         uint32_t w;
-        std::memcpy(&w, from, 4);
-        w = format == 8 ? std::rotr(w, 8) : std::byteswap(w);
-        std::memcpy(to, &w, 4);
+        std::memcpy(&w, from + 4 * i, 4);
+        w = word(w);
+        std::memcpy(to + 4 * i, &w, 4);
     }
 }
+inline void pixels_to_host(uint32_t format, const uint8_t* from, uint8_t* to, size_t pixels) {
+    if (format == 8) map_words(from, to, pixels, [](uint32_t w) { return std::rotr(w, 8); });
+    else map_words(from, to, pixels, [](uint32_t w) { return std::byteswap(w); });
+}
 inline void pixels_to_guest(uint32_t format, const uint8_t* from, uint8_t* to, size_t pixels) {
-    for (size_t i = 0; i < pixels; ++i, from += 4, to += 4) {
-        uint32_t w;
-        std::memcpy(&w, from, 4);
-        w = format == 8 ? std::rotl(w, 8) : std::byteswap(w);
-        std::memcpy(to, &w, 4);
-    }
+    if (format == 8) map_words(from, to, pixels, [](uint32_t w) { return std::rotl(w, 8); });
+    else map_words(from, to, pixels, [](uint32_t w) { return std::byteswap(w); });
 }
 
 // A Z24S8 surface's depth (a big-endian word's top 24 bits) as the depth aspect's word, and back. With D24_UNORM_S8_UINT
@@ -42,8 +44,11 @@ inline uint32_t depth_to_host(uint32_t depth24, bool unorm) {
 }
 inline uint32_t depth_to_guest(uint32_t host, bool unorm) {
     if (unorm) return host & 0xffffffu;
-    // (Rounded half away from zero, as lround, on a non-negative float below 2^24: adding a half is exact in a double.)
-    return static_cast<uint32_t>(static_cast<double>(std::clamp(std::bit_cast<float>(host), 0.0f, 1.0f) * 16777215.0f) + 0.5);
+    // (Rounded half away from zero, as lround, on a non-negative float below 2^24, in floats: the fraction left after the
+    // whole part is taken away is exact. The same as adding a half in a double, for every float: checked exhaustively.)
+    const float v = std::clamp(std::bit_cast<float>(host), 0.0f, 1.0f) * 16777215.0f;
+    const uint32_t whole = static_cast<uint32_t>(v);
+    return whole + (v - static_cast<float>(whole) >= 0.5f ? 1u : 0u);
 }
 
 // A half (big-endian bytes) as a float. A normal one is built from its bits (exactly 1.m times 2 to the e - 15).

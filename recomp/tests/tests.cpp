@@ -42,6 +42,50 @@ int failures = 0;
         }                                                                               \
     } while (0)
 
+// ---------------------------------------------------------------- the lifter's dataflow
+// What each call and return writes back, and which compares a branch reads directly (lift.cpp, "the dataflow").
+// The differential test's programs check the results; these check the shapes.
+void test_lift_dataflow() {
+    const auto lifted = [](std::vector<uint32_t> words) {
+        LiftInput in;
+        in.start = 0x10000;
+        for (size_t i = 0; i < words.size(); ++i) in.insns.emplace_back(0x10000 + 4 * static_cast<uint32_t>(i), ppu::decode(words[i]));
+        in.is_function = [](uint32_t a) { return a == 0x10100; };
+        const Lifted l = lift(in);
+        CHECK(l.ok);
+        return l.code;
+    };
+    const auto has = [](const std::string& text, std::string_view what) { return text.find(what) != std::string::npos; };
+    const auto count = [](const std::string& text, std::string_view what) {
+        size_t n = 0;
+        for (size_t p = text.find(what); p != std::string::npos; p = text.find(what, p + 1)) ++n;
+        return n;
+    };
+    const auto bl = [](uint32_t at) { return 0x48000001u | ((0x10100u - at) & 0x03fffffcu); };
+    // A branch on a field set two blocks earlier, reached by two paths from the one compare: both read its operands.
+    const std::string two = lifted({0x2f830000, 0x419e000c, 0x38800001, 0x60000000, 0x38a00002, 0x409e0008, 0x38c00003, 0x4e800020});
+    CHECK(count(two, "(k7a == k7b)") == 2 && !has(two, "(cr7 & 2u)") && has(two, "k7a = static_cast<uint64_t>(static_cast<int32_t>(r3));"));
+    // A field read after a call (which may change it) is read from the field, and the compare keeps no operands.
+    const std::string after = lifted({0x2f830000, bl(0x10004), 0x419e0008, 0x38800001, 0x4e800020});
+    CHECK(has(after, "(cr7 & 2u)") && !has(after, "k7a"));
+    // Fields set by different kinds of compare on two paths (signed, unsigned) can't be read either way.
+    const std::string mixed = lifted({0x2f830000, 0x419e000c, 0x2b830005, 0x60000000, 0x419d0008, 0x38c00003, 0x4e800020});
+    CHECK(has(mixed, "(cr7 & 4u)"));
+    // A floating-point compare and a CR logical operation on its result fold too (fcmpu cr7,f1,f2; cror eq,gt,eq; beq).
+    const std::string fp = lifted({0xff811000, 0x4fddf382, 0x419e0008, 0x38800001, 0x4e800020});
+    CHECK(has(fp, "kb30 = bit != 0u;") && has(fp, "if ((kb30))") && has(fp, "static_cast<uint32_t>(k7x > k7y)"));
+    // mfcr reads every field's local.
+    const std::string mfcr = lifted({0x2f830000, 0x7c600026, 0x4e800020});
+    CHECK(has(mfcr, "(cr0 << 28) | (cr1 << 24)") && has(mfcr, "(cr7 << 0)"));
+    // Only what may have changed is written back: r3 (and LR) before the call, r4 (only read) never, and after the call
+    // (whose registers are read again) nothing is left to write back at the return.
+    const std::string sync = lifted({0x7c642214, bl(0x10004), 0x4e800020});
+    CHECK(has(sync, "c.r[3] = r3; c.lr = lr;  fn_00010100(c);") && !has(sync, "c.r[4] = r4") && has(sync, "\n     return;\n"));
+    // Changed on one path to the call and not on the other: written back (the paths' union).
+    const std::string paths = lifted({0x2f830000, 0x419e0008, 0x38a00001, bl(0x1000c), 0x4e800020});
+    CHECK(has(paths, "c.r[5] = r5;") && has(paths, "(cr7 << 0)") && !has(paths, "c.r[3] = r3"));
+}
+
 // ---------------------------------------------------------------- SHA-256
 
 std::vector<uint8_t> pattern(size_t n) {
@@ -1323,6 +1367,7 @@ void test_lift_exceptions() {
 
 int main() {
     test_lift_exceptions();
+    test_lift_dataflow();
     test_sha256();
     test_ppu();
     test_spu();

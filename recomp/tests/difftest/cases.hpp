@@ -19,6 +19,12 @@ enum class Kind : uint8_t {
     System,  // sc
     Switch,  // a jump table of two targets
     TimeBase,  // mftb: the hook's value, or its upper half
+    Program,   // a function of many instructions, with branches and calls (gen.cpp): run by the reference word by word
+};
+
+// A word of a program the reference runs, at its address.
+struct ProgramWord {
+    uint32_t at, word;
 };
 
 struct Case {
@@ -26,15 +32,14 @@ struct Case {
     uint32_t word;  // the instruction under test
     uint32_t pc;    // where it is
     void (*fn)(qilin::rt::Cpu&);
+    const ProgramWord* program = nullptr;  // Kind::Program: its words and its helper's, and where it starts
+    uint32_t program_size = 0, entry = 0;
 };
 
 extern const Case kCases[];
 extern const size_t kCaseCount;
 
 // The unwinding program (gen.cpp, "C++ exceptions"): its words, for the reference, and its first function, lifted.
-struct ProgramWord {
-    uint32_t at, word;
-};
 extern const ProgramWord kEhProgram[];
 extern const size_t kEhProgramSize;
 extern const uint32_t kEhEntry, kEhPad;

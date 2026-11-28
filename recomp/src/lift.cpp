@@ -1,6 +1,8 @@
 #include "lift.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bitset>
 #include <format>
 #include <map>
 #include <set>
@@ -135,10 +137,14 @@ public:
             }
             labels_.insert(pad);
         }
-        std::string body;
+        // Each instruction's text, with placeholders for what the dataflow below decides: the registers written back
+        // and read again at each sync site (@S n@, @L n@), each condition-register bit read (@B..@), and each
+        // compare's saved operands (@K..@).
+        text_.resize(f_.insns.size());
+        defs_.assign(f_.insns.size(), {});
         for (size_t k = 0; k < f_.insns.size(); ++k) {
             const auto& [a, in] = f_.insns[k];
-            if (labels_.contains(a)) body += std::format("L_{:08X}:\n", a);
+            k_ = k;
             std::string line;
             if (!insn(a, in, line)) {
                 out.why = error_;
@@ -146,22 +152,33 @@ public:
                 return out;
             }
             if (f_.keep_pc && (line.find("read") != std::string::npos || line.find("write") != std::string::npos))
-                body += std::format("    c.pc = 0x{:08X}u;{}\n", a, f_.keep_registers ? " " + sync_out() : std::string());
-            body += line;
+                line = std::format("    c.pc = 0x{:08X}u;{}\n", a, f_.keep_registers ? " " + site(Site::kFlush) : std::string()) + line;
             const bool last = k + 1 == f_.insns.size();
             const uint32_t next = last ? 0 : f_.insns[k + 1].first;
             if (!terminator(in) && !tables_.contains(a) && (last || next != a + 4)) {
                 // Execution continues past this instruction into code that isn't the next one we have.
                 if (f_.falls_into == a + 4) {
-                    body += std::format("    {} {}(c); return;\n", sync_out(), fn_name(a + 4));
+                    line += std::format("    {} {}(c); return;\n", site(Site::kLeave), fn_name(a + 4));
                 } else {
                     out.why = std::format("execution runs on to {:08X}", a + 4);
                     out.why_at = a;
                     return out;
                 }
             }
+            text_[k] = std::move(line);
         }
-        out.code = expand(f_.landing_pads.empty() ? std::format("void {}(Cpu& c) {{\n{}{}}}\n", fn_name(f_.start), prologue(), body) : entered_at_pads(body));
+        if (!flow()) {
+            out.why = error_;
+            out.why_at = f_.start;
+            return out;
+        }
+        std::string body;
+        for (size_t k = 0; k < f_.insns.size(); ++k) {
+            if (labels_.contains(f_.insns[k].first)) body += std::format("L_{:08X}:\n", f_.insns[k].first);
+            body += text_[k];
+        }
+        body = expand(body);
+        out.code = f_.landing_pads.empty() ? std::format("void {}(Cpu& c) {{\n{}{}}}\n", fn_name(f_.start), prologue(), body) : entered_at_pads(body);
         out.ok = true;
         out.catches = !f_.landing_pads.empty();
         out.eh_returns = eh_returns_;
@@ -223,6 +240,7 @@ private:
 
     std::string prologue() const {
         std::string p;
+        if (memory_) p += "    uint8_t* const m = c.mem;\n";
         for (const unsigned n : gprs_) p += std::format("    uint64_t r{0} = c.r[{0}];\n", n);
         for (const unsigned n : crs_) p += std::format("    uint32_t cr{0} = (c.cr >> {1}) & 15u;\n", n, 28 - 4 * n);
         for (const unsigned n : fprs_) p += std::format("    double f{0} = c.f[{0}];\n", n);
@@ -232,52 +250,348 @@ private:
         if (specials_.contains("so")) p += "    uint32_t so = c.xer_so;\n";
         if (specials_.contains("ov")) p += "    uint32_t ov = c.xer_ov;\n";
         if (specials_.contains("ca")) p += "    uint32_t ca = c.xer_ca;\n";
+        // A compare's operands, kept for the branches that read its result (bit_text below).
+        for (unsigned n = 0; n < 8; ++n) {
+            if (saved_int_[n]) p += std::format("    uint64_t k{0}a = 0, k{0}b = 0;\n", n);
+            if (saved_float_[n]) p += std::format("    double k{0}x = 0, k{0}y = 0;\n", n);
+        }
+        for (unsigned n = 0; n < 32; ++n)
+            if (saved_bool_[n]) p += std::format("    bool kb{} = false;\n", n);
         return p;
     }
-    // The locals are written back before anything outside the function can
-    // see the state (calls, returns, traps), and read again after a call.
-    // The text is a placeholder until the function's uses are known.
-    static std::string sync_out() { return "@OUT@"; }
-    static std::string sync_in() { return "@IN@"; }
 
-    std::string expand(const std::string& code) const {
-        std::string out_s, in_s;
-        for (const unsigned n : gprs_) {
-            out_s += std::format("c.r[{0}] = r{0}; ", n);
-            in_s += std::format("r{0} = c.r[{0}]; ", n);
+    // ---- the dataflow: what each sync site writes back, and which compares a branch reads directly ----
+    //
+    // The locals are written back before anything outside the function can see the state (calls, returns, traps),
+    // and read again after a call. A local is written back only where it may differ from the Cpu: where some path
+    // from the function's start (whose locals were read from the Cpu), from a call (after which every local is read
+    // again) or from a write-back has assigned it. That is exact, not a guess about the callee: a local not written
+    // back holds what the Cpu holds already. A sync site's text is a placeholder until this is known.
+    //
+    // A condition-register bit is read straight from the compare that set it when every definition of it reaching
+    // the read is a compare of one kind (signed integers, unsigned integers, floating point) or a CR logical
+    // operation: the compare's operands are kept in locals (k7a and k7b; k7x and k7y; kb30) and the branch is
+    // `if (k7a == k7b)`, which the compiler makes one compare and jump. Otherwise the bit is read from the field's
+    // local. The field's local is still set at each compare, for the reads that can't fold and the write-backs.
+    struct Site {
+        enum Kind : uint8_t {
+            kLeave,   // the function leaves (a return, a tail call, a trap, a throw): written back, nothing after
+            kCall,    // a call: written back, then read again
+            kCallIf,  // a call that may not happen
+            kFlush,   // written back, and the function goes on (--registers: before each memory access)
+        } kind;
+    };
+    // What each condition-register bit's reaching definitions are, as the dataflow carries them.
+    enum Fold : uint8_t { kUnreached, kOpaque, kSigned, kUnsigned, kFloat, kBool };
+    static constexpr unsigned kFprAt = 32, kVrAt = 64, kCrAt = 96, kLrAt = 104, kCtrAt = 105, kSoAt = 106, kOvAt = 107, kCaAt = 108, kLocals = 109;
+    using Locals = std::bitset<kLocals>;
+    struct Save {
+        Fold kind;        // kSigned, kUnsigned, kFloat (a field's bits) or kBool (one bit)
+        unsigned target;  // the field, or for kBool the bit
+        std::string a, b;
+    };
+
+    // A sync site's placeholder (its write-back).
+    std::string site(Site::Kind kind) {
+        sites_.push_back({kind});
+        return std::format("@S{}@", sites_.size() - 1);
+    }
+    // A call's sync site: the write-back before it and what is read again after it.
+    std::pair<std::string, std::string> call_site(bool conditional) {
+        std::string out = site(conditional ? Site::kCallIf : Site::kCall);
+        return {std::move(out), std::format("@L{}@", sites_.size() - 1)};
+    }
+    // Notes the current instruction's definition of condition-register bits, of a kind a later read can fold; the
+    // placeholder is where its operands are kept, if any read does fold.
+    std::string saves(Fold kind, unsigned target, std::string a, std::string b = {}) {
+        if (kind == kBool) defs_[k_][target] = kBool;
+        else
+            for (unsigned i = 0; i < (kind == kFloat ? 4u : 3u); ++i) defs_[k_][4 * target + i] = kind;  // (an integer compare's SO bit isn't kept)
+        saves_.push_back({kind, target, std::move(a), std::move(b)});
+        return std::format("@K{}@", saves_.size() - 1);
+    }
+
+    // The local a name in the lifted text is, or -1.
+    static int local_index(std::string_view t) {
+        const auto number = [&](size_t from, unsigned limit) -> int {
+            if (from >= t.size() || t.size() - from > 2 || (t.size() - from == 2 && t[from] == '0')) return -1;
+            unsigned v = 0;
+            for (size_t i = from; i < t.size(); ++i) {
+                if (t[i] < '0' || t[i] > '9') return -1;
+                v = v * 10 + static_cast<unsigned>(t[i] - '0');
+            }
+            return v < limit ? static_cast<int>(v) : -1;
+        };
+        if (t == "lr") return kLrAt;
+        if (t == "ctr") return kCtrAt;
+        if (t == "so") return kSoAt;
+        if (t == "ov") return kOvAt;
+        if (t == "ca") return kCaAt;
+        if (t.starts_with("cr")) {
+            const int n = number(2, 8);
+            return n < 0 ? -1 : static_cast<int>(kCrAt) + n;
         }
-        for (const unsigned n : fprs_) {
-            out_s += std::format("c.f[{0}] = f{0}; ", n);
-            in_s += std::format("f{0} = c.f[{0}]; ", n);
+        if (t.empty()) return -1;
+        const int n = number(1, 32);
+        if (n < 0) return -1;
+        switch (t[0]) {
+        case 'r': return n;
+        case 'f': return static_cast<int>(kFprAt) + n;
+        case 'v': return static_cast<int>(kVrAt) + n;
+        default: return -1;
         }
-        for (const unsigned n : vrs_) {
-            out_s += std::format("c.v[{0}] = v{0}; ", n);
-            in_s += std::format("v{0} = c.v[{0}]; ", n);
+    }
+    // The locals a piece of lifted text assigns: `x = `, `x -= ` and the like, and the carry's out-parameter `, ca)`.
+    static Locals assigned(std::string_view s) {
+        Locals out;
+        const auto word = [](char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'; };
+        for (size_t i = 0; i < s.size();) {
+            if (s[i] == '@') {  // a placeholder
+                const size_t end = s.find('@', i + 1);
+                i = end == std::string_view::npos ? s.size() : end + 1;
+                continue;
+            }
+            if (!word(s[i])) {
+                ++i;
+                continue;
+            }
+            const size_t start = i;
+            while (i < s.size() && word(s[i])) ++i;
+            if ((start > 0 && (s[start - 1] == '.' || s[start - 1] == ':')) || (s[start] >= '0' && s[start] <= '9')) continue;
+            const int n = local_index(s.substr(start, i - start));
+            if (n < 0) continue;
+            size_t j = i;
+            while (j < s.size() && s[j] == ' ') ++j;
+            const bool plain = j < s.size() && s[j] == '=' && (j + 1 >= s.size() || s[j + 1] != '=');
+            const bool compound = j + 1 < s.size() && std::string_view("-+|&^").find(s[j]) != std::string_view::npos && s[j + 1] == '=';
+            const bool out_parameter = n == static_cast<int>(kCaAt) && j < s.size() && s[j] == ')';
+            if (plain || compound || out_parameter) out.set(static_cast<size_t>(n));
         }
-        if (!crs_.empty()) {
+        return out;
+    }
+
+    // The function's locals.
+    Locals declared() const {
+        Locals d;
+        for (const unsigned n : gprs_) d.set(n);
+        for (const unsigned n : fprs_) d.set(kFprAt + n);
+        for (const unsigned n : vrs_) d.set(kVrAt + n);
+        for (const unsigned n : crs_) d.set(kCrAt + n);
+        const std::pair<const char*, unsigned> specials[] = {{"lr", kLrAt}, {"ctr", kCtrAt}, {"so", kSoAt}, {"ov", kOvAt}, {"ca", kCaAt}};
+        for (const auto& [name, at] : specials)
+            if (specials_.contains(name)) d.set(at);
+        return d;
+    }
+
+    static Fold join(Fold x, Fold y) { return x == kUnreached ? y : y == kUnreached ? x : x == y ? x : kOpaque; }
+
+    bool flow() {
+        const size_t n = f_.insns.size();
+        const auto index = [&](uint32_t a) {
+            return static_cast<size_t>(std::ranges::lower_bound(f_.insns, a, {}, &std::pair<uint32_t, Insn>::first) - f_.insns.begin());
+        };
+        // Successors, and each instruction's text cut at its sync sites.
+        struct Event {
+            int site;     // or -1: a piece of text, which assigns `defs`
+            Locals defs;
+        };
+        std::vector<std::vector<size_t>> succ(n);
+        std::vector<std::vector<Event>> events(n);
+        std::vector<Locals> assigns(n);
+        std::vector<bool> reloads(n);
+        for (size_t k = 0; k < n; ++k) {
+            const auto& [a, in] = f_.insns[k];
+            if (const auto it = tables_.find(a); it != tables_.end()) {
+                for (const uint32_t t : it->second->targets) succ[k].push_back(index(t));
+            } else {
+                if (!terminator(in) && k + 1 < n && f_.insns[k + 1].first == a + 4) succ[k].push_back(k + 1);
+                if ((in.op == Op::b || in.op == Op::bc) && !in.lk() && present_.contains(in.branch_target(a))) succ[k].push_back(index(in.branch_target(a)));
+            }
+            const std::string_view t = text_[k];
+            size_t from = 0;
+            for (size_t p = 0; (p = t.find('@', p)) != std::string_view::npos;) {
+                const size_t end = t.find('@', p + 1);
+                if (end == std::string_view::npos) {
+                    error_ = "a placeholder of the lifter's cut short (a fault in the lifter)";
+                    return false;
+                }
+                if (t[p + 1] == 'S' || t[p + 1] == 'L') {
+                    events[k].push_back({-1, assigned(t.substr(from, p - from))});
+                    if (t[p + 1] == 'S') events[k].push_back({std::stoi(std::string(t.substr(p + 2, end - p - 2))), {}});
+                    else reloads[k] = true;
+                    from = end + 1;
+                }
+                p = end + 1;
+            }
+            events[k].push_back({-1, assigned(t.substr(from))});
+            assigns[k] = assigned(t);
+        }
+        // Forward to a fixed point: the locals that may differ from the Cpu, and each CR bit's reaching definitions.
+        std::vector<Locals> dirty_in(n);
+        std::vector<std::array<Fold, 32>> fold_in(n);
+        for (auto& f : fold_in) f.fill(kUnreached);
+        std::vector<bool> reached(n);
+        const auto enter = [&](size_t k) {  // the start, and a landing pad (entered with every local read from the Cpu)
+            reached[k] = true;
+            fold_in[k].fill(kOpaque);
+        };
+        if (n) enter(0);
+        for (const uint32_t pad : f_.landing_pads) enter(index(pad));
+        site_dirty_.assign(sites_.size(), {});
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t k = 0; k < n; ++k) {
+                if (!reached[k]) continue;
+                Locals cur = dirty_in[k];
+                for (const Event& e : events[k]) {
+                    if (e.site < 0) {
+                        cur |= e.defs;
+                        continue;
+                    }
+                    site_dirty_[static_cast<size_t>(e.site)] |= cur;
+                    const Site::Kind kind = sites_[static_cast<size_t>(e.site)].kind;
+                    if (kind == Site::kCall || kind == Site::kFlush) cur.reset();
+                }
+                std::array<Fold, 32> fold = fold_in[k];
+                for (unsigned field = 0; field < 8; ++field)
+                    if (assigns[k][kCrAt + field])
+                        for (unsigned i = 0; i < 4; ++i) fold[4 * field + i] = kOpaque;
+                for (unsigned bit = 0; bit < 32; ++bit)
+                    if (defs_[k][bit] != kUnreached) fold[bit] = defs_[k][bit];
+                if (reloads[k]) fold.fill(kOpaque);
+                for (const size_t s : succ[k]) {
+                    const Locals merged = dirty_in[s] | cur;
+                    std::array<Fold, 32> joined{};
+                    for (unsigned bit = 0; bit < 32; ++bit) joined[bit] = join(fold_in[s][bit], fold[bit]);
+                    if (!reached[s] || merged != dirty_in[s] || joined != fold_in[s]) {
+                        reached[s] = true;
+                        dirty_in[s] = merged;
+                        fold_in[s] = joined;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        fold_ = std::move(fold_in);
+        const Locals all = declared();
+        for (const Locals& d : site_dirty_)
+            if ((d & ~all).any()) {
+                error_ = "a local to be written back that the function doesn't declare (a fault in the lifter)";
+                return false;
+            }
+        return true;
+    }
+
+    // A read of condition-register bit `bit` at the current instruction: as a truth value (`truth`) or as 0 or 1.
+    std::string cr_read(unsigned bit, bool truth) {
+        CR(bit >> 2);
+        return std::format("@{}{}.{}@", truth ? 'T' : 'V', k_, bit);
+    }
+    // A bit read, now that the dataflow is done.
+    std::string bit_text(size_t k, unsigned bit, bool truth) {
+        const unsigned field = bit >> 2, which = bit & 3;
+        const Fold kind = fold_[k][bit];
+        std::string e;
+        switch (kind) {
+        case kSigned: case kUnsigned:
+            if (which == 3) break;
+            saved_int_[field] = true;
+            e = which == 2 ? std::format("k{0}a == k{0}b", field)
+                : kind == kSigned ? std::format("static_cast<int64_t>(k{0}a) {1} static_cast<int64_t>(k{0}b)", field, which == 0 ? '<' : '>')
+                                  : std::format("k{0}a {1} k{0}b", field, which == 0 ? '<' : '>');
+            break;
+        case kFloat:
+            saved_float_[field] = true;
+            e = which == 3 ? std::format("k{0}x != k{0}x || k{0}y != k{0}y", field)
+                : which == 2 ? std::format("k{0}x == k{0}y", field)
+                             : std::format("k{0}x {1} k{0}y", field, which == 0 ? '<' : '>');
+            break;
+        case kBool:
+            saved_bool_[bit] = true;
+            e = std::format("kb{}", bit);
+            break;
+        default: break;
+        }
+        if (e.empty()) return truth ? std::format("(cr{} & {}u)", field, 8u >> which) : std::format("((cr{} >> {}) & 1u)", field, 3 - which);
+        return truth ? "(" + e + ")" : "static_cast<uint32_t>(" + e + ")";
+    }
+
+    // The placeholders, filled in.
+    std::string expand(const std::string& code) {
+        const auto write_back = [&](const Locals& d) {
+            std::string s;
+            for (const unsigned n : gprs_)
+                if (d[n]) s += std::format("c.r[{0}] = r{0}; ", n);
+            for (const unsigned n : fprs_)
+                if (d[kFprAt + n]) s += std::format("c.f[{0}] = f{0}; ", n);
+            for (const unsigned n : vrs_)
+                if (d[kVrAt + n]) s += std::format("c.v[{0}] = v{0}; ", n);
             uint32_t keep = 0xFFFFFFFFu;
             std::string merged;
-            for (const unsigned n : crs_) {
-                keep &= ~(15u << (28 - 4 * n));
-                merged += std::format(" | (cr{} << {})", n, 28 - 4 * n);
-                in_s += std::format("cr{0} = (c.cr >> {1}) & 15u; ", n, 28 - 4 * n);
-            }
-            out_s += std::format("c.cr = (c.cr & {}){}; ", hex32(keep), merged);
-        }
+            for (const unsigned n : crs_)
+                if (d[kCrAt + n]) {
+                    keep &= ~(15u << (28 - 4 * n));
+                    merged += std::format("{}(cr{} << {})", merged.empty() ? "" : " | ", n, 28 - 4 * n);
+                }
+            if (!merged.empty()) s += keep ? std::format("c.cr = (c.cr & {}) | {}; ", hex32(keep), merged) : std::format("c.cr = {}; ", merged);
+            const std::pair<const char*, unsigned> specials[] = {{"lr", kLrAt}, {"ctr", kCtrAt}};
+            for (const auto& [name, at] : specials)
+                if (d[at]) s += std::format("c.{0} = {0}; ", name);
+            const std::pair<const char*, unsigned> xer[] = {{"so", kSoAt}, {"ov", kOvAt}, {"ca", kCaAt}};
+            for (const auto& [name, at] : xer)
+                if (d[at]) s += std::format("c.xer_{0} = {0}; ", name);
+            return s;
+        };
+        std::string read_again;
+        for (const unsigned n : gprs_) read_again += std::format("r{0} = c.r[{0}]; ", n);
+        for (const unsigned n : fprs_) read_again += std::format("f{0} = c.f[{0}]; ", n);
+        for (const unsigned n : vrs_) read_again += std::format("v{0} = c.v[{0}]; ", n);
+        for (const unsigned n : crs_) read_again += std::format("cr{0} = (c.cr >> {1}) & 15u; ", n, 28 - 4 * n);
         for (const char* s : {"lr", "ctr"})
-            if (specials_.contains(s)) {
-                out_s += std::format("c.{0} = {0}; ", s);
-                in_s += std::format("{0} = c.{0}; ", s);
-            }
+            if (specials_.contains(s)) read_again += std::format("{0} = c.{0}; ", s);
         for (const char* s : {"so", "ov", "ca"})
-            if (specials_.contains(s)) {
-                out_s += std::format("c.xer_{0} = {0}; ", s);
-                in_s += std::format("{0} = c.xer_{0}; ", s);
+            if (specials_.contains(s)) read_again += std::format("{0} = c.xer_{0}; ", s);
+        // Two passes: the bit reads decide which compares keep their operands.
+        const auto pass = [&](const std::string& in, bool keeps) {
+            std::string out;
+            out.reserve(in.size() + in.size() / 2);
+            size_t from = 0;
+            for (size_t p; (p = in.find('@', from)) != std::string::npos;) {
+                const size_t end = in.find('@', p + 1);
+                const char kind = in[p + 1];
+                const std::string body = in.substr(p + 2, end - p - 2);
+                out.append(in, from, p - from);
+                from = end + 1;
+                if (keeps != (kind == 'K')) {
+                    out.append(in, p, end + 1 - p);
+                    continue;
+                }
+                switch (kind) {
+                case 'S': out += write_back(site_dirty_[std::stoul(body)]); break;
+                case 'L': out += read_again; break;
+                case 'T': case 'V': {
+                    const size_t dot = body.find('.');
+                    out += bit_text(std::stoul(body.substr(0, dot)), static_cast<unsigned>(std::stoul(body.substr(dot + 1))), kind == 'T');
+                    break;
+                }
+                case 'K': {
+                    const Save& s = saves_[std::stoul(body)];
+                    if (s.kind == kBool) {
+                        if (saved_bool_[s.target]) out += std::format(" kb{} = {};", s.target, s.a);
+                    } else if (s.kind == kFloat) {
+                        if (saved_float_[s.target]) out += std::format(" k{0}x = {1}; k{0}y = {2};", s.target, s.a, s.b);
+                    } else if (saved_int_[s.target]) {
+                        out += std::format(" k{0}a = static_cast<uint64_t>({1}); k{0}b = static_cast<uint64_t>({2});", s.target, s.a, s.b);
+                    }
+                    break;
+                }
+                default: break;
+                }
             }
-        std::string r = code;
-        for (const auto& [placeholder, with] : {std::pair{std::string("@OUT@"), out_s}, std::pair{std::string("@IN@"), in_s}})
-            for (size_t p; (p = r.find(placeholder)) != std::string::npos;) r.replace(p, placeholder.size(), with);
-        return r;
+            out.append(in, from);
+            return out;
+        };
+        return pass(pass(code, false), true);
     }
 
     // The condition of a bc/bclr/bcctr, after decrementing CTR if BO says so.
@@ -289,9 +603,8 @@ private:
             parts.push_back((bo & 2) ? "ctr == 0ull" : "ctr != 0ull");
         }
         if (!(bo & 0x10)) {
-            const unsigned m = 8u >> (bi & 3);
-            const std::string field = CR(bi >> 2);
-            parts.push_back((bo & 8) ? std::format("({} & {}u)", field, m) : std::format("!({} & {}u)", field, m));
+            const std::string bit = cr_read(bi, true);
+            parts.push_back((bo & 8) ? bit : "!" + bit);
         }
         if (parts.empty()) return "true";
         std::string c = parts[0];
@@ -305,12 +618,17 @@ private:
             error_ = std::format("branch to {:08X}, which is neither in the function nor a function", target);
             return false;
         }
-        out = std::format("{} {}(c); return;", sync_out(), fn_name(target));
+        out = std::format("{} {}(c); return;", site(Site::kLeave), fn_name(target));
         return true;
     }
 
     // One bit of the condition register, as 0 or 1.
-    std::string cr_bit(unsigned bit) { return std::format("(({} >> {}) & 1u)", CR(bit >> 2), 3 - (bit & 3)); }
+    std::string cr_bit(unsigned bit) { return cr_read(bit, false); }
+    // The guest's memory as lifted code addresses it: a local copy of the base, which a store can't be taken to change.
+    std::string mem() {
+        memory_ = true;
+        return "m";
+    }
 
     bool insn(uint32_t pc, const Insn& in, std::string& out) {
         const unsigned d = in.rd(), a = in.ra(), b = in.rb();
@@ -319,7 +637,10 @@ private:
         // The result register, then the record form on it.
         const auto result = [&](unsigned dst, std::string expr, bool record = false) {
             std::string s = std::format("{} = {};", R(dst), expr);
-            if (record_form || record) s += std::format(" {} = record(r{}, {});", CR(0), dst, SO());
+            if (record_form || record) {
+                s += std::format(" {} = record(r{}, {});", CR(0), dst, SO());
+                s += saves(kSigned, 0, std::format("r{}", dst), "0");
+            }
             line(s);
         };
         // Effective addresses, as the 64-bit sum (an update form writes it back whole) and truncated to an address.
@@ -330,16 +651,16 @@ private:
         const auto load = [&](const char* read, const std::string& ea, bool update, const char* wrap = "$") {
             if (update) {
                 line(std::format("{{ const uint64_t ea = {}; {} = {}; {} = ea; }}", ea, R(d),
-                                 fill(wrap, std::format("{}(c, static_cast<uint32_t>(ea))", read)), R(a)));
+                                 fill(wrap, std::format("{}({}, static_cast<uint32_t>(ea))", read, mem())), R(a)));
             } else {
-                const std::string value = std::format("{}(c, {})", read, addr(ea));
+                const std::string value = std::format("{}({}, {})", read, mem(), addr(ea));
                 line(std::format("{} = {};", R(d), fill(wrap, value)));
             }
         };
         const auto store = [&](const char* write, const std::string& ea, bool update, const char* wrap = "$") {
             const std::string value = fill(wrap, R(d));
-            if (update) line(std::format("{{ const uint64_t ea = {}; {}(c, static_cast<uint32_t>(ea), {}); {} = ea; }}", ea, write, value, R(a)));
-            else line(std::format("{}(c, {}, {});", write, addr(ea), value));
+            if (update) line(std::format("{{ const uint64_t ea = {}; {}({}, static_cast<uint32_t>(ea), {}); {} = ea; }}", ea, write, mem(), value, R(a)));
+            else line(std::format("{}({}, {}, {});", write, mem(), addr(ea), value));
         };
         const char* const kSext8 = "static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>($)))";
         const char* const kSext16 = "static_cast<uint64_t>(static_cast<int64_t>(static_cast<int16_t>($)))";
@@ -355,21 +676,22 @@ private:
             const std::string x = cr_bit(a), y = cr_bit(b);
             const unsigned shift = 3 - (d & 3);
             const std::string field = CR(d >> 2);
-            line(std::format("{{ const uint32_t bit = ({}) & 1u; {} = ({} & {}u) | (bit << {}); }}", fill(format, x, y),
-                             field, field, 15u & ~(1u << shift), shift));
+            line(std::format("{{ const uint32_t bit = ({}) & 1u; {} = ({} & {}u) | (bit << {});{} }}", fill(format, x, y), field, field, 15u & ~(1u << shift), shift,
+                             saves(kBool, d, "bit != 0u")));
         };
         const auto trap = [&](const std::string& x, const std::string& y) {
-            if (d == 31) line(std::format("{} c.hooks->trap(c, {}, \"trap\"); return;", sync_out(), hex32(pc)));
-            else line(std::format("if (trap_on({}u, {}, {})) {{ {} c.hooks->trap(c, {}, \"trap\"); return; }}", d, x, y, sync_out(), hex32(pc)));
+            const std::string leave = site(Site::kLeave);
+            if (d == 31) line(std::format("{} c.hooks->trap(c, {}, \"trap\"); return;", leave, hex32(pc)));
+            else line(std::format("if (trap_on({}u, {}, {})) {{ {} c.hooks->trap(c, {}, \"trap\"); return; }}", d, x, y, leave, hex32(pc)));
         };
         // Floating-point loads, stores and operations: the helpers are cpu.hpp's fp:: functions.
         const auto fload = [&](const char* read, const std::string& ea, bool update, const char* wrap) {
-            if (update) line(std::format("{{ const uint64_t ea = {}; {} = {}; {} = ea; }}", ea, F(d), fill(wrap, std::format("{}(c, static_cast<uint32_t>(ea))", read)), R(a)));
-            else line(std::format("{} = {};", F(d), fill(wrap, std::format("{}(c, {})", read, addr(ea)))));
+            if (update) line(std::format("{{ const uint64_t ea = {}; {} = {}; {} = ea; }}", ea, F(d), fill(wrap, std::format("{}({}, static_cast<uint32_t>(ea))", read, mem())), R(a)));
+            else line(std::format("{} = {};", F(d), fill(wrap, std::format("{}({}, {})", read, mem(), addr(ea)))));
         };
         const auto fstore = [&](const char* write, const std::string& ea, bool update, const char* wrap) {
-            if (update) line(std::format("{{ const uint64_t ea = {}; {}(c, static_cast<uint32_t>(ea), {}); {} = ea; }}", ea, write, fill(wrap, F(d)), R(a)));
-            else line(std::format("{}(c, {}, {});", write, addr(ea), fill(wrap, F(d))));
+            if (update) line(std::format("{{ const uint64_t ea = {}; {}({}, static_cast<uint32_t>(ea), {}); {} = ea; }}", ea, write, mem(), fill(wrap, F(d)), R(a)));
+            else line(std::format("{}({}, {}, {});", write, mem(), addr(ea), fill(wrap, F(d))));
         };
         const auto fp1 = [&](const char* fn) { line(std::format("{} = fp::{}({});", F(d), fn, F(b))); };
         const auto fp2 = [&](const char* fn, unsigned x, unsigned y) { line(std::format("{} = fp::{}({}, {});", F(d), fn, F(x), F(y))); };
@@ -402,7 +724,7 @@ private:
                 const std::string by = R(a == 1 ? b : a);
                 LR();  // (synced for eh_return, which reads the pad from it)
                 ++eh_returns_;
-                line(std::format("{0} = {0} + {1}; if ({1} != 0ull) {{ {2} eh_return(c); }}", R(1), by, sync_out()));
+                line(std::format("{0} = {0} + {1}; if ({1} != 0ull) {{ {2} eh_return(c); }}", R(1), by, site(Site::kLeave)));
                 return true;
             }
             result(d, std::format("{} + {}", R(a), R(b)));
@@ -437,18 +759,16 @@ private:
         case Op::divdu: result(d, std::format("divdu({}, {})", R(a), R(b))); return true;
 
         // ---------------------------------------------------------------- compare
-        case Op::cmp:
-            line(std::format("{} = compare_s({}, {}, {});", CR(in.crfd()), in.l() ? s64(a) : s32(a), in.l() ? s64(b) : s32(b), SO()));
+        case Op::cmp: case Op::cmpi: case Op::cmpl: case Op::cmpli: {
+            const bool is_signed = in.op == Op::cmp || in.op == Op::cmpi;
+            const std::string x = in.l() ? (is_signed ? s64(a) : R(a)) : (is_signed ? s32(a) : u32(a));
+            const std::string y = in.op == Op::cmpi ? std::format("int64_t{{{}}}", in.simm())
+                                : in.op == Op::cmpli ? std::format("{}u", in.uimm())
+                                : in.l() ? (is_signed ? s64(b) : R(b)) : (is_signed ? s32(b) : u32(b));
+            const unsigned field = in.crfd();
+            line(std::format("{} = compare_{}({}, {}, {});{}", CR(field), is_signed ? 's' : 'u', x, y, SO(), saves(is_signed ? kSigned : kUnsigned, field, x, y)));
             return true;
-        case Op::cmpi:
-            line(std::format("{} = compare_s({}, {}, {});", CR(in.crfd()), in.l() ? s64(a) : s32(a), in.simm(), SO()));
-            return true;
-        case Op::cmpl:
-            line(std::format("{} = compare_u({}, {}, {});", CR(in.crfd()), in.l() ? R(a) : u32(a), in.l() ? R(b) : u32(b), SO()));
-            return true;
-        case Op::cmpli:
-            line(std::format("{} = compare_u({}, {}u, {});", CR(in.crfd()), in.l() ? R(a) : u32(a), in.uimm(), SO()));
-            return true;
+        }
 
         // ---------------------------------------------------------------- logical (the result is rA, the source rS = d)
         case Op::ori:
@@ -603,8 +923,10 @@ private:
         // mode this runtime doesn't provide.
         case Op::mffs: line(std::format("{} = std::bit_cast<double>(uint64_t{{c.fpscr}});", F(d))); return true;
         case Op::mtfsf:
-            line(std::format("c.fpscr = fpscr_fields(c.fpscr, {}u, {}); if (c.fpscr & 0xFFu) {{ {} c.hooks->fpscr_mode(c, {}); {} }}", in.fm(), F(b), sync_out(),
-                             hex32(pc), sync_in()));
+        {
+            const auto [out_s, in_s] = call_site(true);
+            line(std::format("c.fpscr = fpscr_fields(c.fpscr, {}u, {}); if (c.fpscr & 0xFFu) {{ {} c.hooks->fpscr_mode(c, {}); {} }}", in.fm(), F(b), out_s, hex32(pc), in_s));
+        }
             return true;
         case Op::fneg: fp1("fneg"); return true;
         case Op::fabs: fp1("fabs"); return true;
@@ -635,12 +957,12 @@ private:
         case Op::fnmsubs: fp3("fnmsubs"); return true;
         case Op::fsel: fp3("fsel"); return true;
         case Op::fcmpu: case Op::fcmpo:  // (they differ in the exceptions they raise, which are not kept)
-            line(std::format("{} = fp::fcompare({}, {});", CR(in.crfd()), F(a), F(b)));
+            line(std::format("{} = fp::fcompare({}, {});{}", CR(in.crfd()), F(a), F(b), saves(kFloat, in.crfd(), F(a), F(b))));
             return true;
 
         // ---------------------------------------------------------------- VMX (vmx.hpp)
-        case Op::lvx: line(std::format("{} = vmx::lvx(c, {});", V(d), addr(ea_x()))); return true;
-        case Op::stvx: line(std::format("vmx::stvx(c, {}, {});", addr(ea_x()), V(d))); return true;
+        case Op::lvx: line(std::format("{} = vmx::lvx({}, {});", V(d), mem(), addr(ea_x()))); return true;
+        case Op::stvx: line(std::format("vmx::stvx({}, {}, {});", mem(), addr(ea_x()), V(d))); return true;
         case Op::lvsl: line(std::format("{} = vmx::lvsl({});", V(d), addr(ea_x()))); return true;
         case Op::lvsr: line(std::format("{} = vmx::lvsr({});", V(d), addr(ea_x()))); return true;
         case Op::vand: vx2("vand"); return true;
@@ -705,7 +1027,11 @@ private:
         case Op::twi: trap(s32(a), std::format("{}", in.simm())); return true;
         case Op::td: trap(s64(a), s64(b)); return true;
         case Op::tdi: trap(s64(a), std::format("{}", in.simm())); return true;
-        case Op::sc: line(std::format("{} c.hooks->system_call(c, {}); {}", sync_out(), hex32(pc), sync_in())); return true;
+        case Op::sc: {
+            const auto [out_s, in_s] = call_site(false);
+            line(std::format("{} c.hooks->system_call(c, {}); {}", out_s, hex32(pc), in_s));
+            return true;
+        }
         case Op::mftb:  // the whole time base, or (register 269) its upper half
             result(d, in.spr() == 268 ? std::string("c.hooks->time_base(c)") : std::string("c.hooks->time_base(c) >> 32"));
             return true;
@@ -718,7 +1044,8 @@ private:
                     error_ = std::format("call to {:08X}, which is not a function", t);
                     return false;
                 }
-                line(std::format("{} = {}; {} {}(c); {}", LR(), hex64(pc + 4), sync_out(), fn_name(t), sync_in()));
+                const auto [out_s, in_s] = call_site(false);
+                line(std::format("{} = {}; {} {}(c); {}", LR(), hex64(pc + 4), out_s, fn_name(t), in_s));
                 return true;
             }
             if (present_.contains(t)) {
@@ -739,7 +1066,9 @@ private:
                     error_ = std::format("call to {:08X}, which is not a function", t);
                     return false;
                 }
-                line(std::format("{}{} = {}; if ({}) {{ {} {}(c); {} }}", pre, LR(), hex64(pc + 4), cond, sync_out(), fn_name(t), sync_in()));
+                const auto [out_s, in_s] = call_site(cond != "true");
+                line(cond == "true" ? std::format("{}{} = {}; {} {}(c); {}", pre, LR(), hex64(pc + 4), out_s, fn_name(t), in_s)
+                                    : std::format("{}{} = {}; if ({}) {{ {} {}(c); {} }}", pre, LR(), hex64(pc + 4), cond, out_s, fn_name(t), in_s));
                 return true;
             }
             std::string go;
@@ -752,19 +1081,25 @@ private:
             std::string pre;
             const std::string cond = condition(in, pre);
             if (in.lk()) {  // a call through LR
-                line(std::format("{}{{ const uint64_t to = {}; {} = {}; if ({}) {{ {} c.hooks->call(c, static_cast<uint32_t>(to) & ~3u); {} }} }}", pre, LR(),
-                                 LR(), hex64(pc + 4), cond, sync_out(), sync_in()));
+                const auto [out_s, in_s] = call_site(cond != "true");
+                line(cond == "true" ? std::format("{}{{ const uint64_t to = {}; {} = {}; {} c.hooks->call(c, static_cast<uint32_t>(to) & ~3u); {} }}", pre, LR(), LR(),
+                                                  hex64(pc + 4), out_s, in_s)
+                                    : std::format("{}{{ const uint64_t to = {}; {} = {}; if ({}) {{ {} c.hooks->call(c, static_cast<uint32_t>(to) & ~3u); {} }} }}", pre,
+                                                  LR(), LR(), hex64(pc + 4), cond, out_s, in_s));
                 return true;
             }
-            line(cond == "true" ? std::format("{}{} return;", pre, sync_out()) : std::format("{}if ({}) {{ {} return; }}", pre, cond, sync_out()));
+            const std::string leave = site(Site::kLeave);
+            line(cond == "true" ? std::format("{}{} return;", pre, leave) : std::format("{}if ({}) {{ {} return; }}", pre, cond, leave));
             return true;
         }
         case Op::bcctr: {
             std::string pre;
             const std::string cond = condition(in, pre);
             if (in.lk()) {
-                line(std::format("{}{} = {}; if ({}) {{ {} c.hooks->call(c, static_cast<uint32_t>({}) & ~3u); {} }}", pre, LR(), hex64(pc + 4), cond,
-                                 sync_out(), CTR(), sync_in()));
+                const auto [out_s, in_s] = call_site(cond != "true");
+                line(cond == "true" ? std::format("{}{} = {}; {} c.hooks->call(c, static_cast<uint32_t>({}) & ~3u); {}", pre, LR(), hex64(pc + 4), out_s, CTR(), in_s)
+                                    : std::format("{}{} = {}; if ({}) {{ {} c.hooks->call(c, static_cast<uint32_t>({}) & ~3u); {} }}", pre, LR(), hex64(pc + 4), cond,
+                                                  out_s, CTR(), in_s));
                 return true;
             }
             if (const auto it = tables_.find(pc); it != tables_.end()) {
@@ -778,12 +1113,13 @@ private:
                     }
                     s += std::format(" case {}: goto L_{:08X};", hex32(t), t);
                 }
-                s += std::format(" default: {} c.hooks->trap(c, {}, \"a switch jumped outside its table\"); return; }}", sync_out(), hex32(pc));
+                s += std::format(" default: {} c.hooks->trap(c, {}, \"a switch jumped outside its table\"); return; }}", site(Site::kLeave), hex32(pc));
                 line(s);
                 return true;
             }
-            line(cond == "true" ? std::format("{}{} c.hooks->call(c, static_cast<uint32_t>({}) & ~3u); return;", pre, sync_out(), CTR())
-                                : std::format("{}if ({}) {{ {} c.hooks->call(c, static_cast<uint32_t>({}) & ~3u); return; }}", pre, cond, sync_out(), CTR()));
+            const std::string leave = site(Site::kLeave);
+            line(cond == "true" ? std::format("{}{} c.hooks->call(c, static_cast<uint32_t>({}) & ~3u); return;", pre, leave, CTR())
+                                : std::format("{}if ({}) {{ {} c.hooks->call(c, static_cast<uint32_t>({}) & ~3u); return; }}", pre, cond, leave, CTR()));
             return true;
         }
         default:
@@ -793,6 +1129,15 @@ private:
     }
 
     const LiftInput& f_;
+    std::vector<std::string> text_;               // each instruction's text, with placeholders
+    std::vector<std::array<Fold, 32>> defs_;      // each instruction's foldable definitions of CR bits (kUnreached: none)
+    std::vector<std::array<Fold, 32>> fold_;      // each instruction's CR bits on entry, from the dataflow
+    std::vector<Site> sites_;
+    std::vector<Locals> site_dirty_;              // what each sync site writes back
+    std::vector<Save> saves_;
+    bool saved_int_[8] = {}, saved_float_[8] = {}, saved_bool_[32] = {};
+    bool memory_ = false;
+    size_t k_ = 0;                                // the instruction being emitted
     std::set<uint32_t> present_, labels_;
     std::map<uint32_t, const JumpTable*> tables_;
     std::set<unsigned> gprs_, crs_, fprs_, vrs_;

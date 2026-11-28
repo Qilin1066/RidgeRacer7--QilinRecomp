@@ -12,6 +12,7 @@
 
 #include "cases.hpp"
 #include "ppu.hpp"
+#include "qilin/rt/dispatch.hpp"
 #include "qilin/rt/memory.hpp"
 #include "ref.hpp"
 
@@ -145,13 +146,13 @@ void compare(const Case& c, const rt::Cpu& cpu, const ref::State& s, const std::
 // mode from random states: everything must agree, and r7 must say the right frames ran (gen.cpp).
 constexpr uint32_t kReturnSentinel = 0x00001230u;
 
-// Runs the program from `pc` until it returns to the sentinel; false if it leaves the program or runs too long.
-bool interpret(ref::State& s, uint32_t pc) {
+// Runs a program from `pc` until it returns to the sentinel; false if it leaves the program or runs too long.
+bool interpret(ref::State& s, uint32_t pc, const difftest::ProgramWord* words, size_t count) {
     for (int steps = 0; steps < 10000; ++steps) {
         if (pc == kReturnSentinel) return true;
         const difftest::ProgramWord* w = nullptr;
-        for (size_t i = 0; i < difftest::kEhProgramSize; ++i)
-            if (difftest::kEhProgram[i].at == pc) w = &difftest::kEhProgram[i];
+        for (size_t i = 0; i < count; ++i)
+            if (words[i].at == pc) w = &words[i];
         if (!w) return false;
         const ppu::Insn in = ppu::decode(w->word);
         switch (in.op) {
@@ -235,7 +236,7 @@ size_t run_unwinding(rt::AddressSpace& space) {
                 std::memcpy(lifted_memory.data(), window, kWinSize);
 
                 std::memcpy(window, before.data(), kWinSize);
-                if (!interpret(s, difftest::kEhEntry)) {
+                if (!interpret(s, difftest::kEhEntry, difftest::kEhProgram, difftest::kEhProgramSize)) {
                     eh_fail(depth, mode, "the reference left the program");
                     continue;
                 }
@@ -252,9 +253,73 @@ size_t run_unwinding(rt::AddressSpace& space) {
     return runs;
 }
 
+// ---- rounding once to single: the fused forms' fast path (fp::rounds_once_to_single) ----
+// Products of singles near half a unit of the addend's last place, so that the double sum lands on or a hair off a
+// point halfway between two singles, where rounding the double again would round twice; and plain noise. The
+// scalar fmadds/fmsubs against the reference's integer soft-float, and VMX's vmaddfp and vnmsubfp (and its fused
+// element alone) against the general path, which the VMX cases hold to the reference.
+size_t run_rounding() {
+    size_t runs = 0;
+    const auto single = [](uint32_t w) { return static_cast<double>(std::bit_cast<float>(w)); };
+    for (int trial = 0; trial < 400000; ++trial, ++runs) {
+        uint32_t a, c, b;
+        if (trial % 4 == 3) {
+            a = static_cast<uint32_t>(rng());
+            c = static_cast<uint32_t>(rng());
+            b = static_cast<uint32_t>(rng());
+        } else {
+            // a = 2^ea (1 + u), c = 2^ec (1 - u): the product is just under (or over) a power of two by u^2.
+            const uint32_t u = 1u + static_cast<uint32_t>(rng() % 64), shift = 8 + static_cast<uint32_t>(rng() % 15);
+            const int eb = 60 + static_cast<int>(rng() % 136);
+            const int ep = eb - 24 - static_cast<int>(rng() % 3);  // the product about half the addend's last place
+            const uint32_t fa = (0x00800000u + (u << (23 - shift))) & 0x007fffffu;
+            const uint32_t fc = (0x00800000u - (u << (23 - shift))) & 0x007fffffu;
+            const int ea = ep / 2 + 1, ec = ep - ea + (rng() % 2 ? 0 : 1);
+            a = (static_cast<uint32_t>(ea + 0) << 23) | fa;
+            c = (static_cast<uint32_t>(ec - 1) << 23) | fc;
+            b = (static_cast<uint32_t>(eb) << 23) | (static_cast<uint32_t>(rng()) & 0x007fffffu);
+            if (rng() % 2) a ^= 0x80000000u;
+            if (rng() % 2) b ^= 0x80000000u;
+        }
+        for (const bool subtract : {false, true}) {
+            const double x = single(a), y = single(c), z = single(b);
+            const double lifted = subtract ? rt::fp::fmsubs(x, y, z) : rt::fp::fmadds(x, y, z);
+            const uint64_t reference = ref::soft::fused(std::bit_cast<uint64_t>(x), std::bit_cast<uint64_t>(y), std::bit_cast<uint64_t>(z), subtract, true);
+            if (std::bit_cast<uint64_t>(lifted) != reference && ++failures <= 20)
+                std::println(stderr, "FAIL {} of singles {:08x} {:08x} {:08x}: lifted {:#018x}, reference {:#018x}", subtract ? "fmsubs" : "fmadds", a, c, b,
+                             std::bit_cast<uint64_t>(lifted), reference);
+            for (const bool negate : {false, true}) {
+                const uint32_t general = rt::vmx::fused32_slow(a, c, b, subtract, negate);
+                // The element alone, and in a vector (whose fast path takes all four at once), beside three plain ones.
+                const rt::Vec va{{a, 0x3f800000u, c, 0x40000000u}}, vc{{c, 0x3f000000u, a, 0x3f800000u}}, vb{{b, 0x3f800000u, b, 0x00000000u}};
+                const uint32_t fast = (subtract != negate) ? rt::vmx::fused32(a, c, b, subtract, negate)
+                                    : subtract ? rt::vmx::vnmsubfp(va, vc, vb).w[0] : rt::vmx::vmaddfp(va, vc, vb).w[0];
+                if (fast != general && ++failures <= 20)
+                    std::println(stderr, "FAIL VMX fused element of {:08x} {:08x} {:08x} ({}{}): fast {:08x}, general {:08x}", a, c, b, subtract ? "subtract" : "add",
+                                 negate ? ", negated" : "", fast, general);
+            }
+        }
+    }
+    return runs;
+}
+
+// ---- the function index (dispatch.hpp): calls through a register find the function by address ----
+void f_a(rt::Cpu&) {}
+void f_b(rt::Cpu&) {}
+void f_c(rt::Cpu&) {}
+bool check_index() {
+    static const rt::LiftedFunction table[] = {{0x00010000u, &f_a}, {0x00010010u, &f_b}, {0x00010100u, &f_c}};
+    const rt::FunctionIndex index(table);
+    bool ok = index.find(0x00010000u) == &f_a && index.find(0x00010010u) == &f_b && index.find(0x00010100u) == &f_c;
+    for (const uint32_t none : {0x00010004u, 0x0000FFFCu, 0x00010102u, 0x00010104u, 0xFFFFFFFCu, 0u}) ok &= index.find(none) == nullptr;
+    if (!ok) std::println(stderr, "FAIL the function index finds a function wrongly");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
+    if (!check_index()) return 1;
     rt::AddressSpace space;
     if (!space.base() || !space.commit(kWin, kWinSize)) {
         std::println(stderr, "difftest: can't reserve the guest's address space");
@@ -262,7 +327,7 @@ int main() {
     }
     uint8_t* const window = space.base() + kWin;
     std::vector<uint8_t> before(kWinSize), lifted_memory(kWinSize);
-    size_t traps = 0, taken = 0, runs = 0;
+    size_t traps = 0, taken = 0, runs = 0, programs = 0;
 
     for (size_t k = 0; k < difftest::kCaseCount; ++k) {
         const Case& c = difftest::kCases[k];
@@ -270,7 +335,7 @@ int main() {
         const ppu::Spec& spec = ppu::spec(in.op);
         // Floating-point arithmetic gets many more states: its hard cases (ties, cancellation, the edges of a format) are rare.
         const bool memory = spec.flags & (ppu::kLoad | ppu::kStore);
-        const int trials = memory ? kTrials : (spec.flags & ppu::kFloat) ? kFloatTrials : (spec.flags & ppu::kVector) ? kVectorTrials : kTrials;
+        const int trials = c.kind == Kind::Program ? kTrials : memory ? kTrials : (spec.flags & ppu::kFloat) ? kFloatTrials : (spec.flags & ppu::kVector) ? kVectorTrials : kTrials;
         for (int trial = 0; trial < trials; ++trial, ++runs) {
             rt::Cpu cpu;
             cpu.mem = space.base();
@@ -311,6 +376,11 @@ int main() {
                     cpu.r[in.ra()] = (target - index) & 0xffffffffu;
                 }
             }
+            if (c.kind == Kind::Program) {
+                cpu.r[1] = kWin + 0x1000;  // the window, which its loads and stores address off r1
+                cpu.lr = kReturnSentinel;
+                cpu.ctr = trial % 4 == 0 ? 2 : cpu.ctr;  // (CTR's branches decrement it: one that reaches zero)
+            }
             if (c.kind == Kind::Switch) cpu.ctr = trial % 3 == 0 ? c.pc + 16 : trial % 3 == 1 ? c.pc + 24 : interesting();
             if (c.kind == Kind::Bc || c.kind == Kind::Bclr || c.kind == Kind::Bcctr || c.kind == Kind::Trap) cpu.r[3] = 7;
 
@@ -350,6 +420,14 @@ int main() {
             bool expect_trap = false, expect_call = false, expect_system_call = false;
             uint32_t expect_target = 0;
             switch (c.kind) {
+            case Kind::Program:
+                if (!interpret(s, c.entry, c.program, c.program_size)) {
+                    fail(c, "the reference left the program");
+                    trial = trials;
+                    continue;
+                }
+                ++programs;
+                break;
             case Kind::Plain:
                 if (!ref::step(s, in)) {
                     fail(c, "the reference doesn't know this instruction");
@@ -401,11 +479,13 @@ int main() {
         }
     }
     const size_t unwinding = run_unwinding(space);
+    const size_t rounding = run_rounding();
     if (failures || eh_failures) {
         std::println(stderr, "difftest: {} disagreements, {} in the unwinding program", failures, eh_failures);
         return 1;
     }
-    std::println("difftest: {} cases, {} runs, all agree ({} branches taken, {} traps fired); the unwinding program: {} runs, all agree", difftest::kCaseCount,
-                 runs, taken, traps, unwinding);
+    std::println("difftest: {} cases, {} runs, all agree ({} branches taken, {} traps fired, {} runs of programs); the unwinding program: {} runs, all agree; "
+                 "rounding once to single: {} operands, all agree",
+                 difftest::kCaseCount, runs, taken, traps, programs, unwinding, rounding);
     return 0;
 }

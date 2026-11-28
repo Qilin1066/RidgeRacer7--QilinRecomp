@@ -39,7 +39,7 @@ The game also needs the console's fonts, from the `dev_flash` folder of a PS3's 
 
 ### From the source on Windows
 
-You need Visual Studio 2022 17.10 or newer with **Desktop development with C++** and **C++ CMake tools for Windows**.
+You need Visual Studio 2022 17.10 or newer with **Desktop development with C++** and **C++ CMake tools for Windows**. Add **C++ Clang Compiler for Windows** too and the game is built with Clang, whose code runs the game's SPU programs about 1.6 times as fast (`docs/toolchain.md`).
 
 - **`Play Ridge Racer 7.bat`** starts the game, building it from your copy first if needed (the first build takes a long while).
 - **`Update Ridge Racer 7.bat`** gets the latest code, rebuilds what changed and starts the game.
@@ -101,9 +101,9 @@ cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
 ```
 
-With Visual Studio, add `--config Release` and `-C Release`; the programs land in `build\Release\`. `-DQILIN_WERROR=ON` makes warnings errors.
+With Visual Studio, add `--config Release` and `-C Release`; the programs land in `build\Release\`. `-DQILIN_WERROR=ON` makes warnings errors. On a Raspberry Pi add `-DQILIN_CPU=pi4` (or `pi5`); `docs/toolchain.md` has the other options (link-time and profile-guided optimisation) and what each was measured to give.
 
-CI builds and tests on Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64 and x64, and Windows x64 with warnings as errors, and runs both decoder sweeps.
+CI builds and tests on Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64 and x64, and Windows x64 (MSVC and clang-cl) with warnings as errors, and runs both decoder sweeps.
 
 ## Using it
 
@@ -163,9 +163,9 @@ With the game built, `ridgeracer7_shader_check` builds a pipeline for every tran
 | `runtime/` | What lifted code compiles against: CPU state, floating point, VMX, the SPU, guest memory, error reports |
 | `ridgeracer7/src/` | The game's machine and the system it calls, one file per part (threads, files, RSX and renderer, sound, films, SPURS, controller, saves) |
 | `host/` | Window and input on SDL3, Vulkan 1.3 through volk, presentation, sound output |
-| `cmake/` | `ffmpeg.cmake`: the parts of libavcodec the game needs |
+| `cmake/` | `ffmpeg.cmake`: the parts of libavcodec the game needs; `toolchain.cmake`: compiler options for speed (processor presets, LTO, PGO) |
 | `tools/` | `build-ridgeracer7.ps1`, `analyse-game.ps1`, `build_shaders.py`; `check/` (decoder and shader checks) |
-| `docs/` | Roadmap and design targets, the program's analysis, the data files, the recompiler's core, the runtime, prior art, naming |
+| `docs/` | Roadmap and design targets, the program's analysis, the data files, the recompiler's core, the runtime, the toolchain, prior art, naming |
 
 ## Versions and changes
 

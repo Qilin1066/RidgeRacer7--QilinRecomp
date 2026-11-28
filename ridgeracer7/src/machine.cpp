@@ -135,9 +135,22 @@ uint64_t system_time() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g_machine->started).count());
 }
 
+#if defined(QILIN_PGO_GENERATE) && defined(__clang__)
+extern "C" int __llvm_profile_write_file(void);
+#elif defined(QILIN_PGO_GENERATE) && defined(__GNUC__)
+extern "C" void __gcov_dump(void);
+#endif
+
 void exit_process(int code) {
     audio_report();
     log("the process ended with code %d", code);
+    // A build counting for profile-guided optimisation (cmake/toolchain.cmake) writes its counts now: _Exit runs no
+    // atexit handler, which is where Clang's and GCC's runtimes would. (MSVC's writes as the process ends.)
+#if defined(QILIN_PGO_GENERATE) && defined(__clang__)
+    if (__llvm_profile_write_file() != 0) log("the profile's counts couldn't be written");
+#elif defined(QILIN_PGO_GENERATE) && defined(__GNUC__)
+    __gcov_dump();
+#endif
     // At once: other threads may be running, and the objects they use must not be torn down under them.
     std::_Exit(code);
 }

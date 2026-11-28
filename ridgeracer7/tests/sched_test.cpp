@@ -38,6 +38,7 @@ thread_local uint32_t thread_id = rr7::kFirstThreadId;
 
 void check(bool ok, const char* what) {
     if (!ok) {
+        std::fflush(stdout);  // (what was measured, printed before the check: _Exit would drop it)
         std::fprintf(stderr, "FAIL: %s\n", what);
         std::_Exit(1);  // (threads may still be waiting)
     }
@@ -494,7 +495,7 @@ void waking() {
         const double ms = static_cast<double>(after.count()) / 1000;
         std::printf("an unrung store after %.0f ms: seen %lld us after it; %.0f yields and %.1f wake-ups a millisecond of waiting\n", ms,
                     static_cast<long long>(seen), static_cast<double>(rr7::host_yields() - yields) / ms, static_cast<double>(quiet.wakeups()) / ms);
-        check(seen < (after.count() < 2000 ? 200 : 3000), "an unrung change is seen soon");
+        check(seen < slack(after.count() < 2000 ? 200 : 3000), "an unrung change is seen soon");
         check(quiet.wakeups() < 30, "an unrung wait parks after its yields");
     }
 

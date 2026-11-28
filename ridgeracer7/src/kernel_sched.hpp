@@ -48,6 +48,8 @@
 #include <immintrin.h>
 #elif defined(_M_ARM64)
 #include <intrin.h>
+#elif defined(__aarch64__)
+#include <arm_acle.h>
 #endif
 
 namespace rr7 {
@@ -183,10 +185,8 @@ private:
 inline void cpu_relax() {
 #if defined(_M_X64) || defined(__x86_64__)
     _mm_pause();
-#elif defined(_M_ARM64)
-    __yield();
-#elif defined(__aarch64__)
-    __asm__ __volatile__("yield");
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    __yield();  // (ACLE's: no inline assembly)
 #endif
 }
 

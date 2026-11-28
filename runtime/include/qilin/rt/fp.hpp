@@ -61,6 +61,8 @@
 #include <xmmintrin.h>  // the float unit's mode (MXCSR)
 #elif defined(_M_ARM64)
 #include <float.h>
+#elif defined(__aarch64__)
+#include <arm_acle.h>  // the float unit's mode (FPCR), by ACLE's intrinsics: no inline assembly
 #endif
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -445,9 +447,7 @@ inline void flush_denormals() {
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_setcsr(_mm_getcsr() | 0x8040u);
 #elif defined(__aarch64__) && !defined(_MSC_VER)
-    uint64_t fpcr;
-    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
-    __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr | (uint64_t{1} << 24)));
+    __arm_wsr64("fpcr", __arm_rsr64("fpcr") | (uint64_t{1} << 24));
 #elif defined(_M_ARM64)
     unsigned int control = 0;
     _controlfp_s(&control, _DN_FLUSH, _MCW_DN);

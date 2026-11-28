@@ -448,8 +448,19 @@ RelaxedCounts run_relaxed() {
     // are what its non-Java mode gives; a denormal operand counts as zero.
     std::thread([&] {
         rt::fp::flush_denormals();
-        const rt::Vec tiny{{0x00400000u, 0x80000001u, 0x00800000u, 0x3f800000u}}, half{{0x3f000000u, 0x3f000000u, 0x3f000000u, 0x00000001u}};
-        const rt::Vec zero{{0, 0, 0, 0}}, small{{0x00c00000u, 0x80c00000u, 0x00800001u, 0x3f800000u}}, normal{{0x00800000u, 0x80800000u, 0x00800000u, 0x3f800000u}};
+        // (Each input through a volatile, read after the flush is set: constants would be folded at compile time, in IEEE
+        // mode, which no flush set at run time reaches. Clang and GCC did so.)
+        const auto unseen = [](rt::Vec v) {
+            rt::Vec r;
+            for (unsigned i = 0; i < 4; ++i) {
+                volatile uint32_t w = v.w[i];
+                r.w[i] = w;
+            }
+            return r;
+        };
+        const rt::Vec tiny = unseen({{0x00400000u, 0x80000001u, 0x00800000u, 0x3f800000u}}), half = unseen({{0x3f000000u, 0x3f000000u, 0x3f000000u, 0x00000001u}});
+        const rt::Vec zero = unseen({{0, 0, 0, 0}}), small = unseen({{0x00c00000u, 0x80c00000u, 0x00800001u, 0x3f800000u}}),
+                      normal = unseen({{0x00800000u, 0x80800000u, 0x00800000u, 0x3f800000u}});
         const std::pair<const char*, std::pair<rt::Vec, rt::Vec>> flushed[] = {
             {"vmaddfp of denormals", {rt::vmx::relaxed::vmaddfp(tiny, half, zero), rt::vmx::exact::vmaddfp(tiny, half, zero)}},
             {"vaddfp of denormals", {rt::vmx::relaxed::vaddfp(tiny, half), rt::vmx::exact::vaddfp(tiny, half)}},

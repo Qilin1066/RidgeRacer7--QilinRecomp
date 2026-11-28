@@ -144,63 +144,90 @@ int main(int argc, char** argv) {
     copy_reference();
 
     size_t disagreements = 0, runs = 0, stores = 0, halts = 0;
+    // Both sides from the same random state.
+    const auto seed = [&](Spu& spu, State& ref, bool is_float) {
+        spu.ls = ls_lifted.data();
+        spu.hooks = &kHooks;
+        ref.ls = ls_reference.data();
+        for (unsigned r = 0; r < 128; ++r)
+            for (unsigned w = 0; w < 4; ++w) {
+                const uint32_t v = is_float ? single_like(rng) : interesting(rng);
+                spu.r[r].w[w] = v;
+                for (unsigned b = 0; b < 4; ++b) ref.r[r][4 * w + b] = static_cast<uint8_t>(v >> (24 - 8 * b));
+            }
+        for (unsigned w = 0; w < 4; ++w) {  // the status register: any bits, mostly round to nearest
+            const uint32_t v = static_cast<uint32_t>(rng()) & (rng() % 4 == 0 ? ~0u : ~0xF00u);
+            spu.fpscr[w] = v;
+            for (unsigned b = 0; b < 4; ++b) ref.fpscr[4 * w + b] = static_cast<uint8_t>(v >> (24 - 8 * b));
+        }
+        g_seen = Seen{};
+    };
+    // Everything the two sides can differ in, each difference to `fail`.
+    const auto compare = [&](const Spu& spu, const State& ref, bool stored, const auto& fail) {
+        for (unsigned r = 0; r < 128; ++r)
+            for (unsigned w = 0; w < 4; ++w) {
+                const uint32_t reference = (uint32_t{ref.r[r][4 * w]} << 24) | (uint32_t{ref.r[r][4 * w + 1]} << 16) | (uint32_t{ref.r[r][4 * w + 2]} << 8) | ref.r[r][4 * w + 3];
+                if (spu.r[r].w[w] != reference) {
+                    char what[32];
+                    std::snprintf(what, sizeof what, "$%u word %u", r, w);
+                    fail(what, spu.r[r].w[w], reference);
+                }
+            }
+        if (g_seen.wrote_channel != ref.wrote_channel || g_seen.channel != ref.channel || g_seen.channel_data != ref.channel_data)
+            fail("a channel's write", (static_cast<unsigned long long>(g_seen.channel) << 32) | g_seen.channel_data, (static_cast<unsigned long long>(ref.channel) << 32) | ref.channel_data);
+        for (unsigned w = 0; w < 4; ++w) {
+            const uint32_t reference = (uint32_t{ref.fpscr[4 * w]} << 24) | (uint32_t{ref.fpscr[4 * w + 1]} << 16) | (uint32_t{ref.fpscr[4 * w + 2]} << 8) | ref.fpscr[4 * w + 3];
+            if (spu.fpscr[w] != reference) fail("the FPSCR", spu.fpscr[w], reference);
+        }
+        if (g_seen.stopped != ref.stopped || g_seen.stop_code != ref.stop_code) fail("a stop", g_seen.stop_code, ref.stop_code);
+        if (g_seen.halted != ref.halted) fail("a halt", g_seen.halted, ref.halted);
+        halts += ref.halted;
+        if (stored) {
+            ++stores;
+            if (!same_stores()) {
+                fail("the local store", 0, ref.stored_at);
+                copy_reference();
+            }
+        }
+    };
     for (size_t k = 0; k < kCaseCount; ++k) {
         const Case& c = kCases[k];
         const qilin::spu::Insn in = qilin::spu::decode(c.word);
         const bool is_float = (qilin::spu::spec(in.op).flags & qilin::spu::kFloat) != 0;
         for (int n = 0; n < (is_float ? 4 * states : states); ++n) {
             Spu spu;
-            spu.ls = ls_lifted.data();
-            spu.hooks = &kHooks;
             State ref{};
-            ref.ls = ls_reference.data();
-            for (unsigned r = 0; r < 128; ++r)
-                for (unsigned w = 0; w < 4; ++w) {
-                    const uint32_t v = is_float ? single_like(rng) : interesting(rng);
-                    spu.r[r].w[w] = v;
-                    for (unsigned b = 0; b < 4; ++b) ref.r[r][4 * w + b] = static_cast<uint8_t>(v >> (24 - 8 * b));
-                }
-            for (unsigned w = 0; w < 4; ++w) {  // the status register: any bits, mostly round to nearest
-                const uint32_t v = static_cast<uint32_t>(rng()) & (rng() % 4 == 0 ? ~0u : ~0xF00u);
-                spu.fpscr[w] = v;
-                for (unsigned b = 0; b < 4; ++b) ref.fpscr[4 * w + b] = static_cast<uint8_t>(v >> (24 - 8 * b));
-            }
-            g_seen = Seen{};
+            seed(spu, ref, is_float);
             c.fn(spu);
             if (!step(ref, in, c.pc)) {
                 std::printf("the reference doesn't know %s (%08x)\n", qilin::spu::disasm(in, c.pc).c_str(), c.word);
                 return 1;
             }
             ++runs;
-            const auto fail = [&](const char* what, unsigned long long lifted, unsigned long long reference) {
+            compare(spu, ref, ref.stored || (qilin::spu::spec(in.op).flags & qilin::spu::kStore), [&](const char* what, unsigned long long lifted, unsigned long long reference) {
                 if (disagreements++ < 20)
                     std::printf("FAIL %08x %s at %05x: %s: lifted %#llx, reference %#llx\n", c.word, qilin::spu::disasm(in, c.pc).c_str(), c.pc, what, lifted, reference);
-            };
-            for (unsigned r = 0; r < 128; ++r)
-                for (unsigned w = 0; w < 4; ++w) {
-                    const uint32_t reference = (uint32_t{ref.r[r][4 * w]} << 24) | (uint32_t{ref.r[r][4 * w + 1]} << 16) | (uint32_t{ref.r[r][4 * w + 2]} << 8) | ref.r[r][4 * w + 3];
-                    if (spu.r[r].w[w] != reference) {
-                        char what[32];
-                        std::snprintf(what, sizeof what, "$%u word %u", r, w);
-                        fail(what, spu.r[r].w[w], reference);
-                    }
-                }
-            if (g_seen.wrote_channel != ref.wrote_channel || g_seen.channel != ref.channel || g_seen.channel_data != ref.channel_data)
-                fail("a channel's write", (static_cast<unsigned long long>(g_seen.channel) << 32) | g_seen.channel_data, (static_cast<unsigned long long>(ref.channel) << 32) | ref.channel_data);
-            for (unsigned w = 0; w < 4; ++w) {
-                const uint32_t reference = (uint32_t{ref.fpscr[4 * w]} << 24) | (uint32_t{ref.fpscr[4 * w + 1]} << 16) | (uint32_t{ref.fpscr[4 * w + 2]} << 8) | ref.fpscr[4 * w + 3];
-                if (spu.fpscr[w] != reference) fail("the FPSCR", spu.fpscr[w], reference);
+            });
+        }
+    }
+    // The programs: whole lifted functions (a loop, branches over code, a call, conditional returns), against the
+    // reference stepping through their words.
+    size_t program_runs = 0;
+    for (size_t k = 0; k < kProgramCount; ++k) {
+        const Program& p = kPrograms[k];
+        for (int n = 0; n < states; ++n) {
+            Spu spu;
+            State ref{};
+            seed(spu, ref, false);
+            p.fn(spu);
+            if (!run_program(ref, p.words, p.count)) {
+                std::printf("the reference can't run program %zu to its end\n", k);
+                return 1;
             }
-            if (g_seen.stopped != ref.stopped || g_seen.stop_code != ref.stop_code) fail("a stop", g_seen.stop_code, ref.stop_code);
-            if (g_seen.halted != ref.halted) fail("a halt", g_seen.halted, ref.halted);
-            halts += ref.halted;
-            if (ref.stored || (qilin::spu::spec(in.op).flags & qilin::spu::kStore)) {
-                ++stores;
-                if (!same_stores()) {
-                    fail("the local store", 0, ref.stored_at);
-                    copy_reference();
-                }
-            }
+            ++program_runs;
+            compare(spu, ref, true, [&](const char* what, unsigned long long lifted, unsigned long long reference) {
+                if (disagreements++ < 20) std::printf("FAIL program %zu (run %d): %s: lifted %#llx, reference %#llx\n", k, n, what, lifted, reference);
+            });
         }
     }
     size_t worst_reciprocal = 0, worst_root = 0;
@@ -214,6 +241,7 @@ int main(int argc, char** argv) {
         std::printf("spu difftest: %zu disagreements\n", disagreements);
         return 1;
     }
-    std::printf("spu difftest: %zu cases, %zu runs, all agree (%zu stores, %zu halts fired)\n", kCaseCount, runs, stores, halts);
+    std::printf("spu difftest: %zu cases, %zu runs, %zu programs, %zu runs of them, all agree (%zu stores, %zu halts fired)\n", kCaseCount, runs, kProgramCount, program_runs,
+                stores, halts);
     return 0;
 }

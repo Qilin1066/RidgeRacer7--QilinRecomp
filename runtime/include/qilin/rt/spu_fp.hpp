@@ -58,7 +58,7 @@
 #include <cstdint>
 #include <utility>
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(QILIN_SPU_PORTABLE)
 #include <immintrin.h>
 #define QILIN_SPU_HOST_SINGLE 1
 #else

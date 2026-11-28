@@ -130,7 +130,7 @@ endforeach()
 # SPU threads and SPURS tasks (spu.cpp) with made-up programs, no game.
 add_executable(ridgeracer7_spu_test ridgeracer7/tests/spu_test.cpp ridgeracer7/src/spu.cpp)
 target_include_directories(ridgeracer7_spu_test PRIVATE recomp/src runtime/include ridgeracer7/src)
-target_link_libraries(ridgeracer7_spu_test PRIVATE qilin_game qilin_warnings Threads::Threads)
+target_link_libraries(ridgeracer7_spu_test PRIVATE qilin_game qilin_host qilin_warnings Threads::Threads)  # (qilin_host: the sound core's thread priority)
 foreach(case tasks group)
     add_test(NAME ridgeracer7_spu_${case} COMMAND ridgeracer7_spu_test ${case})
     set_tests_properties(ridgeracer7_spu_${case} PROPERTIES TIMEOUT 60)

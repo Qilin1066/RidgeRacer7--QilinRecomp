@@ -126,25 +126,53 @@ struct CachedTexture {
     uint64_t bytes = 0;
 };
 
-// A hash of guest bytes (not for security: to see that a texture has changed), in four lanes of eight bytes the CPU can
-// run side by side, so that it goes at about the speed memory is read.
+// A hash of guest bytes (not for security: to see that a texture or surface has changed), in eight lanes of eight bytes
+// the CPU runs side by side, each a multiply and a shift (eight lanes, against four, took it from 12 to 21 GB/s on bytes in
+// the cache; from memory it goes as fast as memory is read either way).
 uint64_t hash_bytes(const uint8_t* p, size_t n) {
     constexpr uint64_t kMul = 0xff51afd7ed558ccdull;
-    uint64_t h[4] = {0x9e3779b97f4a7c15ull ^ n, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull};
+    uint64_t h[8] = {0x9e3779b97f4a7c15ull ^ n, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull,
+                     0x85ebca77c2b2ae63ull, 0x94d049bb133111ebull, 0xbf58476d1ce4e5b9ull, 0x2545f4914f6cdd1dull};
     size_t i = 0;
-    for (; i + 32 <= n; i += 32)
-        for (unsigned k = 0; k < 4; ++k) {
+    for (; i + 64 <= n; i += 64)
+        for (unsigned k = 0; k < 8; ++k) {
             uint64_t w;
             std::memcpy(&w, p + i + 8 * k, 8);
             h[k] = (h[k] ^ w) * kMul;
             h[k] ^= h[k] >> 29;
         }
-    uint64_t out = h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7);
+    uint64_t out = 0;
+    for (const uint64_t lane : h) out = (out ^ lane) * kMul, out ^= out >> 29;
     for (; i < n; ++i) out = (out ^ p[i]) * 0x100000001b3ull;
     return out;
 }
 
 constexpr uint32_t kMostSets = 1024;                   // descriptor sets in a batch
+
+// A texture set's contents: each texture's unit, view and sampler, in the order of the units.
+struct TextureSetKey {
+    uint32_t count = 0;
+    std::array<uint32_t, 16> units{};
+    std::array<VkImageView, 16> views{};
+    std::array<VkSampler, 16> samplers{};
+    bool operator==(const TextureSetKey& o) const {
+        if (count != o.count) return false;
+        for (uint32_t i = 0; i < count; ++i)
+            if (units[i] != o.units[i] || views[i] != o.views[i] || samplers[i] != o.samplers[i]) return false;
+        return true;
+    }
+};
+struct TextureSetHash {
+    size_t operator()(const TextureSetKey& k) const noexcept {
+        uint64_t h = 0x9e3779b97f4a7c15ull ^ k.count;
+        for (uint32_t i = 0; i < k.count; ++i) {
+            h = (h ^ k.units[i]) * 0xff51afd7ed558ccdull;
+            h = (h ^ reinterpret_cast<uintptr_t>(k.views[i])) * 0xff51afd7ed558ccdull;
+            h = (h ^ reinterpret_cast<uintptr_t>(k.samplers[i])) * 0xff51afd7ed558ccdull;
+        }
+        return static_cast<size_t>(h ^ (h >> 32));
+    }
+};
 constexpr uint32_t kBatchesInFlight = 3;               // submitted and not waited for, at most (renderer_flush)
 constexpr VkDeviceSize kArenaBytes = 64u << 20;        // vertices, indices, constants and texels of a batch
 
@@ -209,6 +237,9 @@ struct Renderer {
     VkDeviceSize constants_at = 0;
     uint64_t constants_batch = UINT64_MAX, constants_version = 0;
     uint32_t sets_used = 0;  // texture sets taken from the batch's pool
+    // The batch's texture sets by what they hold: a draw with the textures an earlier draw in the batch had binds that
+    // draw's set again (a set is never written after it is first bound), rather than take and write another.
+    std::unordered_map<TextureSetKey, VkDescriptorSet, TextureSetHash> texture_sets;
     // Set 0, the constant blocks: one a batch, on its arena, each draw's blocks found by dynamic offsets (begin_batch).
     VkDescriptorSet constants_set = VK_NULL_HANDLE;
     VkDeviceSize fragment_range = 16;  // binding 1's range: the most inline constants any translated program has
@@ -218,10 +249,7 @@ struct Renderer {
         VkPipeline pipeline = VK_NULL_HANDLE;
         std::array<uint32_t, 2> constant_offsets{UINT32_MAX, UINT32_MAX};
         VkDescriptorSet textures = VK_NULL_HANDLE;
-        uint32_t texture_count = 0;
-        std::array<uint32_t, 16> units{};
-        std::array<VkImageView, 16> views{};
-        std::array<VkSampler, 16> samplers{};
+        TextureSetKey textures_held;  // what it holds
         bool have_viewport = false;
         VkViewport viewport{};
         VkRect2D scissor{};
@@ -525,49 +553,46 @@ uint32_t surface_copies(const SurfaceEntry& s, VkBufferImageCopy (&copies)[2]) {
 }
 
 // A Z24S8 surface's words to the staging buffer's two aspects (render_formats.hpp: depth_to_host), and back.
-void depth_from_guest(const SurfaceEntry& s) {
+// (Returns the surface's surface_hash, each row hashed as it is read.)
+uint64_t depth_from_guest(const SurfaceEntry& s) {
     const bool unorm = g_renderer->depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
     const size_t texels = size_t{s.desc.width} * s.desc.height;
     uint32_t* depth = static_cast<uint32_t*>(s.staging.mapped);
     uint8_t* stencil = static_cast<uint8_t*>(s.staging.mapped) + texels * 4;
+    uint64_t h = kSurfaceHashStart;
     for (uint32_t y = 0; y < s.desc.height; ++y) {
         const uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
-        for (uint32_t x = 0; x < s.desc.width; ++x) {
-            uint32_t w;
-            std::memcpy(&w, row + 4 * x, 4);
-            w = std::byteswap(w);
-            const size_t i = size_t{y} * s.desc.width + x;
-            depth[i] = depth_to_host(w >> 8, unorm);
-            stencil[i] = static_cast<uint8_t>(w);
-        }
+        h = add_row(h, row, s.desc.width);
+        const size_t i = size_t{y} * s.desc.width;
+        depth_row_to_host(row, depth + i, stencil + i, s.desc.width, unorm);
     }
+    return h;
 }
 // The staging buffer's pixels drawn since the last write-back (the dirty rectangle) to guest memory, which is then
-// clean; returns the surface's surface_hash.
+// clean; returns the surface's surface_hash, each row hashed as it is written (while it is in the cache).
 uint64_t surface_to_guest(SurfaceEntry& s) {
     if (!s.dirty()) return surface_hash(s.desc);
     const uint32_t x0 = s.dirty_x0, x1 = s.dirty_x1, y0 = s.dirty_y0, y1 = s.dirty_y1;
     s.clean();
-    if (!s.depth) {
-        for (uint32_t y = y0; y < y1; ++y) {
-            uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
-            pixels_to_guest(s.desc.format, static_cast<const uint8_t*>(s.staging.mapped) + (size_t{y} * s.desc.width + x0) * 4, row + size_t{x0} * 4, x1 - x0);
-        }
-        return surface_hash(s.desc);
-    }
     const bool unorm = g_renderer->depth_format == VK_FORMAT_D24_UNORM_S8_UINT;
     const size_t texels = size_t{s.desc.width} * s.desc.height;
+    const uint8_t* staging = static_cast<const uint8_t*>(s.staging.mapped);
     const uint32_t* depth = static_cast<const uint32_t*>(s.staging.mapped);
-    const uint8_t* stencil = static_cast<const uint8_t*>(s.staging.mapped) + texels * 4;
-    for (uint32_t y = y0; y < y1; ++y) {
+    const uint8_t* stencil = staging + texels * 4;
+    uint64_t h = kSurfaceHashStart;
+    for (uint32_t y = 0; y < s.desc.height; ++y) {
         uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
-        for (uint32_t x = x0; x < x1; ++x) {
-            const size_t i = size_t{y} * s.desc.width + x;
-            const uint32_t w = std::byteswap((depth_to_guest(depth[i], unorm) << 8) | stencil[i]);
-            std::memcpy(row + 4 * x, &w, 4);
+        if (y >= y0 && y < y1) {
+            if (!s.depth) {
+                pixels_to_guest(s.desc.format, staging + (size_t{y} * s.desc.width + x0) * 4, row + size_t{x0} * 4, x1 - x0);
+            } else {
+                const size_t i = size_t{y} * s.desc.width + x0;
+                depth_row_to_guest(depth + i, stencil + i, row + size_t{x0} * 4, x1 - x0, unorm);
+            }
         }
+        h = add_row(h, row, s.desc.width);
     }
-    return surface_hash(s.desc);
+    return h;
 }
 
 // Writes back the pending surfaces on guest pages [from, to), and every pending surface sharing a page with one of those
@@ -658,11 +683,17 @@ void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s, bool discard) {
     // (Its staging buffer is written here: a batch still in flight that read it is waited for.)
     finish_batch_numbered(*g_renderer, s.staging_batch);
     s.staging_batch = g_renderer->flushes;
+    // (The image now holds guest memory as it is hashed here: the hash it is known by until a draw writes it.)
     if (s.depth) {
-        depth_from_guest(s);
+        s.written_hash = depth_from_guest(s);
     } else {
-        for (uint32_t y = 0; y < s.desc.height; ++y)
-            pixels_to_host(s.desc.format, guest_memory() + s.desc.address + size_t{y} * s.desc.pitch, static_cast<uint8_t*>(s.staging.mapped) + size_t{y} * s.desc.width * 4, s.desc.width);
+        uint64_t h = kSurfaceHashStart;
+        for (uint32_t y = 0; y < s.desc.height; ++y) {
+            const uint8_t* row = guest_memory() + s.desc.address + size_t{y} * s.desc.pitch;
+            pixels_to_host(s.desc.format, row, static_cast<uint8_t*>(s.staging.mapped) + size_t{y} * s.desc.width * 4, s.desc.width);
+            h = add_row(h, row, s.desc.width);
+        }
+        s.written_hash = h;
     }
     if (!s.coherent) {
         const VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s.staging.memory, 0, VK_WHOLE_SIZE};
@@ -836,6 +867,7 @@ void begin_batch(Renderer& r) {
     host::check(vkResetDescriptorPool(r.gpu->device, b.descriptors, 0), "vkResetDescriptorPool");
     r.cmd = b.cmd, r.fence = b.fence, r.descriptors = b.descriptors, r.arena = b.arena, r.timestamps = b.timestamps;
     r.sets_used = 0, r.arena_used = 0;
+    r.texture_sets.clear();
     r.bound = {};
     VkDescriptorSetAllocateInfo ds{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ds.descriptorPool = r.descriptors, ds.descriptorSetCount = 1, ds.pSetLayouts = &r.sets[0];
@@ -936,9 +968,9 @@ void renderer_flush(const char* why) {
     if (lazy) t_holding_pending = false, pending_lock.unlock();
     for (SurfaceEntry* s : r.touched) {
         if (!s->touched) continue;
-        // Unchanged by the batch: the image still holds what guest memory does (or will, once written back). (Read
-        // without the lock: only a flush, on this thread, makes a surface pending.)
-        if (!s->pending) s->written_hash = surface_hash(s->desc);
+        // Unchanged by the batch: the image holds what guest memory did when the batch first used it, which written_hash
+        // is the hash of (surface_from_guest), or what it will once written back (pending). Not hashed again: guest memory
+        // changed since then is uploaded again at the next use, as it should be.
         s->resident = true;
         s->touched = false;
     }
@@ -1339,26 +1371,30 @@ void renderer_draw(const Draw& d) {
         }
     }
     // Set 1, the textures: the set bound already if it holds the same images and samplers at the same units (new texels
-    // in the same image are ordered by its upload's barriers), else one of the batch's own.
+    // in the same image are ordered by its upload's barriers), else the batch's set that holds them, else a new one.
     Renderer::Bound& bound = r.bound;
-    bool same_textures = !uploads.empty() && bound.textures && bound.texture_count == uploads.size();
-    for (size_t i = 0; same_textures && i < uploads.size(); ++i)
-        same_textures = bound.units[i] == uploads[i].unit && bound.views[i] == images[i].imageView && bound.samplers[i] == images[i].sampler;
+    TextureSetKey wanted;
+    wanted.count = static_cast<uint32_t>(uploads.size());
+    for (size_t i = 0; i < uploads.size(); ++i) wanted.units[i] = uploads[i].unit, wanted.views[i] = images[i].imageView, wanted.samplers[i] = images[i].sampler;
+    const bool same_textures = !uploads.empty() && bound.textures && bound.textures_held == wanted;
     VkDescriptorSet set1 = VK_NULL_HANDLE;
     if (!uploads.empty() && !same_textures) {
-        VkDescriptorSetAllocateInfo ds{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ds.descriptorPool = r.descriptors, ds.descriptorSetCount = 1, ds.pSetLayouts = &r.sets[1];
-        host::check(vkAllocateDescriptorSets(gpu.device, &ds, &set1), "vkAllocateDescriptorSets");
-        ++r.sets_used;
-        std::array<VkWriteDescriptorSet, 16> texture_writes{};
-        for (size_t i = 0; i < uploads.size(); ++i) {
-            texture_writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            texture_writes[i].dstSet = set1, texture_writes[i].dstBinding = uploads[i].unit, texture_writes[i].descriptorCount = 1;
-            texture_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_writes[i].pImageInfo = &images[i];
-            bound.units[i] = uploads[i].unit, bound.views[i] = images[i].imageView, bound.samplers[i] = images[i].sampler;
+        VkDescriptorSet& held = r.texture_sets[wanted];
+        if (!held) {
+            VkDescriptorSetAllocateInfo ds{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ds.descriptorPool = r.descriptors, ds.descriptorSetCount = 1, ds.pSetLayouts = &r.sets[1];
+            host::check(vkAllocateDescriptorSets(gpu.device, &ds, &held), "vkAllocateDescriptorSets");
+            ++r.sets_used;
+            std::array<VkWriteDescriptorSet, 16> texture_writes{};
+            for (size_t i = 0; i < uploads.size(); ++i) {
+                texture_writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                texture_writes[i].dstSet = held, texture_writes[i].dstBinding = uploads[i].unit, texture_writes[i].descriptorCount = 1;
+                texture_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_writes[i].pImageInfo = &images[i];
+            }
+            vkUpdateDescriptorSets(gpu.device, static_cast<uint32_t>(uploads.size()), texture_writes.data(), 0, nullptr);
         }
-        vkUpdateDescriptorSets(gpu.device, static_cast<uint32_t>(uploads.size()), texture_writes.data(), 0, nullptr);
-        bound.texture_count = static_cast<uint32_t>(uploads.size());
+        set1 = held;
+        bound.textures_held = wanted;
     }
     // The surfaces from guest memory, as the batch begins with them, and a rendering instance on them.
     open_rendering(r, &target, depth, false, false);

@@ -21,6 +21,7 @@
 #include <utility>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -184,17 +185,10 @@ int main(int argc, char** argv) {
     // test run disturbs nobody at the computer. Its dialogs must be answered by RR7_ANSWER.
     const bool quiet = std::getenv("RR7_QUIET") != nullptr;
     if (quiet && !std::getenv("RR7_ANSWER")) fatal("RR7_QUIET needs RR7_ANSWER: with no window, nobody can answer the system's dialogs");
-    // The game's sound, to the host's output: opened when the first of it comes.
-    if (quiet) {
-        rr7::set_audio_sink([](const int16_t*, size_t) {});
-    } else {
-        rr7::set_audio_sink([](const int16_t* left_right, size_t frames) {
-            static qilin::host::AudioOut out;
-            // Held while the settings menu pauses the game (pause.hpp): the game's sound ports aren't read on.
-            rr7::hold_while_paused(rr7::HoldPoint::sound);
-            out.push(left_right, frames, 48000);
-        });
-    }
+    // The game's sound, to the host's output (none headless): opened by the mixer's thread when the game starts its sound
+    // library. The mixer paces itself by it and is held there while the settings menu pauses the game (audio.cpp).
+    if (quiet) rr7::set_audio_output(nullptr);
+    else rr7::set_audio_output([] { return std::make_unique<qilin::host::AudioOut>(48000); });
     // The window, on this thread (the window system wants its events here); the game on a thread of its own.
     namespace host = qilin::host;
     host::Display::Options o;

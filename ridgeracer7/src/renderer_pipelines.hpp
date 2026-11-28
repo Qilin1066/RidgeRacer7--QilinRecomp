@@ -56,6 +56,8 @@ private:
     VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
     std::unordered_map<const qilin::rt::TranslatedShader*, std::array<VkShaderModule, 4>> modules_;  // by program, then its form
     std::unordered_map<Key, VkPipeline, WordsHash> pipelines_;
+    Key last_key_{};                              // the last draw's key,
+    VkPipeline last_pipeline_ = VK_NULL_HANDLE;   // and its pipeline
     std::unordered_map<std::array<uint32_t, 12>, VkSampler, WordsHash> samplers_;  // by the fields they're made from
 };
 

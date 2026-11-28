@@ -62,11 +62,12 @@ void digest_value(const T& v) {
 
 // ---- Vulkan, stubbed ----
 
-uintptr_t g_next_handle = 0x10000;
+// Handles counted by type, so that one kind made more or less often (descriptor sets) leaves the others' numbers alone.
 template <class H>
 H fake_handle() {
-    g_next_handle += 16;
-    return reinterpret_cast<H>(g_next_handle);
+    static uintptr_t next = 0x10000;
+    next += 16;
+    return reinterpret_cast<H>(next);
 }
 // A buffer: its size, and where its memory is once bound.
 struct FakeBuffer {
@@ -89,14 +90,31 @@ struct Bound {
     const uint8_t* indices = nullptr;
     std::array<uint32_t, 2> constant_offsets{};
     const uint8_t* arena = nullptr;  // the buffer set 0 points into (the batch's arena)
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorSet textures = VK_NULL_HANDLE;
+    VkRect2D scissor{};
+    VkViewport viewport{};
+    std::array<uint8_t, 64> push{};
 } g_bound;
+// What each texture set holds: (binding, view, sampler) for each texture written to it.
+struct SetTexture {
+    uint32_t binding;
+    VkImageView view;
+    VkSampler sampler;
+};
+std::unordered_map<VkDescriptorSet, std::vector<SetTexture>> g_sets;
 std::unordered_map<VkBuffer, FakeBuffer*> g_buffers;
 uint32_t g_vertex_bindings_first = 0, g_vertex_bindings_count = 0;
 uint32_t g_attributes = 0;  // the bound pipeline's attributes (bit a for attribute a), from its creation
 std::unordered_map<VkPipeline, uint32_t> g_pipeline_attributes;
 uint64_t g_vk_draws = 0;
 
+// What a draw sees: its pipeline, textures, window, push constants, vertices and constants.
 void digest_draw(uint32_t vertices) {
+    if (!g_digesting) return;
+    digest_value(g_bound.pipeline), digest_value(g_bound.scissor), digest_value(g_bound.viewport), digest(g_bound.push.data(), g_bound.push.size());
+    if (g_bound.textures)
+        for (const SetTexture& t : g_sets.at(g_bound.textures)) digest_value(t.binding), digest_value(t.view), digest_value(t.sampler);
     for (uint32_t a = 0; a < 16; ++a)
         if ((g_attributes >> a) & 1) {
             const uint32_t binding = a - g_vertex_bindings_first;
@@ -177,7 +195,7 @@ void stub_vulkan() {
         return VK_SUCCESS;
     };
     vkAllocateDescriptorSets = [](VkDevice, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* out) {
-        for (uint32_t i = 0; i < info->descriptorSetCount; ++i) out[i] = fake_handle<VkDescriptorSet>();
+        for (uint32_t i = 0; i < info->descriptorSetCount; ++i) out[i] = fake_handle<VkDescriptorSet>(), g_sets[out[i]].clear();
         return VK_SUCCESS;
     };
     vkUpdateDescriptorSets = [](VkDevice, uint32_t count, const VkWriteDescriptorSet* writes, uint32_t, const VkCopyDescriptorSet*) {
@@ -186,7 +204,7 @@ void stub_vulkan() {
                 g_bound.arena = g_buffers.at(writes[i].pBufferInfo->buffer)->memory;
                 continue;
             }
-            digest_value(writes[i].dstBinding);
+            g_sets[writes[i].dstSet].push_back({writes[i].dstBinding, writes[i].pImageInfo->imageView, writes[i].pImageInfo->sampler});
         }
     };
     vkCreateFence = [](VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence* out) { return *out = fake_handle<VkFence>(), VK_SUCCESS; };
@@ -218,22 +236,23 @@ void stub_vulkan() {
     NOP(vkCmdEndRendering);
     NOP(vkCmdCopyImage);
     NOP(vkCmdCopyImageToBuffer);
-    NOP(vkCmdSetViewport);
+    vkCmdSetViewport = [](VkCommandBuffer, uint32_t, uint32_t, const VkViewport* v) { g_bound.viewport = *v; };
     vkCmdClearAttachments = [](VkCommandBuffer, uint32_t count, const VkClearAttachment* clears, uint32_t, const VkClearRect* rects) {
         for (uint32_t i = 0; i < count; ++i) digest_value(clears[i]);
         digest_value(rects[0]);
     };
-    vkCmdSetScissor = [](VkCommandBuffer, uint32_t, uint32_t, const VkRect2D* r) { digest_value(*r); };
-    vkCmdPushConstants = [](VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* data) {
-        digest_value(stages), digest_value(offset), digest(data, size);
+    vkCmdSetScissor = [](VkCommandBuffer, uint32_t, uint32_t, const VkRect2D* r) { g_bound.scissor = *r; };
+    vkCmdPushConstants = [](VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, uint32_t offset, uint32_t size, const void* data) {
+        std::memcpy(g_bound.push.data() + offset, data, size);
     };
     vkCmdBindPipeline = [](VkCommandBuffer, VkPipelineBindPoint, VkPipeline p) {
-        digest_value(p);
+        g_bound.pipeline = p;
         g_attributes = g_pipeline_attributes.at(p);
     };
-    vkCmdBindDescriptorSets = [](VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t first, uint32_t, const VkDescriptorSet*, uint32_t dynamic_count,
+    vkCmdBindDescriptorSets = [](VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t first, uint32_t, const VkDescriptorSet* sets, uint32_t dynamic_count,
                                  const uint32_t* dynamic) {
         if (first == 0 && dynamic_count == 2) g_bound.constant_offsets = {dynamic[0], dynamic[1]};
+        if (first == 1) g_bound.textures = sets[0];
     };
     vkCmdBindVertexBuffers = [](VkCommandBuffer, uint32_t first, uint32_t count, const VkBuffer* buffers, const VkDeviceSize* offsets) {
         g_vertex_bindings_first = first, g_vertex_bindings_count = count;
@@ -247,6 +266,7 @@ void stub_vulkan() {
     };
     vkCmdDrawIndexed = [](VkCommandBuffer, uint32_t indices, uint32_t, uint32_t, int32_t, uint32_t) {
         ++g_vk_draws;
+        if (!g_digesting) return;
         digest_value(indices);
         const auto* list = reinterpret_cast<const uint32_t*>(g_bound.indices);
         digest(list, size_t{indices} * 4);

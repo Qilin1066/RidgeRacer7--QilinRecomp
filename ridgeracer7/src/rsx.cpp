@@ -421,12 +421,15 @@ void serve() {
     bool after_transfer = false;  // the last command was a jump, call or return
     std::chrono::steady_clock::time_point idle_since{};
     bool idle_flushed = false;
+    uint32_t put = r.get;  // as last read: read again only once get has reached it
     for (;;) {
-        const uint32_t put = load32(control);
-        // (The commands before put were written before it moved: the game's own fence orders that, and this one keeps
-        // this thread's reads of them after its read of put.)
-        std::atomic_thread_fence(std::memory_order_acquire);
-        g_put = put;
+        if (r.get == put) {
+            put = load32(control);
+            // (The commands before put were written before it moved: the game's own fence orders that, and this one keeps
+            // this thread's reads of them after its read of put.)
+            std::atomic_thread_fence(std::memory_order_acquire);
+            g_put = put;
+        }
         if (r.get == put) {
             // Out of commands for 2 ms: what was drawn goes to guest memory. (Not at once: the game often runs the RSX dry
             // mid-frame while it writes the rest, and a flush writes every surface drawn back. A game can only rely on drawn

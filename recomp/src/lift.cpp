@@ -6,6 +6,7 @@
 #include <format>
 #include <map>
 #include <set>
+#include <unordered_map>
 
 namespace qilin {
 
@@ -103,6 +104,26 @@ bool in_slice(const Insn& in, std::string* why) {
 
 namespace {
 
+using Slots = std::bitset<kRegisterSlots>;
+
+// ---- what a callee reads and writes (register_effects) ----
+// Each function's own part, read off its lifted text as the lifter's dataflow reads it (assigned and used below): per
+// instruction, its pieces of text in order, each with what it reads and assigns, and its direct calls (and tail calls);
+// and whether anything in it reaches everything (a call through a register, a system call, a hook, a throw, a landing
+// pad). A call to a function gives its effects at that point; a return and a trap give nothing.
+struct FactEvent {
+    Slots uses, defs;
+    bool call = false;
+    uint32_t callee = 0;
+};
+struct FunctionFacts {
+    uint32_t start = 0;
+    bool everything = false;
+    std::vector<std::vector<FactEvent>> events;
+    std::vector<std::vector<size_t>> succ;
+    std::vector<uint32_t> callees;
+};
+
 class Emitter {
 public:
     explicit Emitter(const LiftInput& f) : f_(f) {
@@ -112,61 +133,7 @@ public:
 
     Lifted run() {
         Lifted out;
-        for (const auto& [a, in] : f_.insns) {
-            std::string why;
-            if (!in_slice(in, &why)) {
-                out.why = why;
-                out.why_at = a;
-                return out;
-            }
-        }
-        // Labels: every branch target inside the function, every switch target, every landing pad.
-        for (const auto& [a, in] : f_.insns) {
-            if ((in.op == Op::b || in.op == Op::bc) && !in.lk()) {
-                const uint32_t t = in.branch_target(a);
-                if (present_.contains(t)) labels_.insert(t);
-            }
-            if (const auto it = tables_.find(a); it != tables_.end())
-                for (const uint32_t t : it->second->targets) labels_.insert(t);
-        }
-        for (const uint32_t pad : f_.landing_pads) {
-            if (!present_.contains(pad)) {
-                out.why = std::format("a landing pad at {:08X} that the function doesn't reach", pad);
-                out.why_at = pad;
-                return out;
-            }
-            labels_.insert(pad);
-        }
-        // Each instruction's text, with placeholders for what the dataflow below decides: the registers written back
-        // and read again at each sync site (@S n@, @L n@), each condition-register bit read (@B..@), and each
-        // compare's saved operands (@K..@).
-        text_.resize(f_.insns.size());
-        defs_.assign(f_.insns.size(), {});
-        for (size_t k = 0; k < f_.insns.size(); ++k) {
-            const auto& [a, in] = f_.insns[k];
-            k_ = k;
-            std::string line;
-            if (!insn(a, in, line)) {
-                out.why = error_;
-                out.why_at = a;
-                return out;
-            }
-            if (f_.keep_pc && (line.find("read") != std::string::npos || line.find("write") != std::string::npos))
-                line = std::format("    c.pc = 0x{:08X}u;{}\n", a, f_.keep_registers ? " " + site(Site::kFlush) : std::string()) + line;
-            const bool last = k + 1 == f_.insns.size();
-            const uint32_t next = last ? 0 : f_.insns[k + 1].first;
-            if (!terminator(in) && !tables_.contains(a) && (last || next != a + 4)) {
-                // Execution continues past this instruction into code that isn't the next one we have.
-                if (f_.falls_into == a + 4) {
-                    line += std::format("    {} {}(c); return;\n", site(Site::kLeave), fn_name(a + 4));
-                } else {
-                    out.why = std::format("execution runs on to {:08X}", a + 4);
-                    out.why_at = a;
-                    return out;
-                }
-            }
-            text_[k] = std::move(line);
-        }
+        if (!prepare(out)) return out;
         if (!flow()) {
             out.why = error_;
             out.why_at = f_.start;
@@ -182,10 +149,106 @@ public:
         out.ok = true;
         out.catches = !f_.landing_pads.empty();
         out.eh_returns = eh_returns_;
+        out.narrowed = narrowed_;
         return out;
     }
 
+    // What the function itself does to the registers, for register_effects: false if it doesn't lift.
+    bool facts(FunctionFacts& out) {
+        Lifted unused;
+        if (!prepare(unused) || !cut()) return false;
+        out.start = f_.start;
+        out.everything = !f_.landing_pads.empty();  // (a pad's body reads every register from the Cpu)
+        out.succ = succ_;
+        out.events.resize(events_.size());
+        Locals mentioned;
+        for (size_t k = 0; k < events_.size(); ++k)
+            for (const Event& e : events_[k]) {
+                FactEvent fe;
+                if (e.site < 0) {
+                    fe.uses = e.uses;
+                    fe.defs = e.defs;
+                    mentioned |= e.uses | e.defs;
+                } else {
+                    if (e.reload) continue;
+                    const Site& site = sites_[static_cast<size_t>(e.site)];
+                    if (site.reach == Site::kAll && site.kind != Site::kFlush) out.everything = true;
+                    if (site.reach != Site::kDirect) continue;
+                    fe.call = true;
+                    fe.callee = site.callee;
+                    out.callees.push_back(site.callee);
+                }
+                out.events[k].push_back(fe);
+            }
+        // Every local the function declares must be one its text was seen to read or write: else the reading of the
+        // text above has missed something, and the function is taken to read and write everything.
+        if ((declared() & ~mentioned).any()) out.everything = true;
+        std::ranges::sort(out.callees);
+        out.callees.erase(std::ranges::unique(out.callees).begin(), out.callees.end());
+        return true;
+    }
+
 private:
+    // The function's text, with placeholders: false (and why in `out`) if it isn't lifted.
+    bool prepare(Lifted& out) {
+        for (const auto& [a, in] : f_.insns) {
+            std::string why;
+            if (!in_slice(in, &why)) {
+                out.why = why;
+                out.why_at = a;
+                return false;
+            }
+        }
+        // Labels: every branch target inside the function, every switch target, every landing pad.
+        for (const auto& [a, in] : f_.insns) {
+            if ((in.op == Op::b || in.op == Op::bc) && !in.lk()) {
+                const uint32_t t = in.branch_target(a);
+                if (present_.contains(t)) labels_.insert(t);
+            }
+            if (const auto it = tables_.find(a); it != tables_.end())
+                for (const uint32_t t : it->second->targets) labels_.insert(t);
+        }
+        for (const uint32_t pad : f_.landing_pads) {
+            if (!present_.contains(pad)) {
+                out.why = std::format("a landing pad at {:08X} that the function doesn't reach", pad);
+                out.why_at = pad;
+                return false;
+            }
+            labels_.insert(pad);
+        }
+        // Each instruction's text, with placeholders for what the dataflow below decides: the registers written back
+        // and read again at each sync site (@S n@, @L n@), each condition-register bit read (@B..@), and each
+        // compare's saved operands (@K..@).
+        text_.resize(f_.insns.size());
+        defs_.assign(f_.insns.size(), {});
+        for (size_t k = 0; k < f_.insns.size(); ++k) {
+            const auto& [a, in] = f_.insns[k];
+            k_ = k;
+            std::string line;
+            if (!insn(a, in, line)) {
+                out.why = error_;
+                out.why_at = a;
+                return false;
+            }
+            if (f_.keep_pc && (line.find("read") != std::string::npos || line.find("write") != std::string::npos))
+                line = std::format("    c.pc = 0x{:08X}u;{}\n", a, f_.keep_registers ? " " + site(Site::kFlush) : std::string()) + line;
+            const bool last = k + 1 == f_.insns.size();
+            const uint32_t next = last ? 0 : f_.insns[k + 1].first;
+            if (!terminator(in) && !tables_.contains(a) && (last || next != a + 4)) {
+                // Execution continues past this instruction into code that isn't the next one we have.
+                if (f_.falls_into == a + 4) {
+                    line += std::format("    {} {}(c); return;\n", site(Site::kLeave, Site::kDirect, a + 4), fn_name(a + 4));
+                } else {
+                    out.why = std::format("execution runs on to {:08X}", a + 4);
+                    out.why_at = a;
+                    return false;
+                }
+            }
+            text_[k] = std::move(line);
+        }
+        return true;
+    }
+
     // A function with landing pads: the guest's unwinder "returns" into one of them from further down the stack (the
     // eh_return epilogue below throws GuestUnwind). The function is lifted twice: `fn_X_start` entered at its start,
     // as any function is, and `fn_X_pad`, which reads the registers and goes to a pad through a switch at its top, so
@@ -287,11 +350,16 @@ private:
             kCallIf,  // a call that may not happen
             kFlush,   // written back, and the function goes on (--registers: before each memory access)
         } kind;
+        // What runs there: nothing of the guest's (a return; a trap, which doesn't come back), a lifted function by its
+        // address, or anything at all (a call through a register, a system call, a hook, a throw).
+        enum Reach : uint8_t { kNothing, kDirect, kAll } reach = kAll;
+        uint32_t callee = 0;
     };
     // What each condition-register bit's reaching definitions are, as the dataflow carries them.
     enum Fold : uint8_t { kUnreached, kOpaque, kSigned, kUnsigned, kFloat, kBool };
     static constexpr unsigned kFprAt = 32, kVrAt = 64, kCrAt = 96, kLrAt = 104, kCtrAt = 105, kSoAt = 106, kOvAt = 107, kCaAt = 108, kLocals = 109;
     using Locals = std::bitset<kLocals>;
+    static_assert(kLocals == kRegisterSlots, "lift.hpp's RegisterEffects number the locals as the dataflow does");
     struct Save {
         Fold kind;        // kSigned, kUnsigned, kFloat (a field's bits) or kBool (one bit)
         unsigned target;  // the field, or for kBool the bit
@@ -300,13 +368,14 @@ private:
     };
 
     // A sync site's placeholder (its write-back).
-    std::string site(Site::Kind kind) {
-        sites_.push_back({kind});
+    std::string site(Site::Kind kind, Site::Reach reach = Site::kAll, uint32_t callee = 0) {
+        sites_.push_back({kind, reach, callee});
         return std::format("@S{}@", sites_.size() - 1);
     }
-    // A call's sync site: the write-back before it and what is read again after it.
-    std::pair<std::string, std::string> call_site(bool conditional) {
-        std::string out = site(conditional ? Site::kCallIf : Site::kCall);
+    // A call's sync site: the write-back before it and what is read again after it. `callee` is the lifted function
+    // called, or 0 for anything else (a call through a register, a system call, a hook).
+    std::pair<std::string, std::string> call_site(bool conditional, uint32_t callee = 0) {
+        std::string out = site(conditional ? Site::kCallIf : Site::kCall, callee ? Site::kDirect : Site::kAll, callee);
         return {std::move(out), std::format("@L{}@", sites_.size() - 1)};
     }
     // Notes the current instruction's definition of condition-register bits, of a kind a later read can fold; the
@@ -390,6 +459,54 @@ private:
         return out;
     }
 
+    // The locals a piece of lifted text reads: every name of one that isn't the target of a plain assignment (`x = `)
+    // or the carry's out-parameter (`, ca)`); in the placeholders, the bit reads' fields and what the compares read.
+    Locals used(std::string_view s) const {
+        Locals out;
+        const auto word = [](char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'; };
+        for (size_t i = 0; i < s.size();) {
+            if (s[i] == '@') {
+                const size_t end = s.find('@', i + 1);
+                if (end == std::string_view::npos) break;
+                const std::string body(s.substr(i + 2, end - i - 2));
+                switch (s[i + 1]) {
+                case 'T': case 'V': out.set(kCrAt + std::stoul(body.substr(body.find('.') + 1)) / 4); break;
+                case 'F': out |= used(saves_[std::stoul(body.substr(0, body.find('.')))].field); break;
+                case 'K': {
+                    const Save& v = saves_[std::stoul(body)];
+                    out |= used(v.a) | used(v.b);
+                    break;
+                }
+                default: break;
+                }
+                i = end + 1;
+                continue;
+            }
+            if (s[i] == '"') {  // a string (a trap's message)
+                const size_t end = s.find('"', i + 1);
+                i = end == std::string_view::npos ? s.size() : end + 1;
+                continue;
+            }
+            if (s.substr(i, 2) == "//") break;  // a comment, to the end of the line
+            if (!word(s[i])) {
+                ++i;
+                continue;
+            }
+            const size_t start = i;
+            while (i < s.size() && word(s[i])) ++i;
+            if ((start > 0 && (s[start - 1] == '.' || s[start - 1] == ':' || (s[start - 1] == '>' && start > 1 && s[start - 2] == '-'))) || (s[start] >= '0' && s[start] <= '9'))
+                continue;
+            const int n = local_index(s.substr(start, i - start));
+            if (n < 0) continue;
+            size_t j = i;
+            while (j < s.size() && s[j] == ' ') ++j;
+            const bool plain = j < s.size() && s[j] == '=' && (j + 1 >= s.size() || s[j + 1] != '=');
+            const bool out_parameter = n == static_cast<int>(kCaAt) && j < s.size() && s[j] == ')';  // (add_carry's and sraw's last: assigned())
+            if (!plain && !out_parameter) out.set(static_cast<size_t>(n));
+        }
+        return out;
+    }
+
     // The function's locals.
     Locals declared() const {
         Locals d;
@@ -405,17 +522,18 @@ private:
 
     static Fold join(Fold x, Fold y) { return x == kUnreached ? y : y == kUnreached ? x : x == y ? x : kOpaque; }
 
-    bool flow() {
+    size_t index(uint32_t a) const {
+        return static_cast<size_t>(std::ranges::lower_bound(f_.insns, a, {}, &std::pair<uint32_t, Insn>::first) - f_.insns.begin());
+    }
+    // Successors, and each instruction's text cut at its sync sites (what each piece reads and assigns).
+    bool cut() {
         const size_t n = f_.insns.size();
-        const auto index = [&](uint32_t a) {
-            return static_cast<size_t>(std::ranges::lower_bound(f_.insns, a, {}, &std::pair<uint32_t, Insn>::first) - f_.insns.begin());
-        };
-        // Successors, and each instruction's text cut at its sync sites.
-        std::vector<std::vector<size_t>> succ(n);
+        std::vector<std::vector<size_t>>& succ = succ_;
+        succ.assign(n, {});
         std::vector<std::vector<Event>>& events = events_;
         events.assign(n, {});
-        std::vector<Locals> assigns(n);
-        std::vector<bool> reloads(n);
+        std::vector<Locals>& assigns = assigns_;
+        assigns.assign(n, {});
         for (size_t k = 0; k < n; ++k) {
             const auto& [a, in] = f_.insns[k];
             if (const auto it = tables_.find(a); it != tables_.end()) {
@@ -433,16 +551,56 @@ private:
                     return false;
                 }
                 if (t[p + 1] == 'S' || t[p + 1] == 'L') {
-                    events[k].push_back({-1, assigned(t.substr(from, p - from))});
-                    if (t[p + 1] == 'S') events[k].push_back({std::stoi(std::string(t.substr(p + 2, end - p - 2))), {}});
-                    else reloads[k] = true;
+                    events[k].push_back({-1, assigned(t.substr(from, p - from)), used(t.substr(from, p - from))});
+                    events[k].push_back({std::stoi(std::string(t.substr(p + 2, end - p - 2))), {}, {}, t[p + 1] == 'L'});
                     from = end + 1;
                 }
                 p = end + 1;
             }
-            events[k].push_back({-1, assigned(t.substr(from))});
+            events[k].push_back({-1, assigned(t.substr(from)), used(t.substr(from))});
             assigns[k] = assigned(t);
         }
+        return true;
+    }
+
+    // The callee's effects at a call site, where they are known (register_effects): what is written back before it
+    // (what the callee may read or write: what it may write and doesn't must be in the Cpu too, since the local is
+    // read again after it) and what is read again after it (what it may write; with SO, every CR field, whose lazy
+    // forms take SO from its local). Elsewhere, everything.
+    void site_masks() {
+        Locals all;
+        all.set();
+        site_write_.assign(sites_.size(), all);
+        site_read_.assign(sites_.size(), all);
+        if (!f_.effects || f_.keep_registers) return;
+        Locals fields;
+        for (unsigned n = 0; n < 8; ++n) fields.set(kCrAt + n);
+        for (size_t i = 0; i < sites_.size(); ++i) {
+            const Site& site = sites_[i];
+            if ((site.kind != Site::kCall && site.kind != Site::kCallIf) || site.reach != Site::kDirect) continue;
+            const auto it = f_.effects->find(site.callee);
+            if (it == f_.effects->end()) continue;
+            const Locals reads = it->second.reads;
+            Locals writes = it->second.writes;
+            if (writes[kSoAt]) writes |= fields;
+            site_write_[i] = reads | writes;
+            site_read_[i] = writes;
+            narrowed_ += (reads | writes) != all;
+        }
+    }
+
+    bool flow() {
+        const size_t n = f_.insns.size();
+        if (!cut()) return false;
+        site_masks();
+        const std::vector<std::vector<size_t>>& succ = succ_;
+        const std::vector<std::vector<Event>>& events = events_;
+        const std::vector<Locals>& assigns = assigns_;
+        // What each instruction reads again after its calls.
+        std::vector<Locals> reloads(n);
+        for (size_t k = 0; k < n; ++k)
+            for (const Event& e : events[k])
+                if (e.reload) reloads[k] |= site_read_[static_cast<size_t>(e.site)];
         // Forward to a fixed point: the locals that may differ from the Cpu, and each CR bit's reaching definitions.
         std::vector<Locals> dirty_in(n);
         std::vector<std::array<Fold, 32>> fold_in(n);
@@ -465,9 +623,13 @@ private:
                         cur |= e.defs;
                         continue;
                     }
-                    site_dirty_[static_cast<size_t>(e.site)] |= cur;
-                    const Site::Kind kind = sites_[static_cast<size_t>(e.site)].kind;
-                    if (kind == Site::kCall || kind == Site::kFlush) cur.reset();
+                    if (e.reload) continue;
+                    const size_t site = static_cast<size_t>(e.site);
+                    site_dirty_[site] |= cur & site_write_[site];
+                    // After a call: what was written back is in the Cpu, what is read again is the Cpu's; the rest
+                    // (neither read nor written by the callee) is as it was. A call that may not happen changes nothing.
+                    const Site::Kind kind = sites_[site].kind;
+                    if (kind == Site::kCall || kind == Site::kFlush) cur &= ~site_write_[site];
                 }
                 std::array<Fold, 32> fold = fold_in[k];
                 for (unsigned field = 0; field < 8; ++field)
@@ -475,7 +637,9 @@ private:
                         for (unsigned i = 0; i < 4; ++i) fold[4 * field + i] = kOpaque;
                 for (unsigned bit = 0; bit < 32; ++bit)
                     if (defs_[k][bit] != kUnreached) fold[bit] = defs_[k][bit];
-                if (reloads[k]) fold.fill(kOpaque);
+                for (unsigned field = 0; field < 8; ++field)
+                    if (reloads[k][kCrAt + field])
+                        for (unsigned i = 0; i < 4; ++i) fold[4 * field + i] = kOpaque;
                 for (const size_t s : succ[k]) {
                     const Locals merged = dirty_in[s] | cur;
                     std::array<Fold, 32> joined{};
@@ -577,6 +741,7 @@ private:
                     before |= e.defs;
                     continue;
                 }
+                if (e.reload) continue;
                 const size_t site = static_cast<size_t>(e.site);
                 for (unsigned field = 0; field < 8; ++field) {
                     if (!site_dirty_[site][kCrAt + field]) continue;
@@ -666,17 +831,27 @@ private:
                 if (d[at]) s += std::format("c.xer_{0} = {0}; ", name);
             return s;
         };
-        std::string read_again;
-        for (const unsigned n : gprs_) read_again += std::format("r{0} = c.r[{0}]; ", n);
-        for (const unsigned n : fprs_) read_again += std::format("f{0} = c.f[{0}]; ", n);
-        for (const unsigned n : vrs_) read_again += std::format("v{0} = c.v[{0}]; ", n);
-        for (const unsigned n : crs_) read_again += std::format("cr{0} = (c.cr >> {1}) & 15u; ", n, 28 - 4 * n);
-        for (unsigned n = 0; n < 8; ++n)
-            if (lazy_[n] && selector_[n]) read_again += std::format("kf{} = 0u; ", n);
-        for (const char* s : {"lr", "ctr"})
-            if (specials_.contains(s)) read_again += std::format("{0} = c.{0}; ", s);
-        for (const char* s : {"so", "ov", "ca"})
-            if (specials_.contains(s)) read_again += std::format("{0} = c.xer_{0}; ", s);
+        const auto read_again = [&](size_t site) {
+            const Locals& d = site_read_[site];
+            std::string s;
+            for (const unsigned n : gprs_)
+                if (d[n]) s += std::format("r{0} = c.r[{0}]; ", n);
+            for (const unsigned n : fprs_)
+                if (d[kFprAt + n]) s += std::format("f{0} = c.f[{0}]; ", n);
+            for (const unsigned n : vrs_)
+                if (d[kVrAt + n]) s += std::format("v{0} = c.v[{0}]; ", n);
+            for (const unsigned n : crs_)
+                if (d[kCrAt + n]) s += std::format("cr{0} = (c.cr >> {1}) & 15u; ", n, 28 - 4 * n);
+            for (unsigned n = 0; n < 8; ++n)
+                if (lazy_[n] && selector_[n] && d[kCrAt + n]) s += std::format("kf{} = 0u; ", n);
+            const std::pair<const char*, unsigned> specials[] = {{"lr", kLrAt}, {"ctr", kCtrAt}};
+            for (const auto& [name, at] : specials)
+                if (specials_.contains(name) && d[at]) s += std::format("{0} = c.{0}; ", name);
+            const std::pair<const char*, unsigned> xer[] = {{"so", kSoAt}, {"ov", kOvAt}, {"ca", kCaAt}};
+            for (const auto& [name, at] : xer)
+                if (specials_.contains(name) && d[at]) s += std::format("{0} = c.xer_{0}; ", name);
+            return s;
+        };
         // Two passes: the bit reads decide which compares keep their operands.
         const auto pass = [&](const std::string& in, bool keeps) {
             std::string out;
@@ -700,7 +875,7 @@ private:
                     else if (selector_[v.target]) out += std::format(" kf{} = {}u;", v.target, kind_code(v.kind));
                     break;
                 }
-                case 'L': out += read_again; break;
+                case 'L': out += read_again(std::stoul(body)); break;
                 case 'T': case 'V': {
                     const size_t dot = body.find('.');
                     out += bit_text(std::stoul(body.substr(0, dot)), static_cast<unsigned>(std::stoul(body.substr(dot + 1))), kind == 'T');
@@ -750,7 +925,7 @@ private:
             error_ = std::format("branch to {:08X}, which is neither in the function nor a function", target);
             return false;
         }
-        out = std::format("{} {}(c); return;", site(Site::kLeave), fn_name(target));
+        out = std::format("{} {}(c); return;", site(Site::kLeave, Site::kDirect, target), fn_name(target));
         return true;
     }
 
@@ -811,7 +986,7 @@ private:
                              saves(kBool, d, "bit != 0u")));
         };
         const auto trap = [&](const std::string& x, const std::string& y) {
-            const std::string leave = site(Site::kLeave);
+            const std::string leave = site(Site::kLeave, Site::kNothing);  // (a trap doesn't come back)
             if (d == 31) line(std::format("{} c.hooks->trap(c, {}, \"trap\"); return;", leave, hex32(pc)));
             else line(std::format("if (trap_on({}u, {}, {})) {{ {} c.hooks->trap(c, {}, \"trap\"); return; }}", d, x, y, leave, hex32(pc)));
         };
@@ -1175,7 +1350,7 @@ private:
                     error_ = std::format("call to {:08X}, which is not a function", t);
                     return false;
                 }
-                const auto [out_s, in_s] = call_site(false);
+                const auto [out_s, in_s] = call_site(false, t);
                 line(std::format("{} = {}; {} {}(c); {}", LR(), hex64(pc + 4), out_s, fn_name(t), in_s));
                 return true;
             }
@@ -1197,7 +1372,7 @@ private:
                     error_ = std::format("call to {:08X}, which is not a function", t);
                     return false;
                 }
-                const auto [out_s, in_s] = call_site(cond != "true");
+                const auto [out_s, in_s] = call_site(cond != "true", t);
                 line(cond == "true" ? std::format("{}{} = {}; {} {}(c); {}", pre, LR(), hex64(pc + 4), out_s, fn_name(t), in_s)
                                     : std::format("{}{} = {}; if ({}) {{ {} {}(c); {} }}", pre, LR(), hex64(pc + 4), cond, out_s, fn_name(t), in_s));
                 return true;
@@ -1219,7 +1394,7 @@ private:
                                                   LR(), LR(), hex64(pc + 4), cond, out_s, in_s));
                 return true;
             }
-            const std::string leave = site(Site::kLeave);
+            const std::string leave = site(Site::kLeave, Site::kNothing);
             line(cond == "true" ? std::format("{}{} return;", pre, leave) : std::format("{}if ({}) {{ {} return; }}", pre, cond, leave));
             return true;
         }
@@ -1244,7 +1419,7 @@ private:
                     }
                     s += std::format(" case {}: goto L_{:08X};", hex32(t), t);
                 }
-                s += std::format(" default: {} c.hooks->trap(c, {}, \"a switch jumped outside its table\"); return; }}", site(Site::kLeave), hex32(pc));
+                s += std::format(" default: {} c.hooks->trap(c, {}, \"a switch jumped outside its table\"); return; }}", site(Site::kLeave, Site::kNothing), hex32(pc));
                 line(s);
                 return true;
             }
@@ -1272,10 +1447,15 @@ private:
     unsigned kinds_[8] = {};                       // the kinds of compare into each field (1 << kind_code)
     std::vector<std::array<Fold, 8>> site_kind_;  // at each sync site, each field's reaching compares' kind
     struct Event {
-        int site;     // or -1: a piece of text, which assigns `defs`
-        Locals defs;
+        int site;            // or -1: a piece of text, which assigns `defs` and reads `uses`
+        Locals defs, uses;
+        bool reload = false;  // the site's read again (@L), not its write-back (@S)
     };
     std::vector<std::vector<Event>> events_;      // each instruction's text cut at its sync sites
+    std::vector<std::vector<size_t>> succ_;       // each instruction's successors
+    std::vector<Locals> assigns_;                 // what each instruction assigns
+    std::vector<Locals> site_write_, site_read_;  // what each sync site writes back (of what has changed) and reads again
+    unsigned narrowed_ = 0;                       // calls whose sync the callee's effects narrowed
     bool memory_ = false;
     size_t k_ = 0;                                // the instruction being emitted
     std::set<uint32_t> present_, labels_;
@@ -1289,6 +1469,84 @@ private:
 }  // namespace
 
 Lifted lift(const LiftInput& f) { return Emitter(f).run(); }
+
+// The effects, from each function's own part (Emitter::facts) and its callees' effects, to a fixed point: least, so
+// that a recursion adds only what its other paths read or write. What a function may write: all it assigns, and all
+// its callees may write. What it may read before writing: a backward pass over its instructions, from its returns,
+// where each piece of text reads what it uses after killing what it assigns, and each call reads what the callee may
+// read (a callee's writes may not happen, so they kill nothing).
+EffectsTable register_effects(const std::vector<LiftInput>& functions) {
+    std::vector<FunctionFacts> facts;
+    facts.reserve(functions.size());
+    for (const LiftInput& f : functions) {
+        FunctionFacts one;
+        if (Emitter(f).facts(one)) facts.push_back(std::move(one));
+    }
+    EffectsTable table;
+    std::unordered_map<uint32_t, size_t> at;
+    for (size_t i = 0; i < facts.size(); ++i) {
+        table[facts[i].start] = {};
+        at[facts[i].start] = i;
+    }
+    Slots all;
+    all.set();
+    std::unordered_map<uint32_t, std::vector<size_t>> callers;
+    for (size_t i = 0; i < facts.size(); ++i)
+        for (const uint32_t callee : facts[i].callees) callers[callee].push_back(i);
+    const auto effects_of = [&](const FunctionFacts& f) {
+        if (f.everything) return RegisterEffects{all, all};
+        RegisterEffects e;
+        for (const auto& events : f.events)
+            for (const FactEvent& ev : events) {
+                if (!ev.call) {
+                    e.writes |= ev.defs;
+                    continue;
+                }
+                const auto it = table.find(ev.callee);
+                if (it == table.end()) return RegisterEffects{all, all};  // not lifted, or not one of the program's
+                e.writes |= it->second.writes;
+            }
+        const size_t n = f.events.size();
+        std::vector<Slots> live_in(n);
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t k = n; k-- > 0;) {
+                Slots live;
+                for (const size_t s : f.succ[k]) live |= live_in[s];
+                for (size_t i = f.events[k].size(); i-- > 0;) {
+                    const FactEvent& ev = f.events[k][i];
+                    if (ev.call) live |= table.at(ev.callee).reads;
+                    else live = (live & ~ev.defs) | ev.uses;
+                }
+                if (live != live_in[k]) {
+                    live_in[k] = live;
+                    changed = true;
+                }
+            }
+        }
+        if (n) e.reads = live_in[0];
+        return e;
+    };
+    std::vector<size_t> work(facts.size());
+    std::vector<bool> queued(facts.size(), true);
+    for (size_t i = 0; i < facts.size(); ++i) work[i] = facts.size() - 1 - i;
+    while (!work.empty()) {
+        const size_t i = work.back();
+        work.pop_back();
+        queued[i] = false;
+        const RegisterEffects e = effects_of(facts[i]);
+        RegisterEffects& old = table[facts[i].start];
+        if (e.reads == old.reads && e.writes == old.writes) continue;
+        old = e;
+        if (const auto it = callers.find(facts[i].start); it != callers.end())
+            for (const size_t c : it->second)
+                if (!queued[c]) {
+                    queued[c] = true;
+                    work.push_back(c);
+                }
+    }
+    return table;
+}
 
 LiftInput lift_input(const Cfg& cfg, const Function& f) {
     LiftInput in;

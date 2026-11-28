@@ -60,26 +60,43 @@ struct Out {
         ++count;
         return true;
     }
-    // A program (add_programs): its function, lifted at `at`, and its words and its helper's for the reference.
-    bool program(uint32_t pc, uint32_t at, const std::vector<std::pair<uint32_t, uint32_t>>& words, const std::vector<std::pair<uint32_t, uint32_t>>& helper_words,
-                 std::vector<uint32_t> functions_known, bool registers) {
-        LiftInput in;
-        in.start = at;
-        for (const auto& [a, w] : words) in.insns.emplace_back(a, ppu::decode(w));
-        in.keep_pc = in.keep_registers = registers;
-        in.is_function = [known = std::move(functions_known)](uint32_t a) { return std::ranges::find(known, a) != known.end(); };
-        const Lifted l = lift(in);
-        if (!l.ok) {
-            std::println(stderr, "difftest_gen: a program at {:08x} didn't lift: {} (at {:08x})", at, l.why, l.why_at);
-            return false;
+    // A program (add_programs, add_call_programs): its functions, the first its entry, lifted as the game's are, with
+    // the effects of each on the registers (register_effects) narrowing the calls among them, unless `registers`
+    // (--registers); and all their words, for the reference. `narrowed` counts the calls the effects narrowed.
+    bool program(uint32_t pc, const std::vector<std::vector<std::pair<uint32_t, uint32_t>>>& bodies, bool registers, size_t* narrowed = nullptr) {
+        std::vector<uint32_t> starts;
+        for (const auto& body : bodies) starts.push_back(body[0].first);
+        std::vector<LiftInput> inputs;
+        for (const auto& body : bodies) {
+            LiftInput in;
+            in.start = body[0].first;
+            for (const auto& [a, w] : body) in.insns.emplace_back(a, ppu::decode(w));
+            in.keep_pc = in.keep_registers = registers && in.start == starts[0];
+            in.is_function = [starts](uint32_t a) { return std::ranges::find(starts, a) != starts.end(); };
+            inputs.push_back(std::move(in));
         }
-        functions += l.code + "\n";
+        const EffectsTable effects = register_effects(inputs);
+        // Callees first: each is declared before what calls it.
+        for (size_t i = inputs.size(); i-- > 0;) {
+            inputs[i].effects = &effects;
+            const Lifted l = lift(inputs[i]);
+            if (!l.ok) {
+                std::println(stderr, "difftest_gen: a program's function at {:08x} didn't lift: {} (at {:08x})", inputs[i].start, l.why, l.why_at);
+                return false;
+            }
+            if (narrowed) *narrowed += l.narrowed;
+            functions += l.code + "\n";
+        }
+        size_t words = 0;
         programs += std::format("const ProgramWord kProgram{:08x}[] = {{", pc);
-        for (const auto* list : {&words, &helper_words})
-            for (const auto& [a, w] : *list) programs += std::format("{{0x{:08x}u, 0x{:08x}u}}, ", a, w);
+        for (const auto& body : bodies)
+            for (const auto& [a, w] : body) {
+                programs += std::format("{{0x{:08x}u, 0x{:08x}u}}, ", a, w);
+                ++words;
+            }
         programs += "};\n";
-        table += std::format("    {{Kind::Program, 0x{:08x}u, 0x{:08x}u, &{}, kProgram{:08x}, {}u, 0x{:08x}u}},  // a program{}\n", words[1].second, at, fn_name(at), pc,
-                             words.size() + helper_words.size(), at, registers ? ", lifted with --registers" : "");
+        table += std::format("    {{Kind::Program, 0x{:08x}u, 0x{:08x}u, &{}, kProgram{:08x}, {}u, 0x{:08x}u}},  // a program of {} functions{}\n", bodies[0][1].second,
+                             starts[0], fn_name(starts[0]), pc, words, starts[0], bodies.size(), registers ? ", lifted with --registers" : "");
         ++count;
         return true;
     }
@@ -308,8 +325,111 @@ bool add_programs(Out& out, std::mt19937& rng, int count) {
         }
         std::vector<std::pair<uint32_t, uint32_t>> program;
         for (size_t i = 0; i < words.size(); ++i) program.emplace_back(at + 4 * static_cast<uint32_t>(i), words[i]);
-        ok &= out.helper(helper, helper_words);
-        ok &= out.program(pc, at, program, helper_words, {helper}, p % 3 == 2);
+        ok &= out.program(pc, {program, helper_words}, p % 3 == 2);
+    }
+    return ok;
+}
+
+// ---- programs of three functions: calls narrowed by what the callee reads and writes (register_effects) ----
+// main calls mid and leaf, mid calls leaf, each call plain or conditional; each function's random instructions use
+// registers of a few of its own (leaf's and mid's sets drawn apart, overlapping sometimes), so that each call
+// writes back and reads again part of the state: what main changed and mid neither reads nor writes must survive the
+// call in main's locals, and reach the Cpu at main's return. Compares into any field and branches on them, before and
+// after the calls, carries, loads and stores off r1. main keeps its return address in r0, mid in r31 (which leaf and
+// mid's own instructions leave alone). The reference interprets the words.
+// A random instruction from the pool whose registers are all in `set` (r0 as rA0 means 0, and is allowed).
+uint32_t word_in(std::mt19937& rng, const std::vector<const ppu::Spec*>& pool, const std::vector<unsigned>& set) {
+    const auto in_set = [&](unsigned r) { return std::ranges::find(set, r) != set.end(); };
+    for (;;) {
+        const ppu::Spec& s = *pool[rng() % pool.size()];
+        uint32_t fields = (s.flags & ppu::kRc) ? 1u : 0u;
+        for (const ppu::Opnd o : s.operands) fields |= ppu::field_mask(o);
+        uint32_t word = s.match | (rng() & fields & ~s.mask);
+        // Registers drawn from the set, not at random (or a 3-operand instruction would hardly ever fit).
+        for (const ppu::Opnd o : s.operands) {
+            const unsigned shift = o == ppu::Opnd::rD ? 21 : (o == ppu::Opnd::rA || o == ppu::Opnd::rA0) ? 16 : o == ppu::Opnd::rB ? 11 : 0;
+            if (shift) word = (word & ~(31u << shift)) | (set[rng() % set.size()] << shift);
+        }
+        const Insn in = ppu::decode(word);
+        if (in.op != s.op || !in_slice(in)) continue;
+        bool fine = true;
+        for (const ppu::Opnd o : s.operands) {
+            if (o == ppu::Opnd::rD) fine &= in_set(in.rd());
+            if (o == ppu::Opnd::rA) fine &= in_set(in.ra());
+            if (o == ppu::Opnd::rB) fine &= in_set(in.rb());
+            if (o == ppu::Opnd::rA0) fine &= in.ra() == 0 || in_set(in.ra());
+        }
+        if (fine) return word;
+    }
+}
+
+bool add_call_programs(Out& out, std::mt19937& rng, int count, size_t& narrowed) {
+    const std::vector<const ppu::Spec*> pool = program_pool();
+    bool ok = true;
+    const auto set_of = [&](unsigned size) {
+        std::vector<unsigned> set;
+        while (set.size() < size) {
+            const unsigned r = 3 + static_cast<unsigned>(rng() % 28);  // r3 to r30
+            if (std::ranges::find(set, r) == set.end()) set.push_back(r);
+        }
+        return set;
+    };
+    for (int p = 0; p < count; ++p) {
+        const uint32_t pc = out.pc();
+        const uint32_t main_at = 0x00a00000u + 0x800u * static_cast<uint32_t>(p), mid_at = main_at + 0x200u, leaf_at = main_at + 0x400u;
+        const std::vector<unsigned> leaf_set = set_of(2 + static_cast<unsigned>(rng() % 5)), mid_set = set_of(2 + static_cast<unsigned>(rng() % 6));
+        // A body of random words in a set, with compares and forward branches on them (filled in below), and calls.
+        const auto body = [&](const std::vector<unsigned>* set, unsigned size, const std::vector<uint32_t>& callees, std::vector<uint32_t>& words) {
+            for (unsigned i = 0; i < size; ++i) {
+                const unsigned pick = static_cast<unsigned>(rng() % 12);
+                if (pick < 2 && !callees.empty()) words.push_back(0x100u | static_cast<uint32_t>(rng() % callees.size()));  // a call, filled in below
+                else if (pick < 3) {
+                    const uint32_t field = static_cast<uint32_t>(rng() % 8);
+                    const uint32_t ra = set ? (*set)[rng() % set->size()] : static_cast<uint32_t>(rng() % 32);
+                    words.push_back((11u << 26) | (field << 23) | (static_cast<uint32_t>(rng() % 2) << 21) | (ra << 16) | (static_cast<uint32_t>(rng()) & 0x7u));  // cmpi
+                    words.push_back(0x10u | field);  // a branch on it, later
+                } else if (pick < 4) words.push_back(0);  // a branch on any bit
+                else if (pick < 5 && set) {
+                    const uint32_t r = (*set)[rng() % set->size()];
+                    const uint32_t disp = (static_cast<uint32_t>(static_cast<int32_t>(rng() % 64) * 8 - 256)) & 0xfffcu;
+                    words.push_back(((rng() % 2 ? 36u : 32u) << 26) | (r << 21) | (1u << 16) | disp);  // stw / lwz
+                } else words.push_back(set ? word_in(rng, pool, *set) : program_word(rng, pool));
+            }
+        };
+        const auto fill = [&](uint32_t at, std::vector<uint32_t>& words, const std::vector<uint32_t>& callees, size_t epilogue) {
+            for (size_t i = 0; i < words.size(); ++i) {
+                const uint32_t here = at + 4 * static_cast<uint32_t>(i);
+                if (words[i] == 0 || (words[i] & ~7u) == 0x10u) {
+                    const size_t last = words.size() - epilogue;
+                    const size_t to = i + 1 + rng() % (last - i);
+                    const uint32_t bo = words[i] ? (rng() % 2 ? 12u : 4u) : (rng() % 2 ? 12u : 4u);
+                    const uint32_t bi = words[i] ? 4 * (words[i] & 7u) + static_cast<uint32_t>(rng() % 3) : static_cast<uint32_t>(rng() % 32);
+                    words[i] = (16u << 26) | (bo << 21) | (bi << 16) | ((4 * static_cast<uint32_t>(to - i)) & 0xfffcu);
+                } else if ((words[i] & ~0xffu) == 0x100u) {
+                    const uint32_t callee = callees[words[i] & 0xffu];
+                    words[i] = rng() % 3 == 0 ? (16u << 26) | ((rng() % 2 ? 12u : 4u) << 21) | (static_cast<uint32_t>(rng() % 32) << 16) | ((callee - here) & 0xfffcu) | 1u
+                                              : 0x48000001u | ((callee - here) & 0x03fffffcu);
+                }
+            }
+        };
+        std::vector<uint32_t> leaf, mid{0x7fe802a6u}, main{0x7c0802a6u};  // mflr r31; mflr r0
+        body(&leaf_set, static_cast<unsigned>(rng() % 7), {}, leaf);
+        leaf.push_back(kBlr);
+        body(&mid_set, 3 + static_cast<unsigned>(rng() % 10), {leaf_at}, mid);
+        mid.push_back(0x7fe803a6u);  // mtlr r31
+        mid.push_back(kBlr);
+        body(nullptr, 8 + static_cast<unsigned>(rng() % 20), {mid_at, leaf_at}, main);
+        main.push_back(0x7c0803a6u);  // mtlr r0
+        main.push_back(kBlr);
+        fill(leaf_at, leaf, {}, 1);
+        fill(mid_at, mid, {leaf_at}, 2);
+        fill(main_at, main, {mid_at, leaf_at}, 2);
+        const auto placed = [](uint32_t at, const std::vector<uint32_t>& words) {
+            std::vector<std::pair<uint32_t, uint32_t>> v;
+            for (size_t i = 0; i < words.size(); ++i) v.emplace_back(at + 4 * static_cast<uint32_t>(i), words[i]);
+            return v;
+        };
+        ok &= out.program(pc, {placed(main_at, main), placed(mid_at, mid), placed(leaf_at, leaf)}, false, &narrowed);
     }
     return ok;
 }
@@ -412,6 +532,12 @@ int main(int argc, char** argv) {
         ok &= out.add(Kind::TimeBase, mftb, {{pc, mftb}, {pc + 4, kBlr}});
     }
     ok &= add_programs(out, rng, 400);
+    size_t narrowed = 0;
+    ok &= add_call_programs(out, rng, 300, narrowed);
+    if (narrowed == 0) {
+        std::println(stderr, "difftest_gen: no call in the programs of three functions was narrowed by its callee's effects");
+        return 1;
+    }
     std::string eh_data;
     ok &= eh_program(out.functions, eh_data);
     if (!ok) return 1;
@@ -426,6 +552,6 @@ int main(int argc, char** argv) {
         std::println(stderr, "difftest_gen: cannot write {}", argv[1]);
         return 1;
     }
-    std::println("difftest_gen: {} cases; {} instructions covered one at a time", out.count, covered);
+    std::println("difftest_gen: {} cases; {} instructions covered one at a time; {} calls in programs narrowed by their callees' effects", out.count, covered, narrowed);
     return 0;
 }

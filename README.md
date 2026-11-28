@@ -25,17 +25,27 @@ Runs from start-up through its logos, title film and menus to its first race, wi
 | Thread scheduling | 🔨 priorities not honoured yet |
 | Settings menu (F1) | ✅ controls, display, the console's settings; pauses the game |
 | CI | ✅ six configurations, warnings as errors; the game itself needs your copy, so isn't built there |
+| Downloads | 🔨 Windows, Linux and macOS players' kits with a launcher that builds the game from your copy; not yet tried by a player |
 
 ## Playing
 
 ### Your copy of the game
 
-Keep your disc's folder (the one holding `PS3_GAME`) outside this repository. Its `EBOOT.BIN` is encrypted, so decrypt it yourself, once:
+You need three things, all from your own disc and console software; the project ships none of them, and no PS3 keys:
 
-1. In [RPCS3](https://rpcs3.net): **Utilities > Decrypt PS3 Binaries**, and choose your `EBOOT.BIN`. It writes `EBOOT.elf`.
-2. Put `EBOOT.elf` beside `EBOOT.BIN`, in `USRDIR`. `qilin` refuses an ELF that isn't that `EBOOT.BIN`'s program.
+1. **The disc's folder**, the one holding `PS3_GAME`, copied as it is (keep it outside this repository).
+2. **The decrypted program.** `EBOOT.BIN` is encrypted, so decrypt it yourself, once: in [RPCS3](https://rpcs3.net), **Utilities > Decrypt PS3 Binaries**, and choose your `PS3_GAME/USRDIR/EBOOT.BIN`. It writes `EBOOT.elf` beside it; keep it there, in `USRDIR`. `qilin` refuses an ELF that isn't that `EBOOT.BIN`'s program.
+3. **The console's fonts**, from a PS3's system software: in RPCS3, **File > Install Firmware** with Sony's `PS3UPDAT.PUP` (or `rpcs3 --installfw PS3UPDAT.PUP`) makes its `dev_flash` folder. The game finds it by itself in the disc's folder (`dev_flash` beside `PS3_GAME`), in an `RPCS3` folder beside the disc's folder or a `dev_flash` there, in RPCS3's own folder where the system has a standard one (`RPCS3_CONFIG_DIR`; Linux `~/.config/rpcs3` or the Flatpak's; macOS `~/Library/Application Support/rpcs3`), and in the data folder (`qilin/ridgeracer7`). On Windows RPCS3 keeps `dev_flash` beside `rpcs3.exe`: copy it into the disc's folder. `--flash <dev_flash>` names one by hand.
 
-The game also needs the console's fonts, from the `dev_flash` folder of a PS3's system software (`rpcs3 --installfw PS3UPDAT.PUP` makes one, from Sony's file). Pass it with `--flash <dev_flash>`; without it, an `RPCS3` folder beside your game's folder is looked in.
+`qilin identify <disc folder>` checks all three and says what is missing.
+
+### The downloads (Windows, Linux, macOS)
+
+The [Releases](https://github.com/Qilin1066/RidgeRacer7--QilinRecomp/releases) page has a download for each system: `RidgeRacer7--QilinRecomp-X.Y.Z-windows-x64.zip`, `-linux-x86_64.tar.gz` (and `-linux-arm64.tar.gz`), and `-macos.dmg` (Apple silicon and Intel). Unpack it, double-click **Play Ridge Racer 7**, and choose your disc's folder: the launcher checks it (`qilin identify`), and the first start builds the game from your copy (it lifts the code of your `EBOOT.elf` and translates its shaders, then compiles that code with the compiler in the download: LLVM-MinGW on Windows, zig's Clang on Linux, Apple's Clang on macOS, which the app offers to install). Then Play. Each download's `README.txt` says the rest.
+
+What a build needs: about 2 GB free on the drive, and memory for each compiler the launcher runs at once (it runs as many as fit, at 900 MB each: the largest of the about 117 files peaks at about 550 MB with Clang). On a desktop PC the first build takes a few minutes; later ones recompile only what changed. The downloads are made by `.github/workflows/player-kit*.yml` (`tools/player-kit/`, the launcher shared with the other QilinRecomp projects in `tools/player-kit/launcher/`); nothing in them is made from the game.
+
+The game hasn't yet been played on Linux or macOS, nor built by a player's launcher on any system. ARM64 (Raspberry Pi 4 and 5 included) is built, but isn't expected to hold the game's frame rate yet.
 
 ### From the source on Windows
 
@@ -53,9 +63,9 @@ powershell -ExecutionPolicy Bypass -File tools\build-ridgeracer7.ps1 [-Game <pat
 
 It lifts your copy into `build-game\gen` and builds `build-game\Release\ridgeracer7.exe`, compiling as many files at once as free memory allows (8 GB each).
 
-### Linux and macOS
+### Linux and macOS from the source
 
-Not yet tried. By hand, after the build below:
+The game itself hasn't been run there yet (CI builds everything but the lifted code, and links the game's program with stand-ins for it). By hand, after the build below:
 
 ```sh
 build/qilin lift    <game> --out build/gen
@@ -125,7 +135,8 @@ build/qilin spu-cfg     <game>                  # the SPU programs' control flow
 build/qilin spu-insns   <game>                  # every word of the SPU programs' code
 build/qilin spu-profile <game>                  # how often the SPU programs use each instruction
 build/qilin spu-disasm  <file> [--base address] [--ignore-reserved]   # a file of raw SPU words
-build/qilin lift    <game> [--out folder] [--pc] [--registers]   # lift the PPU and SPU code to C++
+build/qilin lift    <game> [--out folder] [--pc] [--registers] [--per-file N] [--file-kb K]   # lift the PPU and SPU code to C++
+build/qilin identify <disc folder> [--json] [--build <name>]   # the launcher's check: the right disc, EBOOT.elf, the fonts
 build/qilin insns   <game>                      # every word of the program's code: address, word, instruction
 build/qilin profile <game>                      # how often the code uses each instruction
 build/qilin disasm  <file> [--base address]     # a file of raw big-endian PPU words

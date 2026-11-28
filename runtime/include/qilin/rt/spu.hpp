@@ -59,7 +59,7 @@
 #if QILIN_SPU_SSSE3
 #include <tmmintrin.h>
 #endif
-#if defined(_MSC_VER)
+#if defined(_WIN32)  // (MinGW too: its <intrin.h>, which SDL includes, has a __cpuid that <cpuid.h>'s macro would break)
 #include <intrin.h>
 #else
 #include <cpuid.h>
@@ -899,7 +899,7 @@ QILIN_SPU_INLINE SpuReg insertion_mask(uint32_t address, unsigned size) {
 // Whether this host can run what the helpers were built to use (SSSE3, where QILIN_SPU_SSSE3 is set without the
 // compiler having been told the host has it): the runtime asks before the first SPU program runs.
 inline bool host_has_ssse3() {
-#if QILIN_SPU_SSE2 && defined(_MSC_VER)
+#if QILIN_SPU_SSE2 && defined(_WIN32)
     int info[4];
     __cpuid(info, 1);
     return (info[2] & (1 << 9)) != 0;

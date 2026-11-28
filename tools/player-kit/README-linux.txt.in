@@ -1,0 +1,140 @@
+@TITLE@ QilinRecomp for Linux (64-bit)
+=============================================
+
+@FULL_TITLE@ (@STUDIO@), recompiled to run natively: the game's own
+program translated into C++ and compiled for your computer, drawn with
+Vulkan. It is a work in progress: it reaches the races, but some drawing
+is still wrong.
+
+No game data is included, and no PS3 keys. You need your own copy of the
+game: @RELEASE@. Other regions and versions are other programs and aren't
+supported.
+
+
+Your game folder
+----------------
+You need three things, all from your own disc and console software:
+
+1. The disc's files: the folder holding PS3_GAME (with PS3_DISC.SFB beside
+   it), copied from your disc as it is.
+2. The decrypted program. The disc's PS3_GAME/USRDIR/EBOOT.BIN is
+   encrypted, and this project can't decrypt it. Do it once with the PS3
+   emulator RPCS3 (https://rpcs3.net): in RPCS3 choose Utilities > Decrypt
+   PS3 Binaries and pick that EBOOT.BIN. RPCS3 writes EBOOT.elf beside it;
+   if it ends up anywhere else, move it into PS3_GAME/USRDIR, beside
+   EBOOT.BIN.
+3. The PS3's fonts, from its system software. In RPCS3 choose File >
+   Install Firmware and pick the PS3 system software update (PS3UPDAT.PUP,
+   from PlayStation's website). RPCS3 keeps it in ~/.config/rpcs3/dev_flash
+   (the Flatpak's in ~/.var/app/net.rpcs3.RPCS3/config/rpcs3/dev_flash),
+   where the game finds it by itself. A dev_flash folder copied into your
+   game folder, beside PS3_GAME, is found too.
+
+The launcher checks all three when you choose the folder, and says what is
+missing and what to do.
+
+
+Playing
+-------
+1. Unpack the download anywhere you can write to (your home folder is
+   fine): double-click it in your file manager, or in a terminal
+   "tar xzf @PACKAGE@-*.tar.gz". Building the game needs about 2 GB free.
+2. Open the @PACKAGE@ folder and double-click "Play @TITLE@" (if your file
+   manager asks, choose Execute or Run). From a terminal: ./"Play @TITLE@"
+3. Click "Choose your game folder" and pick the folder above, or drag it
+   onto the window. (Where the desktop has no folder chooser, type or paste
+   the folder's path.)
+4. Wait for the first build: a few minutes on a desktop PC. The game's
+   code is recompiled from your EBOOT.elf and compiled with the compiler in
+   this download (zig's Clang), as many files at once as your computer's
+   memory allows (each takes up to about @COMPILE_MEMORY_MB@ MB). Your game
+   files never leave your computer.
+5. Click Play. The window hides while the game runs. "Add to the
+   applications menu" puts @TITLE@ in your desktop's menu.
+
+After that, Play @TITLE@ remembers your folder (even in a new download
+folder), and Play starts the game straight away. After an update it builds
+the game again first, recompiling only what changed. Leave the game folder
+where it is: the game reads its files from it while you play.
+
+The game's output is in work/run.log and work/run-errors.log, and the
+build's in work/build.log. Send them when reporting a problem.
+
+Needs: a 64-bit Linux on x86-64 (the linux-x86_64 download; a processor
+with SSSE3) with glibc 2.35 or later (Ubuntu 22.04, Debian 12, Fedora 36 or
+later), 4 GB of memory or more, and a graphics driver with Vulkan 1.3:
+Mesa's Vulkan drivers (on Debian and Ubuntu, the mesa-vulkan-drivers
+package) or NVIDIA's. Sound goes through PipeWire, PulseAudio or ALSA,
+whichever the system has. Before building, Play @TITLE@ checks for Vulkan
+and says what to install if it's missing. Updates use curl (or wget) and
+tar, which nearly every Linux has.
+
+@ARM_NOTE@
+
+
+Controls
+--------
+A controller works as the PS3's. On the keyboard:
+
+  Keys            Button          Keys              Button
+  arrows          d-pad           Q, W              L1, R1
+  Z               cross           1, 2              L2, R2
+  X               circle          Return            Start
+  A               square          Backspace         Select
+  S               triangle        C, V              L3, R3
+  I J K L         left stick      keypad 8 4 2 6    right stick
+
+F1 or Esc (a controller: Back and Start together): the settings menu (the
+game pauses), with the controls (set by pressing them), the picture and
+the console's own settings. Alt+Enter or F11: full screen. F3: frame
+times.
+
+Settings (ridgeracer7.ini), saves (dev_hdd0) and the shader cache are kept
+in ~/.local/share/qilin/@GAME@ (or $XDG_DATA_HOME/qilin/@GAME@), with the
+folder you chose and the build's cache of compiled files (build-cache).
+
+
+What's in here
+--------------
+Play @TITLE@      chooses your game folder, builds the game (once) and starts it
+kit/qilin           the recompiler: turns your @BOOT@ into C++, and the
+                    game's shaders into Vulkan's
+kit/lib, include    the prebuilt rest of the game: its runtime, the renderer,
+                    sound, films, the window and controls (SDL3), the menu
+                    (Dear ImGui), fonts (FreeType), MPEG-2 and ATRAC3plus
+                    (FFmpeg's libavcodec)
+kit/toolchain/zig   zig, whose Clang compiles the game (with its own C++
+                    library), so nothing needs installing
+kit/files.txt       every file this release holds (see below)
+work/               made when building: the game (@EXE_LINUX@), built from
+                    your copy, the recompiled code, the build's files and the
+                    logs
+LICENSES/           the licences of everything included
+
+Portions of this software are copyright (C) 2024 The FreeType Project
+(https://freetype.org). All rights reserved. FFmpeg's libraries are under
+the LGPL: LICENSES/FFmpeg says where their source is and how the game can
+be linked with other builds of them.
+
+Source, changes and issues: https://github.com/@REPO@
+
+
+Updates and recovery
+--------------------
+"Check for updates" in Play @TITLE@ asks GitHub for a newer release (it
+sends nothing about you or your computer). If there is one, it downloads
+it, unpacks it beside this folder and swaps in the new kit and launcher,
+then starts again and builds the game for the new version. If anything
+fails on the way, the old version is left as it was. You can also unpack a
+new download anywhere, even over this folder: it finds your folder and the
+cache by itself, and at its first start it removes files the new kit no
+longer has (anything in kit/ or LICENSES/ that kit/files.txt doesn't name).
+Your saves and settings are never in this folder, so nothing of yours is
+touched.
+
+The game is compiled for this computer's processor; moved to another, it
+is built again. Compiled files come from the cache when nothing they're
+made from has changed. A failed build leaves the working game as it was;
+the one before a new build is kept as work/@EXE_LINUX@.previous until the
+new one has run and closed normally. "Build again from scratch" compiles
+everything anew.

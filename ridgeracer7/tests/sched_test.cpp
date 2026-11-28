@@ -268,17 +268,27 @@ void sleeping() {
     join(threads);
 }
 
-// A thread of better priority waiting while the holder runs on without calling the system runs on a lent token after a
-// short wait; one of worse priority only after a long one; the lent tokens are repaid.
+// A thread of better priority waiting while the holder runs on without calling the system runs on a lent token at once;
+// one of worse priority only after a long one; the lent tokens are repaid.
 void lend() {
     rr7::configure_scheduler(1, false, true);
     become_guest(1000);
     std::vector<std::thread> threads;
-    threads.push_back(guest(10, 10, [] { record(10); }));
+    // (The thread takes its token itself, timed: the scheduler's part alone, not the host's starting of the thread.)
+    static std::atomic<int64_t> took_us{-1};
+    threads.push_back(guest(10, 10, [] {
+        const auto asked = std::chrono::steady_clock::now();
+        rr7::take_core();
+        took_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - asked).count();
+        record(10);
+    }, false));
     const auto from = std::chrono::steady_clock::now();
     while (recorded() == 0 && std::chrono::steady_clock::now() - from < 5s) {
     }
     check(recorded() == 1 && rr7::lent_tokens() == 1, "the better thread ran on a lent token");
+    // At once, not after a wait (kPatience is 1 ms; the first design waited 2 ms and more).
+    std::printf("the better thread had its token %lld us after asking\n", static_cast<long long>(took_us.load()));
+    check(took_us.load() >= 0 && took_us.load() < 500, "the better thread lent a token at once");
     join(threads);
     check(rr7::free_core_tokens() == 0, "the lent token repaid");
     threads.push_back(guest(2000, 2000, [] { record(2000); }));

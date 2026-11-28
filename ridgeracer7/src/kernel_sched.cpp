@@ -27,10 +27,11 @@ struct SchedThread {
 
 namespace {
 
-// How long a thread waits for a token before it runs on a lent one: when the threads holding them are no better than
-// it (the console would have preempted one, or shared its time with it), and when they are (something holds a token
+// How long a thread waits for a token before it runs on a lent one: when a thread holding one is worse than it, not at
+// all (the console would have preempted that thread at once); when the worst holder is as good as it, kPatience (the
+// console would have shared its time with them); when every holder is better, kLongPatience (something holds a token
 // that should have given it up).
-constexpr auto kPatience = std::chrono::milliseconds(2);
+constexpr auto kPatience = std::chrono::milliseconds(1);
 constexpr auto kLongPatience = std::chrono::milliseconds(50);
 constexpr uint64_t kLentLogged = 8;  // the first so many lent tokens are logged
 
@@ -101,22 +102,31 @@ void grant(SchedThread* t) {
     t->cv.notify_one();
 }
 
-// Whether `t`, waiting this long, may run on a lent token. Under g_mutex.
-bool may_borrow(const SchedThread* t, std::chrono::steady_clock::duration waited) {
-    if (!g_lend) return false;
-    if (waited >= kLongPatience) return true;
+// The worst priority among the threads holding a token (INT32_MIN if none holds one). Under g_mutex.
+int32_t worst_holder() {
     int32_t worst = INT32_MIN;
     for (const auto& [id, other] : g_threads)
         if (other->holding.load(std::memory_order_relaxed)) worst = std::max(worst, other->priority.load(std::memory_order_relaxed));
-    return worst >= t->priority.load(std::memory_order_relaxed);
+    return worst;
+}
+
+// Whether `t`, waiting this long, may run on a lent token. Under g_mutex.
+bool may_borrow(const SchedThread* t, std::chrono::steady_clock::duration waited) {
+    if (!g_lend) return false;
+    const int32_t worst = worst_holder(), mine = t->priority.load(std::memory_order_relaxed);
+    if (worst > mine) return true;  // (at once: the console would have preempted that holder)
+    return waited >= kLongPatience || (worst == mine && waited >= kPatience);
 }
 
 // Waits, queued, until `t` is given a token (or lent one). Under g_mutex.
 void wait_for_grant(std::unique_lock<std::mutex>& lock, SchedThread* t) {
     while (!t->granted) {
-        if (t->cv.wait_for(lock, kPatience) == std::cv_status::no_timeout || t->granted) continue;
+        // (Asked before waiting at all, so that a thread outranking a holder runs at once, and again after each wait.)
         const auto waited = std::chrono::steady_clock::now() - t->since;
-        if (!may_borrow(t, waited)) continue;
+        if (!may_borrow(t, waited)) {
+            t->cv.wait_for(lock, kPatience);
+            continue;
+        }
         // Lent: one waiting fewer, one token fewer free (below zero). Nothing else changes the word while some wait.
         uint64_t s = g_state.load();
         while (!g_state.compare_exchange_weak(s, pack(free_of(s) - 1, waiting_of(s) - 1))) {

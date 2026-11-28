@@ -13,9 +13,9 @@
 // A thread of better priority waiting for a token takes one from a running
 // thread at that thread's next return from a call into the system (as the
 // console would preempt it at once; not inside a handler that has called the
-// game back, which may hold a lock of its own). One whose wait has lasted kPatience while the threads
-// holding tokens are no better than it runs anyway, on a token lent until the
-// next one is given back: guest code between system calls can't be
+// game back, which may hold a lock of its own). One that outranks a thread holding a token runs at
+// once, on a token lent until the next one is given back (one as good as the
+// worst holder after kPatience, 1 ms; one worse than every holder after 50 ms): guest code between system calls can't be
 // interrupted here, and a thread polling memory in a loop would otherwise
 // hold its token for ever. That stands in for the console's preemption; it is
 // counted and the first few are logged.

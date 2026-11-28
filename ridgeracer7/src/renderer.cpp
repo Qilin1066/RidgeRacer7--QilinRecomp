@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -148,6 +149,7 @@ uint64_t hash_bytes(const uint8_t* p, size_t n) {
 }
 
 constexpr uint32_t kMostSets = 1024;                   // descriptor sets in a batch
+using Clock = std::chrono::steady_clock;
 
 // A texture set's contents: each texture's unit, view and sampler, in the order of the units.
 struct TextureSetKey {
@@ -255,6 +257,8 @@ struct Renderer {
         VkRect2D scissor{};
         bool have_push = false;
         std::array<float, 8> vertex_push{}, fragment_push{};
+        bool have_dynamic = false;
+        DynamicState dynamic;  // the state set per draw (renderer_pipelines.hpp)
     } bound;
     std::unordered_map<std::array<uint32_t, 6>, CachedTexture, WordsHash> textures;  // by address, format, size, pitch, remap and cube
     std::vector<SurfaceEntry*> touched;     // the surfaces it draws to
@@ -263,6 +267,10 @@ struct Renderer {
     VkFormat depth_format = VK_FORMAT_UNDEFINED;  // for Z24S8: D32_SFLOAT_S8_UINT, or D24_UNORM_S8_UINT where the GPU lacks it
     uint64_t draws = 0, flushes = 0;
     VkQueryPool timestamps = VK_NULL_HANDLE;  // three a batch: its start, before its copies back, its end
+    // The pipelines made for draws when last looked at (renderer_flush), and when that count last grew: the cache is
+    // written to disk once the game has made none for a while.
+    uint64_t pipelines_seen = 0;
+    Clock::time_point pipelines_grew{};
 };
 Renderer* g_renderer = nullptr;
 
@@ -273,11 +281,12 @@ struct Stats {
     std::atomic<uint64_t> gpu_draw_ns{0}, gpu_copy_ns{0};  // the GPU's own time: the batch's commands, and its copies back
     std::atomic<uint64_t> on_demand{0}, on_demand_ns{0};  // surfaces written back when touched
     std::atomic<uint64_t> surface_textures{0};            // textures copied from a surface on the GPU
+    std::atomic<uint64_t> arena_bytes{0};                 // written by the CPU into the arenas (vertices, indices, constants, texels)
+    std::atomic<uint64_t> copied_bytes{0};                // copied by the GPU between buffers and images (texels, surfaces up and back)
 };
 Stats g_stats;
 std::mutex g_flush_reasons_mutex;
 std::map<std::string, uint64_t, std::less<>> g_flush_reasons;  // flushes with work in them, by what asked for them (found without a string made)
-using Clock = std::chrono::steady_clock;
 uint64_t since(Clock::time_point t) { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
 
 // The surfaces drawn and not yet written back (SurfaceEntry::pending). The lock is held while the GPU may write their
@@ -405,7 +414,7 @@ void transition_texture(VkCommandBuffer cmd, VkImage image, VkImageLayout from, 
 
 }  // namespace
 
-void renderer_start(host::Gpu& gpu, std::mutex& queue) {
+void renderer_start(host::Gpu& gpu, std::mutex& queue, const std::filesystem::path& pipeline_folder) {
     auto* r = new Renderer;  // (for the process's life: it ends without unwinding)
     r->gpu = &gpu;
     r->queue = &queue;
@@ -478,7 +487,7 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
     query.queryType = VK_QUERY_TYPE_TIMESTAMP, query.queryCount = 3;
     for (Renderer::Batch& b : r->batches) host::check(vkCreateQueryPool(gpu.device, &query, nullptr, &b.timestamps), "vkCreateQueryPool");
     r->align = std::max<VkDeviceSize>({256, gpu.properties.limits.minUniformBufferOffsetAlignment, gpu.properties.limits.optimalBufferCopyOffsetAlignment});
-    r->cache.start(gpu, r->layout, r->depth_format);
+    r->cache.start(gpu, r->layout, r->depth_format, pipeline_folder);
     g_renderer = r;
     qilin::rt::log("the renderer draws on %s, with %zu translated shaders", gpu.name.c_str(), qilin::rt::kTranslatedShaderCount);
 }
@@ -492,6 +501,7 @@ VkDeviceSize arena_take(Renderer& r, VkDeviceSize size) {
     const VkDeviceSize at = (r.arena_used + r.align - 1) / r.align * r.align;
     if (at + size > r.arena.size) fatal("the renderer's arena is full mid-draw (a draw's needs are checked before it starts)");
     r.arena_used = at + size;
+    g_stats.arena_bytes += size;
     return at;
 }
 uint8_t* arena_at(Renderer& r, VkDeviceSize offset) { return static_cast<uint8_t*>(r.arena.mapped) + offset; }
@@ -629,6 +639,7 @@ void write_back_pages(uint64_t from, uint64_t to) {
         VkBufferImageCopy copies[2];
         const uint32_t n = surface_copies(*s, copies);
         vkCmdCopyImageToBuffer(r.demand_cmd, s->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->staging.buffer, n, copies);
+        g_stats.copied_bytes += s->staging.size;
     }
     VkMemoryBarrier2 to_host_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     to_host_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, to_host_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -703,6 +714,7 @@ void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s, bool discard) {
     VkBufferImageCopy copies[2];
     const uint32_t n = surface_copies(s, copies);
     vkCmdCopyBufferToImage(cmd, s.staging.buffer, s.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, copies);
+    g_stats.copied_bytes += s.staging.size;
     host::transition(cmd, s.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      s.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, aspects(s));
 }
@@ -907,6 +919,7 @@ void renderer_flush(const char* why) {
         VkBufferImageCopy copies[2];
         const uint32_t n = surface_copies(*s, copies);
         vkCmdCopyImageToBuffer(r.cmd, s->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->staging.buffer, n, copies);
+        g_stats.copied_bytes += s->staging.size;
     }
     // Everything copied back is visible to the host once the fence is signalled.
     VkMemoryBarrier2 to_host_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -987,6 +1000,9 @@ void renderer_flush(const char* why) {
             }
         }
     }
+    // The pipelines to disk once the game has made none for three seconds (on the cache's worker thread).
+    if (const uint64_t made = r.cache.counts().drawing; made != r.pipelines_seen) r.pipelines_seen = made, r.pipelines_grew = Clock::now();
+    else if (r.cache.made_since_save() && Clock::now() - r.pipelines_grew > std::chrono::seconds(3)) r.cache.save(false);
     r.recording = false;
     ++r.flushes;
     ++g_stats.flushes;
@@ -1056,10 +1072,27 @@ void renderer_report() {
                    static_cast<unsigned long long>(g_stats.flushes.load()), ms(g_stats.flush_ns), ms(g_stats.wait_ns), ms(g_stats.writeback_ns),
                    ms(g_stats.gpu_draw_ns), ms(g_stats.gpu_copy_ns));
     qilin::rt::log("renderer: %llu textures copied from surfaces on the GPU", static_cast<unsigned long long>(g_stats.surface_textures.load()));
+    const PipelineCache::Counts pipelines = g_renderer ? g_renderer->cache.counts() : PipelineCache::Counts{};
+    qilin::rt::log("renderer: %llu pipelines made ahead, %llu when a draw needed them (%llu draws waited for one being made ahead); %llu MB written to the arenas, %llu MB copied on the GPU",
+                   static_cast<unsigned long long>(pipelines.ahead), static_cast<unsigned long long>(pipelines.drawing), static_cast<unsigned long long>(pipelines.waited),
+                   static_cast<unsigned long long>(g_stats.arena_bytes.load() >> 20), static_cast<unsigned long long>(g_stats.copied_bytes.load() >> 20));
     qilin::rt::log("renderer: %llu surfaces written back when touched (%.0f ms)%s", static_cast<unsigned long long>(g_stats.on_demand.load()), ms(g_stats.on_demand_ns),
                    lazy_writeback() ? "" : " (RR7_EAGER_WRITEBACK, or faults not handled: written back at every flush)");
     const std::lock_guard lock(g_flush_reasons_mutex);
     for (const auto& [why, count] : g_flush_reasons) qilin::rt::log("renderer: %llu flushes for %s", static_cast<unsigned long long>(count), why.c_str());
+}
+
+RendererCounters renderer_counters() {
+    const PipelineCache::Counts pipelines = g_renderer ? g_renderer->cache.counts() : PipelineCache::Counts{};
+    return {g_stats.draws.load(), pipelines.ahead, pipelines.drawing, pipelines.waited, g_stats.arena_bytes.load(), g_stats.copied_bytes.load()};
+}
+
+void renderer_pipelines_wait() {
+    if (g_renderer) g_renderer->cache.wait_ahead();
+}
+
+void renderer_pipelines_save() {
+    if (g_renderer) g_renderer->cache.save(true);
 }
 
 void renderer_draw(const Draw& d) {
@@ -1367,6 +1400,7 @@ void renderer_draw(const Draw& d) {
                     c.imageExtent = {std::max(1u, up.texels.width >> l), std::max(1u, up.texels.height >> l), 1};
                 }
             vkCmdCopyBufferToImage(cmd, r.arena.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(levels.size()), levels.data());
+            g_stats.copied_bytes += up.texels.rgba.size();
             transition_texture(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
     }
@@ -1404,8 +1438,16 @@ void renderer_draw(const Draw& d) {
     const VkRect2D scissor{{static_cast<int32_t>(window.x0), static_cast<int32_t>(window.y0)}, {window.x1 - window.x0, window.y1 - window.y0}};
 
     // What the draw binds and sets, where it differs from what the command buffer has.
-    if (const VkPipeline pipeline = r.cache.pipeline(d, vs, fs, forms, format, vulkan_topology(assembly->topology), *raster); pipeline != bound.pipeline)
+    // (Every attribute read, as four floats.)
+    std::array<uint8_t, 16> vertex_formats{};
+    for (uint32_t a = 0; a < 16; ++a)
+        if (vs.inputs & (1u << a)) vertex_formats[a] = kVertexFloats;
+    const VkPrimitiveTopology topology = vulkan_topology(assembly->topology);
+    if (const VkPipeline pipeline = r.cache.pipeline(r.cache.key(d, vs, fs, forms, format, topology, *raster, vertex_formats)); pipeline != bound.pipeline)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline), bound.pipeline = pipeline;
+    const DynamicState dynamic = dynamic_state(d, topology, *raster, gpu.depth_bounds);
+    set_dynamic_state(cmd, dynamic, bound.have_dynamic ? &bound.dynamic : nullptr, r.cache.bounds_dynamic());
+    bound.dynamic = dynamic, bound.have_dynamic = true;
     const VkViewport viewport{0, 0, static_cast<float>(d.color.width), static_cast<float>(d.color.height), 0.0f, 1.0f};
     if (!bound.have_viewport || bound.viewport.width != viewport.width || bound.viewport.height != viewport.height) {
         vkCmdSetViewport(cmd, 0, 1, &viewport);

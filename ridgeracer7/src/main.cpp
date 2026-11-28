@@ -202,7 +202,7 @@ int main(int argc, char** argv) {
     host::Display display(o);
     qilin::rt::log("graphics device: %s", display.device_name().c_str());
     static std::mutex queue;  // the GPU's queue: the renderer's draws and the window's presentation take turns on it
-    rr7::renderer_start(display.gpu(), queue);
+    rr7::renderer_start(display.gpu(), queue, data_folder);  // (its pipelines recorded there, made ahead at the next start)
     // The settings menu (F1 or Esc), over the game; none headless.
     rr7::Menu menu(display, settings, data_folder, queue);
     rr7::ControlTable controls = quiet ? rr7::ControlTable{} : control_table(display, settings, data_folder);

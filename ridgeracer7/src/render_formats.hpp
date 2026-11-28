@@ -89,4 +89,24 @@ float half_float(const uint8_t* p);
 // components big-endian. False for a type not taken (nothing is written then).
 bool decode_attributes(uint32_t format, const uint8_t* p, size_t stride, uint32_t count, float* out);
 
+// How a vertex attribute is given to the GPU, as a byte (the renderer's pipeline keys hold one for each attribute): its own
+// format, the RSX's type | size << 4 (type 1 to 7 but 6, size 1 to 4), each component in the GPU's format of the same kind
+// (renderer_pipelines.cpp: vertex_input); or kVertexFloats, four floats made by decode_attributes (a size past four, or a
+// format the GPU can't read); or kVertexConstant, no array: one value, 0, 0, 0, 1, for every vertex. 0: not read.
+inline constexpr uint8_t kVertexFloats = 0xff, kVertexConstant = 0xfe;
+inline constexpr bool vertex_format_native(uint8_t f) {
+    const uint32_t type = f & 0xf, size = f >> 4;
+    return f != kVertexFloats && f != kVertexConstant && type >= 1 && type <= 7 && type != 6 && size >= 1 && size <= 4;
+}
+// The bytes a vertex takes in an attribute's own format (its components' bytes, three made four: the GPU's formats of
+// three 8- and 16-bit components are not required to exist), a whole number of words.
+inline constexpr uint32_t native_stride(uint8_t f) {
+    const uint32_t type = f & 0xf, size = f >> 4;
+    const uint32_t bytes = (type == 2 ? 4 : type == 4 || type == 7 ? 1 : 2) * (type != 2 && size == 3 ? 4 : size);
+    return (bytes + 3) / 4 * 4;
+}
+// An attribute's `count` vertices from `p`, `stride` bytes apart, in its own format (vertex_format_native): each component
+// in the host's byte order, a fourth component of 1 where three are given, native_stride(f) bytes a vertex.
+void encode_attributes(uint8_t f, const uint8_t* p, size_t stride, uint32_t count, uint8_t* out);
+
 }  // namespace rr7

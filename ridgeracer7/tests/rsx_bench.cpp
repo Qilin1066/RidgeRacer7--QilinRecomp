@@ -5,9 +5,12 @@
 // indices, constants and push constants, the texels uploaded, the pipelines' state, the surfaces written back), so that a
 // change meant to be faster can be shown to give the GPU exactly the same.
 //
-//   ridgeracer7_rsx_bench [--frames N] [--lazy] [--touch]
-//     --lazy   surfaces are written back when touched (as when faults are handled), not at every flush
-//     --touch  ...and touched after every frame, as the game reading a surface would (implies --lazy)
+//   ridgeracer7_rsx_bench [--frames N] [--lazy] [--touch] [--pipelines FOLDER [--expect-ahead]]
+//     --lazy       surfaces are written back when touched (as when faults are handled), not at every flush
+//     --touch      ...and touched after every frame, as the game reading a surface would (implies --lazy)
+//     --pipelines  the pipelines made are recorded in FOLDER (as the game records them in its data folder), and those an
+//                  earlier run recorded there made ahead (waited for before the first frame)
+//     --expect-ahead  fails unless every pipeline drawn with was made ahead (a second run on the same folder)
 //
 // It prints microseconds per frame for each part, and the digest. In ctest it runs two frames, as a test that the whole
 // path runs.
@@ -782,13 +785,16 @@ void run_frame(rr7::RsxState& s, Acts& acts, uint32_t bytes) {
 
 int main(int argc, char** argv) {
     uint32_t frames = 30;
-    bool touch = false;
+    bool touch = false, expect_ahead = false;
+    std::string pipelines;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--frames" && i + 1 < argc) frames = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (a == "--lazy") g_lazy = true;
         else if (a == "--touch") g_lazy = touch = true;
-        else return std::fprintf(stderr, "usage: ridgeracer7_rsx_bench [--frames N] [--lazy] [--touch]\n"), 2;
+        else if (a == "--pipelines" && i + 1 < argc) pipelines = argv[++i];
+        else if (a == "--expect-ahead") expect_ahead = true;
+        else return std::fprintf(stderr, "usage: ridgeracer7_rsx_bench [--frames N] [--lazy] [--touch] [--pipelines FOLDER [--expect-ahead]]\n"), 2;
     }
     static qilin::rt::AddressSpace space;
     g_space = &space;
@@ -807,7 +813,8 @@ int main(int argc, char** argv) {
     vkGetPhysicalDeviceMemoryProperties(gpu.physical, &gpu.memory);
     gpu.fill_non_solid = gpu.logic_op = gpu.clip_distance = gpu.depth_bounds = true;
     static std::mutex queue;
-    rr7::renderer_start(gpu, queue);
+    rr7::renderer_start(gpu, queue, pipelines);
+    rr7::renderer_pipelines_wait();
 
     static rr7::RsxState s;
     s.state[0x0198 / 4] = 0xFEED0000u, s.state[0x1454 / 4] = 1;
@@ -833,6 +840,7 @@ int main(int argc, char** argv) {
         g_digesting = false;
         // Each frame's time: the best and the median are given (other work on the computer only ever makes a frame slower).
         std::vector<double> times;
+        const rr7::RendererCounters before = rr7::renderer_counters();
         for (uint32_t i = 0; i < frames; ++i) {
             const Clock::time_point start = Clock::now();
             run_frame(s, acts, bytes);
@@ -841,9 +849,12 @@ int main(int argc, char** argv) {
         }
         std::sort(times.begin(), times.end());
         std::printf("  %-48s best %8.1f us, median %8.1f us a frame (%.3f us a draw)\n", what, times.front(), times[times.size() / 2], times.front() / kDraws);
-        if (depth == Depth::draw)
-            std::printf("  pipelines made: %llu in the first frame drawn, %llu in the %u after\n", static_cast<unsigned long long>(made_first),
-                        static_cast<unsigned long long>(g_pipelines_made - made_before - made_first), frames);
+        if (depth == Depth::draw) {
+            const rr7::RendererCounters after = rr7::renderer_counters();
+            std::printf("  pipelines made: %llu in the first frame drawn, %llu in the %u after; a frame writes %.2f MB to the arenas, copies %.2f MB on the GPU\n",
+                        static_cast<unsigned long long>(made_first), static_cast<unsigned long long>(g_pipelines_made - made_before - made_first), frames,
+                        static_cast<double>(after.arena_bytes - before.arena_bytes) / frames / 1048576.0, static_cast<double>(after.copied_bytes - before.copied_bytes) / frames / 1048576.0);
+        }
         g_digesting = true;
     };
     time(Depth::parse, "commands only (rsx_state.hpp: run_command)");
@@ -884,7 +895,15 @@ int main(int argc, char** argv) {
     digest(space.base() + rr7::kRsxLocal + kColour, size_t{kPitch} * kHeight);
     digest(space.base() + rr7::kRsxLocal + kDepth, size_t{kPitch} * kHeight);
     rr7::renderer_report();
+    const rr7::RendererCounters counted = rr7::renderer_counters();
+    if (!pipelines.empty()) {
+        rr7::renderer_pipelines_save();
+        std::printf("pipelines: %llu made ahead, %llu when a draw needed them; recorded in %s\n", static_cast<unsigned long long>(counted.pipelines_ahead),
+                    static_cast<unsigned long long>(counted.pipelines_drawing), pipelines.c_str());
+    }
     std::printf("%llu draws given to Vulkan; digest %016llx\n", static_cast<unsigned long long>(g_vk_draws), static_cast<unsigned long long>(g_digest));
     if (g_vk_draws != uint64_t{kDraws} * (frames + 2)) return std::fprintf(stderr, "expected %u draws a frame\n", kDraws), 1;
+    if (expect_ahead && (counted.pipelines_drawing != 0 || counted.pipelines_ahead == 0))
+        return std::fprintf(stderr, "expected every pipeline made ahead, from the folder's record\n"), 1;
     return 0;
 }

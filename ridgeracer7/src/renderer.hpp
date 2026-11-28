@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <mutex>
 #include <vector>
@@ -108,7 +109,9 @@ struct Draw {
 };
 
 // The device to draw with, and the lock every use of its queue takes (the window's presentation uses the queue too).
-void renderer_start(qilin::host::Gpu& gpu, std::mutex& queue);
+// `pipeline_folder`: where the pipelines made are recorded, with the driver's pipeline cache, for the next start to make
+// them ahead (renderer_pipelines.hpp; the data folder; empty: nowhere).
+void renderer_start(qilin::host::Gpu& gpu, std::mutex& queue, const std::filesystem::path& pipeline_folder = {});
 bool renderer_started();
 // Draws it, into a batch: surfaces stay on the GPU until the batch is flushed. Then what was drawn is written back to guest
 // memory: when something first touches it (its pages are unreadable until then: renderer_fault), or at once where faults
@@ -141,6 +144,18 @@ void renderer_guest_access(uint32_t address, uint64_t bytes);
 bool renderer_fault(uint32_t address);
 // Where the renderer's time has gone (a development aid: logged when a timed run ends).
 void renderer_report();
+// What the renderer has done so far, counted (for the bench).
+struct RendererCounters {
+    uint64_t draws = 0;
+    uint64_t pipelines_ahead = 0, pipelines_drawing = 0, pipeline_waits = 0;  // made ahead, made for a draw, draws that waited
+    uint64_t arena_bytes = 0;   // written by the CPU into the arenas: vertices, indices, constants, texels
+    uint64_t copied_bytes = 0;  // copied by the GPU between buffers and images
+};
+RendererCounters renderer_counters();
+// Waits until the pipelines recorded by an earlier run are made (a development aid, for the bench); writes the pipelines
+// to disk now (they are written by themselves when the game has made none for a while).
+void renderer_pipelines_wait();
+void renderer_pipelines_save();
 
 // A flip's picture: RGBA8 pixels, `width` by `height`, rows packed; or (rgba null) one the renderer keeps on the GPU,
 // numbered `gpu_frame` (renderer_frame_image).

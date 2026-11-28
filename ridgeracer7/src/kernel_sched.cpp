@@ -31,7 +31,7 @@ namespace {
 // all (the console would have preempted that thread at once); when the worst holder is as good as it, kPatience (the
 // console would have shared its time with them); when every holder is better, kLongPatience (something holds a token
 // that should have given it up).
-constexpr auto kPatience = std::chrono::milliseconds(1);
+constexpr auto kPatience = std::chrono::microseconds(250);  // (the game's sound thread, priority 0, has 5.33 ms a block)
 constexpr auto kLongPatience = std::chrono::milliseconds(50);
 constexpr uint64_t kLentLogged = 8;  // the first so many lent tokens are logged
 

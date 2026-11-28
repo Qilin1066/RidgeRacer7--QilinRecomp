@@ -15,7 +15,7 @@
 // console would preempt it at once; not inside a handler that has called the
 // game back, which may hold a lock of its own). One that outranks a thread holding a token runs at
 // once, on a token lent until the next one is given back (one as good as the
-// worst holder after kPatience, 1 ms; one worse than every holder after 50 ms): guest code between system calls can't be
+// worst holder after kPatience, 250 us; one worse than every holder after 50 ms): guest code between system calls can't be
 // interrupted here, and a thread polling memory in a loop would otherwise
 // hold its token for ever. That stands in for the console's preemption; it is
 // counted and the first few are logged.

@@ -240,6 +240,13 @@ if(QILIN_HOST)
     FetchContent_Declare(volk GIT_REPOSITORY https://github.com/zeux/volk GIT_TAG vulkan-sdk-1.4.363.0 GIT_SHALLOW ON
                          SOURCE_SUBDIR no-cmake)
     FetchContent_MakeAvailable(SDL3 VulkanHeaders volk)
+    # SDL's Wayland protocol headers, made from its own XML, before the system's (as Toy Commander's): SDL adds them as a
+    # system folder, and zig's compiler (the Linux download's) searches the system's /usr/include first, whose older
+    # wayland-client-protocol.h (Ubuntu 22.04's) lacks what SDL uses. SDL includes them in quotes, and -iquote folders
+    # come before every -I and -isystem one.
+    if(TARGET SDL3-static AND EXISTS "${sdl3_BINARY_DIR}/wayland-generated-protocols" AND NOT MSVC)
+        target_compile_options(SDL3-static BEFORE PRIVATE "-iquote${sdl3_BINARY_DIR}/wayland-generated-protocols")
+    endif()
     add_library(qilin_volk STATIC ${volk_SOURCE_DIR}/volk.c)
     target_include_directories(qilin_volk PUBLIC ${volk_SOURCE_DIR})
     target_link_libraries(qilin_volk PUBLIC Vulkan::Headers ${CMAKE_DL_LIBS})

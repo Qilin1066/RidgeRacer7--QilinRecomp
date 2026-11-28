@@ -18,7 +18,8 @@ namespace {
 constexpr uint64_t kNotInitialised = 0x80130101u, kNotTerminated = 0x80130102u;
 
 std::mutex g_mutex;
-bool g_net = false, g_netctl = false;
+[[maybe_unused]] bool g_net = false;  // (set and cleared; nothing asks it yet)
+bool g_netctl = false;
 
 // sys_net_initialize_network_ex(sys_net_initialize_parameter_t* {memory, its size, flags}): the socket library starts.
 void sys_net_initialize_network_ex(Cpu& c) {

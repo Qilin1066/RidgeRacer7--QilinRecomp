@@ -5,6 +5,10 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ## [Unreleased]
 
 ### Added
+- Relaxed floating point for play (`QILIN_FP_EXACT`, 0 by default; the differential test runs 1, the exact mode): the host's float and double arithmetic and `std::fma`, VMX as SSE on x86-64 and NEON on ARM64 with a portable twin, the flush-to-zero mode set once per thread. `fmadds` x20 97 to 49 ns, the largest VMX leaf functions 2,237 to 610 and 972 to 318 (MSVC). The differential test bounds it against the exact mode (`docs/recompiler-core.md`, "Relaxed floating point").
+- A direct call writes back and reads again only what its callee may read or write, from a whole-program analysis of each function's effects on the registers (`register_effects`): 25,833 of 60,340 calls; the lifted text 108 to 100 MB. 300 programs of three functions in the differential test.
+- Condition fields that only compares set and only folded branches read are formed where they are written back, not at each compare: `memchr` 69 to 36 ns, `strlen` 46 to 33 (the `memchr` loss of the round before).
+- `fctiw`, `fctiwz`, `fctid` and `fctidz` inline and exact without a library call.
 - The lifter's dataflow (`docs/recompiler-core.md`, "Lifted code's speed"): a call, return or trap writes back only the registers, CR fields and XER bits that may have changed; a branch whose CR bit comes only from compares of one kind reads the compare's operands (`if (k7a == k7b)`); memory goes through a local base. The lifted text is 8% smaller; `lifted_022` compiles in 6.1 s and 400 MB with MSVC (13.4 s, 615 MB before), `lifted_020` in 21.2 s and 776 MB (33.8 s, 871 MB).
 - Calls through a register find their function in a dense index (`runtime/include/qilin/rt/dispatch.hpp`): one load, where the binary search took about 35 ns.
 - VMX's `vmaddfp` and `vnmsubfp` take four plain elements at once, rounded once by a halfway test (`fp::rounds_once_to_single`, also before the scalar fused forms' two-sum); `vperm` and `vsldoi` work on words. Bit-exact as before.

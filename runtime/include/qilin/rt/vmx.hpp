@@ -2,8 +2,9 @@
 //
 // A vector register is four words, element 0 first (the guest's order),
 // each held as a host integer. Bytes are numbered as the guest numbers them:
-// byte 0 is the top byte of word 0. Everything is plain portable C++ on
-// fixed-size arrays, which compilers vectorise: no host intrinsics.
+// byte 0 is the top byte of word 0. Everything but the relaxed mode's
+// floating point (below) is plain portable C++ on fixed-size arrays, which
+// compilers vectorise.
 //
 // Floating point is single precision, element by element, bit-exact:
 //   - a NaN operand gives the first NaN operand (vA, then vB, then vC), made

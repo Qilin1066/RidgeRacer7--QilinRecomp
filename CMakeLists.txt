@@ -36,17 +36,17 @@ endif()
 
 option(QILIN_WERROR "Treat warnings in our own code as errors" OFF)
 
-# Floating point is bit-exact with the guest: the host compiler must not fuse
-# a multiply and an add on its own (the PowerPC fmadd family is fused, and
-# will be written as std::fma; nothing else is).
-if(NOT MSVC)
-    add_compile_options(-ffp-contract=off)
-endif()
+# The compiler's settings for speed and exactness: floating point bit-exact with the guest (no contraction), the
+# processor presets (QILIN_CPU: pi4, pi5, ...), the lifted code's level, LTO and PGO of the game. docs/toolchain.md.
+include(cmake/toolchain.cmake)
 
 # ---- Warnings for our own targets ----
 add_library(qilin_warnings INTERFACE)
 if(MSVC)
-    target_compile_options(qilin_warnings INTERFACE /W4 /permissive- /utf-8 /Zc:__cplusplus /Zc:preprocessor)
+    target_compile_options(qilin_warnings INTERFACE /W4 /permissive- /utf-8 /Zc:__cplusplus)
+    if(QILIN_REAL_MSVC)
+        target_compile_options(qilin_warnings INTERFACE /Zc:preprocessor)  # (clang-cl's preprocessor is standard already)
+    endif()
     # fopen/strerror etc. are standard C++; MSVC's "use the _s variants" advice is not.
     target_compile_definitions(qilin_warnings INTERFACE _CRT_SECURE_NO_WARNINGS)
     if(QILIN_WERROR)
@@ -235,7 +235,7 @@ if(QILIN_HOST)
     target_link_libraries(qilin_host PUBLIC qilin_volk PRIVATE SDL3::SDL3-static qilin_warnings)
     # Vulkan structures are written {sType} with the rest zeroed: that's the idiom, not a mistake.
     # (On the sources, so it comes after -Wextra on the command line.)
-    if(NOT MSVC)
+    if(NOT QILIN_REAL_MSVC)  # (clang-cl too)
         set_source_files_properties(host/src/vulkan.cpp host/src/display.cpp host/src/audio.cpp host/src/paths.cpp host/tests/vktest.cpp
                                     PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
     endif()
@@ -323,7 +323,7 @@ add_library(ridgeracer7_machine STATIC
 )
 target_include_directories(ridgeracer7_machine PUBLIC ridgeracer7/src)
 # Vulkan structures are written {sType} with the rest zeroed: the idiom, not a mistake (as host/'s sources).
-if(NOT MSVC)
+if(NOT QILIN_REAL_MSVC)
     set_source_files_properties(ridgeracer7/src/renderer.cpp ridgeracer7/src/renderer_pipelines.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
 endif()
 if(NOT TARGET qilin_host)
@@ -336,7 +336,9 @@ target_include_directories(ridgeracer7_machine SYSTEM PRIVATE $<TARGET_PROPERTY:
 add_library(ridgeracer7_window STATIC ridgeracer7/src/menu.cpp)
 target_link_libraries(ridgeracer7_window PUBLIC ridgeracer7_machine qilin_host qilin_imgui SDL3::SDL3-static PRIVATE qilin_warnings)
 target_compile_definitions(ridgeracer7_window PRIVATE RIDGERACER7_VERSION="${PROJECT_VERSION}")
-if(NOT MSVC)
+qilin_game_target(ridgeracer7_machine)
+qilin_game_target(ridgeracer7_window)
+if(NOT QILIN_REAL_MSVC)
     target_compile_options(ridgeracer7_window PRIVATE -Wno-missing-field-initializers)
 endif()
 # The RSX's side of a frame timed on the CPU: a synthetic frame of 2,000 draws through the command processing, the draws'
@@ -345,7 +347,7 @@ add_executable(ridgeracer7_rsx_bench ridgeracer7/tests/rsx_bench.cpp ridgeracer7
     ridgeracer7/src/renderer_pipelines.cpp ridgeracer7/src/render_formats.cpp ridgeracer7/src/render_state.cpp ridgeracer7/src/textures.cpp)
 target_include_directories(ridgeracer7_rsx_bench PRIVATE recomp/src ridgeracer7/src)
 target_link_libraries(ridgeracer7_rsx_bench PRIVATE qilin_host qilin_rt qilin_warnings)
-if(NOT MSVC)
+if(NOT QILIN_REAL_MSVC)
     target_compile_options(ridgeracer7_rsx_bench PRIVATE -Wno-missing-field-initializers)
 endif()
 add_test(NAME ridgeracer7_rsx_bench COMMAND ridgeracer7_rsx_bench --frames 2)
@@ -371,6 +373,8 @@ if(QILIN_GEN_DIR)
         set_source_files_properties("${QILIN_GEN_DIR}/shaders.cpp" PROPERTIES COMPILE_OPTIONS "/w;/bigobj")
     else()
         set_source_files_properties("${QILIN_GEN_DIR}/shaders.cpp" PROPERTIES COMPILE_OPTIONS "-w")
+    endif()
+    if(NOT QILIN_REAL_MSVC)
         set_source_files_properties(ridgeracer7/src/shader_check.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
     endif()
     add_executable(ridgeracer7 ridgeracer7/src/main.cpp ${qilin_lifted})
@@ -378,11 +382,15 @@ if(QILIN_GEN_DIR)
     target_link_libraries(ridgeracer7 PRIVATE ridgeracer7_machine ridgeracer7_window qilin_host SDL3::SDL3-static qilin_warnings)
     # Lifted code is generated: its unused labels and the like are not warnings worth reading.
     if(MSVC)
-        set_source_files_properties(${qilin_lifted} PROPERTIES COMPILE_OPTIONS "/w;/bigobj")
-        target_compile_options(ridgeracer7 PRIVATE /MP)  # the lifted files side by side
+        set(qilin_lifted_flags /w /bigobj ${QILIN_LIFTED_OPTIONS})
     else()
-        set_source_files_properties(${qilin_lifted} PROPERTIES COMPILE_OPTIONS "-w")
+        set(qilin_lifted_flags -w ${QILIN_LIFTED_OPTIONS})
     endif()
+    set_source_files_properties(${qilin_lifted} PROPERTIES COMPILE_OPTIONS "${qilin_lifted_flags}")
+    if(QILIN_REAL_MSVC)
+        target_compile_options(ridgeracer7 PRIVATE /MP)  # the lifted files side by side (Ninja runs clang-cl's in parallel itself)
+    endif()
+    qilin_game_target(ridgeracer7)
 endif()
 
 # ---- The differential test of the lifter ----

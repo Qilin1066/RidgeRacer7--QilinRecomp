@@ -17,6 +17,8 @@ jobs:
           - { name: macos-arm64,       os: macos-latest }
           - { name: macos-x64,         os: macos-15-intel }
           - { name: windows-x64,       os: windows-2022 }
+          # The game's preferred compiler on Windows (docs/toolchain.md): Visual Studio's own Clang, through its ClangCL toolset.
+          - { name: windows-x64-clang-cl, os: windows-2022, toolset: ClangCL }
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     steps:
@@ -37,6 +39,9 @@ jobs:
           args=()
           if [ -n "${{ matrix.cxx }}" ]; then
             args+=(-DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }})
+          fi
+          if [ -n "${{ matrix.toolset }}" ]; then
+            args+=(-T ${{ matrix.toolset }})
           fi
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQILIN_WERROR=ON "${args[@]}"
       - name: Build

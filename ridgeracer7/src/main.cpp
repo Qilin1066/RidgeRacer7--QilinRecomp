@@ -279,7 +279,7 @@ int main(int argc, char** argv) {
             rr7::spu_report();
             qilin::rt::log("stopped: RR7_SECONDS's %s seconds are over, at flip %llu", seconds, static_cast<unsigned long long>(flips.load()));
             std::fflush(nullptr);
-            std::_Exit(0);
+            rr7::exit_process(0);  // (which writes a profiling build's counts: cmake/toolchain.cmake)
         }
         {
             uint16_t pressed1 = 0, pressed2 = 0;

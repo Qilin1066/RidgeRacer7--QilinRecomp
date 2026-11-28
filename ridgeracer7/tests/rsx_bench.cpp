@@ -159,6 +159,7 @@ struct PipelineRecord {
 };
 std::mutex g_pipelines_mutex;  // (pipelines may be made on the renderer's worker thread)
 std::unordered_map<VkPipeline, PipelineRecord> g_pipelines;
+std::unordered_map<VkShaderModule, uint64_t> g_modules;  // each module's code, hashed (not its handle: modules may be made in any order)
 uint64_t g_pipelines_made = 0;
 
 // What the command buffer has bound and set, for the digest at each draw.
@@ -265,7 +266,8 @@ void digest_draw(uint32_t vertices) {
         if (p.dynamic & kStencilReference) face->reference = set->reference;
     }
     digest_state(s);
-    digest_value(p.modules), digest(p.specialisation.data(), p.specialisation.size());
+    for (const VkShaderModule m : p.modules) digest_value(g_modules.at(m));
+    digest(p.specialisation.data(), p.specialisation.size());
     digest_value(p.blend), digest_value(p.logic), digest_value(p.logic_op), digest_value(p.colour), digest_value(p.depth), digest_value(p.stencil);
     digest_value(g_bound.scissor), digest_value(g_bound.viewport), digest(g_bound.push.data(), g_bound.push.size());
     if (g_bound.textures)
@@ -336,7 +338,14 @@ void stub_vulkan() {
         digest_value(info->magFilter), digest_value(info->minFilter), digest_value(info->addressModeU), digest_value(info->maxLod);
         return *out = fake_handle<VkSampler>(), VK_SUCCESS;
     };
-    vkCreateShaderModule = [](VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule* out) { return *out = fake_handle<VkShaderModule>(), VK_SUCCESS; };
+    vkCreateShaderModule = [](VkDevice, const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks*, VkShaderModule* out) {
+        const std::lock_guard lock(g_pipelines_mutex);
+        *out = fake_handle<VkShaderModule>();
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < info->codeSize; ++i) h = (h ^ reinterpret_cast<const uint8_t*>(info->pCode)[i]) * 0x100000001b3ull;
+        g_modules[*out] = h;
+        return VK_SUCCESS;
+    };
     vkCreateGraphicsPipelines = [](VkDevice, VkPipelineCache, uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* out) {
         const std::lock_guard lock(g_pipelines_mutex);
         for (uint32_t i = 0; i < count; ++i) {
@@ -553,13 +562,16 @@ std::vector<uint8_t> fragment_microcode(unsigned program, uint32_t constant_seed
     return out;
 }
 
-const uint32_t kSpirv[1] = {0x07230203u};
+// (Each program's own code: the magic number and its address.)
+uint32_t g_spirv[kVertexPrograms + kFragmentPrograms][2];
 const uint32_t kConstantSlots[2] = {16, 64};
 
 qilin::rt::TranslatedShader make_shader(bool vertex, unsigned program) {
     qilin::rt::TranslatedShader s{};
     s.vertex = vertex, s.address = (vertex ? 0x100000u : 0x200000u) + program * 0x100;
-    s.spirv = kSpirv, s.spirv_words = 1;
+    uint32_t* code = g_spirv[vertex ? program : kVertexPrograms + program];
+    code[0] = 0x07230203u, code[1] = s.address;
+    s.spirv = code, s.spirv_words = 2;
     std::vector<uint8_t> keyed;
     if (vertex) {
         for (unsigned i = 0; i < kVertexProgramLength; ++i)

@@ -50,17 +50,32 @@ void decode_attribute(const uint8_t* p, size_t stride, uint32_t size, uint32_t c
 
 // An attribute's vertices in its own format: `Bytes` a component, `Size` given, `One` the fourth's value where three are.
 // (All known when compiled: a vertex is a few loads, swaps and a store.)
+template <class Word>
+Word swapped(const uint8_t* p) {
+    Word w;
+    std::memcpy(&w, p, sizeof w);
+    if constexpr (sizeof(Word) == 1) return w;
+    else return std::byteswap(w);
+}
 template <uint32_t Bytes, uint32_t Size, uint32_t One>
 void encode_sized(const uint8_t* p, size_t stride, uint32_t count, uint8_t* out) {
+    using Word = std::conditional_t<Bytes == 4, uint32_t, std::conditional_t<Bytes == 2, uint16_t, uint8_t>>;
     constexpr uint32_t padded = Bytes < 4 && Size == 3 ? 4 : Size;
     constexpr uint32_t out_stride = (Bytes * padded + 3) / 4 * 4;
     for (uint32_t v = 0; v < count; ++v, p += stride, out += out_stride) {
-        uint8_t vertex[out_stride] = {};
-        for (uint32_t c = 0; c < Size; ++c)
-            for (uint32_t b = 0; b < Bytes; ++b) vertex[Bytes * c + b] = p[Bytes * c + Bytes - 1 - b];
-        if constexpr (padded != Size)
-            for (uint32_t b = 0; b < Bytes; ++b) vertex[Bytes * 3 + b] = static_cast<uint8_t>(One >> (8 * b));
-        std::memcpy(out, vertex, out_stride);
+        if constexpr (Bytes == 1 && Size == 4) {
+            std::memcpy(out, p, 4);  // (bytes: in the same order)
+        } else {
+            for (uint32_t c = 0; c < Size; ++c) {
+                const Word w = swapped<Word>(p + Bytes * c);
+                std::memcpy(out + Bytes * c, &w, Bytes);
+            }
+            if constexpr (padded != Size) {
+                const auto one = static_cast<Word>(One);
+                std::memcpy(out + Bytes * 3, &one, Bytes);
+            }
+        }
+        // (Bytes past the components, up to the stride's whole word, are never read.)
     }
 }
 template <uint32_t Bytes, uint32_t One>

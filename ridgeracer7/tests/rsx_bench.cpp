@@ -923,6 +923,19 @@ int main(int argc, char** argv) {
         });
         const double depth_in = best_of([&] { rr7::depth_row_to_host(guest, reinterpret_cast<uint32_t*>(host.data()), host.data() + pixels * 4, pixels, false); });
         std::printf("  a %ux%u surface: to the image %.1f us, back %.1f us; a depth surface to the image %.1f us, back %.1f us\n", kWidth, kHeight, to_host, to_guest, depth_in, depth);
+        // A frame's vertices (its three attributes, 100 vertices a draw), as four floats each and in their own formats.
+        const uint8_t* vertices = rr7::guest_memory() + rr7::kRsxLocal + kVertices;
+        const uint32_t all = kDraws * kVerticesPerDraw;
+        std::vector<uint8_t> out(size_t{all} * 16);
+        const uint32_t formats[3] = {2u | 3u << 4, 4u | 4u << 4, 2u | 2u << 4}, offsets[3] = {0, 12, 16};
+        const double floats = best_of([&] {
+            for (uint32_t a = 0; a < 3; ++a) rr7::decode_attributes(formats[a], vertices + offsets[a], kVertexStride, all, reinterpret_cast<float*>(out.data()));
+        });
+        const double own = best_of([&] {
+            for (uint32_t a = 0; a < 3; ++a) rr7::encode_attributes(static_cast<uint8_t>(formats[a]), vertices + offsets[a], kVertexStride, all, out.data());
+        });
+        std::printf("  a frame's vertices (%u, three attributes): as four floats %.1f us (%u bytes a vertex), in their own formats %.1f us (%u bytes)\n", all, floats,
+                    3 * 16, own, rr7::native_stride(0x32) + rr7::native_stride(0x44) + rr7::native_stride(0x22));
     }
     // The digest of everything the stubs were given (in the first frame drawn and in one more), and of the surfaces as
     // guest memory holds them then.

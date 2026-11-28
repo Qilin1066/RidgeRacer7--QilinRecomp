@@ -1348,8 +1348,18 @@ void renderer_draw(const Draw& d) {
 
     // What the draw takes from the arena (a fragment program's inline constants as much as set 0's range), and a descriptor
     // set: if the batch hasn't room, it is flushed first.
-    const uint32_t attributes = static_cast<uint32_t>(std::popcount(vs.inputs & 0xffffu));
-    VkDeviceSize needed = r.align * 8 + VkDeviceSize{16} * attributes * d.count + index_list.size() * 4 + kVertexConstants * 16 + r.fragment_range;
+    // Each attribute read as the GPU is given it (renderer_pipelines.hpp: vertex_format), and the room its vertices take
+    // (each attribute's run beginning on 16 bytes).
+    std::array<uint8_t, 16> vertex_formats{};
+    VkDeviceSize vertex_bytes = 0;
+    uint32_t attributes = 0;
+    for (uint32_t a = 0; a < 16; ++a)
+        if (vs.inputs & (1u << a)) {
+            vertex_formats[a] = r.cache.vertex_format(d.attribute_format[a]);
+            const VertexInput in = vertex_input(vertex_formats[a]);
+            vertex_bytes += (in.per_instance ? 16 : (VkDeviceSize{in.stride} * d.count + 15) / 16 * 16), ++attributes;
+        }
+    VkDeviceSize needed = r.align * 8 + vertex_bytes + index_list.size() * 4 + kVertexConstants * 16 + r.fragment_range;
     for (const Upload& up : uploads) needed += up.decode ? up.texels.rgba.size() + r.align : 0;
     begin_batch(r);
     if (needed > r.arena.size) {
@@ -1380,30 +1390,35 @@ void renderer_draw(const Draw& d) {
     for (const Upload& up : uploads) up.cached->used = r.flushes;
     VkCommandBuffer cmd = r.cmd;
 
-    // The vertices: every attribute the program reads, as four floats.
+    // The vertices: every attribute the program reads, in its own format where the GPU reads that (its components' bytes
+    // put in the host's order, no more), else as four floats.
     std::array<VkDeviceSize, 16> offsets{};  // each attribute read's place in the arena, by slot
-    const VkDeviceSize vertex_at = arena_take(r, std::max<VkDeviceSize>(16, VkDeviceSize{16} * attributes * d.count));
+    const VkDeviceSize vertex_at = arena_take(r, std::max<VkDeviceSize>(16, vertex_bytes));
+    VkDeviceSize run = 0;  // (the next attribute's run, from vertex_at)
     for (uint32_t a = 0, slot = 0; a < 16; ++a) {
         if (!(vs.inputs & (1u << a))) continue;
         const uint32_t format_word = d.attribute_format[a], stride = (format_word >> 8) & 0xff;
-        const VkDeviceSize at = vertex_at + VkDeviceSize{slot} * 16 * d.count;
-        float* out = reinterpret_cast<float*>(arena_at(r, at));
-        if (((format_word >> 4) & 0xf) == 0) {
+        const uint8_t f = vertex_formats[a];
+        const VertexInput in = vertex_input(f);
+        uint8_t* out = arena_at(r, vertex_at + run);
+        offsets[slot++] = vertex_at + run;
+        run += in.per_instance ? 16 : (VkDeviceSize{in.stride} * d.count + 15) / 16 * 16;
+        if (f == kVertexConstant) {
             // No array: every vertex reads the attribute's current value, which the RSX's immediate methods set
             // (SET_VERTEX_DATA*: none of them is sent by the game, and one would stop it as a method not provided), so
-            // the value it starts with: 0, 0, 0, 1 (*a stated choice, to be checked against the console*).
-            for (uint32_t v = 0; v < d.count; ++v) out[4 * v] = out[4 * v + 1] = out[4 * v + 2] = 0.0f, out[4 * v + 3] = 1.0f;
-            offsets[slot++] = at;
+            // the value it starts with: 0, 0, 0, 1 (*a stated choice, to be checked against the console*). One value,
+            // read for every vertex (a binding read per instance, and one instance drawn).
+            constexpr float kStart[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            std::memcpy(out, kStart, sizeof kStart);
             continue;
         }
-        if (!decode_attributes(format_word, guest_memory() + d.attribute_address[a] + size_t{d.first} * stride, stride, d.count, out))
+        const uint8_t* from = guest_memory() + d.attribute_address[a] + size_t{d.first} * stride;
+        if (f != kVertexFloats) encode_attributes(f, from, stride, d.count, out);
+        else if (!decode_attributes(format_word, from, stride, d.count, reinterpret_cast<float*>(out)))
             fatal("a vertex attribute of type %u, which the renderer doesn't take yet", format_word & 0xf);
-        if (d.logged && d.count) {
-            const uint8_t* raw = guest_memory() + d.attribute_address[a] + d.first * stride;
-            qilin::rt::log("(draw)   attribute %u format %08x: first vertex %g %g %g %g (bytes %02x %02x %02x %02x)", a, format_word, out[0], out[1], out[2], out[3], raw[0],
-                           raw[1], raw[2], raw[3]);
-        }
-        offsets[slot++] = at;
+        if (d.logged && d.count)
+            qilin::rt::log("(draw)   attribute %u format %08x, given as %02x: first vertex's bytes %02x %02x %02x %02x, as given %02x %02x %02x %02x", a, format_word, f, from[0],
+                           from[1], from[2], from[3], out[0], out[1], out[2], out[3]);
     }
     VkDeviceSize index_at = 0;
     if (!index_list.empty()) {
@@ -1524,10 +1539,6 @@ void renderer_draw(const Draw& d) {
     const VkRect2D scissor{{static_cast<int32_t>(window.x0), static_cast<int32_t>(window.y0)}, {window.x1 - window.x0, window.y1 - window.y0}};
 
     // What the draw binds and sets, where it differs from what the command buffer has.
-    // (Every attribute read, as four floats.)
-    std::array<uint8_t, 16> vertex_formats{};
-    for (uint32_t a = 0; a < 16; ++a)
-        if (vs.inputs & (1u << a)) vertex_formats[a] = kVertexFloats;
     const VkPrimitiveTopology topology = vulkan_topology(assembly->topology);
     if (const VkPipeline pipeline = r.cache.pipeline(r.cache.key(d, vs, fs, forms, format, topology, *raster, vertex_formats)); pipeline != bound.pipeline)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline), bound.pipeline = pipeline;

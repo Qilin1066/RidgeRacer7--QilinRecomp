@@ -6,6 +6,7 @@
 // The definitions: PSL1GHT's public headers for the texture format word and the remap (CELL_GCM_TEXTURE_REMAP: output A,
 // R, G, B in bits 0-1, 2-3, 4-5, 6-7 each taking input A 0, R 1, G 2 or B 3; their kinds in bits 8-15, 0 zero, 1 one, 2 the
 // input); the formats' channels as their names give them, 16-bit texels big-endian; DXT as on a PC.
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -238,6 +239,56 @@ void test_attributes() {
     CHECK(std::isinf(rr7::half_float(h[3])) && rr7::half_float(h[4]) == 65504.0f);
 }
 
+// An attribute in its own format (encode_attributes), read as the GPU reads its format (Vulkan's conversions: SNORM
+// max(c / 32767, -1), UNORM c / 255, SCALED the number itself, floats as they are; components a format lacks 0, 0, 0, 1),
+// must be the four floats decode_attributes makes of it, bit for bit, for every type and size.
+void test_native_attributes() {
+    constexpr uint32_t kVertices = 7, kStride = 20;
+    uint8_t guest[kVertices * kStride];
+    uint32_t seed = 12345;
+    for (uint8_t& b : guest) seed = seed * 1103515245u + 12345u, b = static_cast<uint8_t>(seed >> 16);
+    CHECK(!rr7::vertex_format_native(6 | 1 << 4) && !rr7::vertex_format_native(2) && !rr7::vertex_format_native(2 | 5 << 4) && !rr7::vertex_format_native(rr7::kVertexFloats));
+    for (const uint32_t type : {1u, 2u, 3u, 4u, 5u, 7u})
+        for (uint32_t size = 1; size <= 4; ++size) {
+            const auto f = static_cast<uint8_t>(type | size << 4);
+            CHECK(rr7::vertex_format_native(f));
+            const uint32_t bytes = type == 2 ? 4 : type == 4 || type == 7 ? 1 : 2;
+            const uint32_t given = bytes < 4 && size == 3 ? 4 : size;  // (three 8- or 16-bit components given as four)
+            const uint32_t stride = rr7::native_stride(f);
+            CHECK(stride % 4 == 0 && stride >= bytes * given && stride < bytes * given + 4);
+            std::vector<uint8_t> native(size_t{kVertices} * stride);
+            rr7::encode_attributes(f, guest, kStride, kVertices, native.data());
+            float floats[kVertices * 4];
+            CHECK(rr7::decode_attributes(type | size << 4, guest, kStride, kVertices, floats));
+            for (uint32_t v = 0; v < kVertices; ++v) {
+                const uint8_t* p = native.data() + size_t{v} * stride;
+                float read[4] = {0, 0, 0, 1};
+                for (uint32_t c = 0; c < given; ++c) {
+                    const uint8_t* q = p + bytes * c;
+                    int16_t s16;
+                    std::memcpy(&s16, q, 2);
+                    switch (type) {
+                    case 1: read[c] = std::max(-1.0f, static_cast<float>(s16) / 32767.0f); break;
+                    case 2: std::memcpy(&read[c], q, 4); break;
+                    case 3: {
+                        const uint8_t big[2] = {q[1], q[0]};
+                        read[c] = rr7::half_float(big);
+                        break;
+                    }
+                    case 4: read[c] = static_cast<float>(q[0]) / 255.0f; break;
+                    case 5: read[c] = static_cast<float>(s16); break;
+                    default: read[c] = static_cast<float>(q[0]); break;
+                    }
+                }
+                if (std::memcmp(read, floats + 4 * v, sizeof read) != 0) {
+                    std::fprintf(stderr, "type %u size %u vertex %u: read %g %g %g %g, decoded %g %g %g %g\n", type, size, v, read[0], read[1], read[2], read[3], floats[4 * v],
+                                 floats[4 * v + 1], floats[4 * v + 2], floats[4 * v + 3]);
+                    ++failures;
+                }
+            }
+        }
+}
+
 void test_depth() {
     // Every 24-bit depth comes back as it went, as a float or as itself.
     bool all = true;
@@ -411,6 +462,7 @@ int main() {
     test_surfaces_as_textures();
     test_format_word();
     test_attributes();
+    test_native_attributes();
     test_depth();
     test_assembly();
     test_rasterisation();

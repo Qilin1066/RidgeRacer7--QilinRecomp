@@ -18,7 +18,10 @@
 // worst holder after kPatience, 250 us; one worse than every holder after 50 ms): guest code between system calls can't be
 // interrupted here, and a thread polling memory in a loop would otherwise
 // hold its token for ever. That stands in for the console's preemption; it is
-// counted and the first few are logged.
+// counted and the first few are logged. A waiting thread doesn't poll to
+// find out when it may borrow: it parks until that time (precisely, see
+// Parker below), and is woken sooner only if the holders or a priority change
+// make the time come sooner.
 //
 // The common case costs a compare-and-swap on one word: taking a token when
 // one is free and nobody waits, giving one back when nobody waits. Only a
@@ -33,10 +36,18 @@
 // Runtime code: no std::format.
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <vector>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#elif defined(_M_ARM64)
+#include <intrin.h>
+#endif
 
 namespace rr7 {
 
@@ -79,6 +90,8 @@ int32_t current_priority();
 // How many times a thread ran on a lent token (see the top); the tokens free now (below 0 while some are lent), the
 // threads waiting for one, and how many waits on objects have begun (for tests).
 uint64_t lent_tokens();
+// How many times a thread waiting for a token has woken (granted, lent, or only to look again), for tests.
+uint64_t core_wakeups();
 int32_t free_core_tokens();
 uint32_t threads_waiting_for_core();
 uint64_t waits_begun();
@@ -156,6 +169,104 @@ private:
     std::vector<Waiter*> waiters_;
     uint64_t seq_ = 0;
     WakeOrder order_;
+};
+
+// ---- waiting without spinning ----
+//
+// A busy wait takes a core the game needs (a Raspberry Pi has four, against the console's two PPU threads, six SPUs and
+// the RSX), and the host's plain timed waits are coarse: on Windows a sleep or a condition variable's timeout is whole
+// milliseconds (15.6 ms unless the timer's resolution is raised, as SDL raises it to 1 ms). What follows waits precisely
+// and is woken by whoever changes what is waited for.
+
+// What a core does while spinning: tells the core so (x86's pause, ARM's yield), freeing its other hardware thread.
+inline void cpu_relax() {
+#if defined(_M_X64) || defined(__x86_64__)
+    _mm_pause();
+#elif defined(_M_ARM64)
+    __yield();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+// Sleeps until `when`, to within the host's timer: about 50 us on Linux and macOS (the calling thread's timer slack is made
+// 1 ns on Linux), half a millisecond on Windows (a high-resolution waitable timer: plain sleeps there are 1 to 15.6 ms).
+void sleep_until_precisely(std::chrono::steady_clock::time_point when);
+
+// One thread's wait that others can end early, timed as precisely as sleep_until_precisely. A wake given while nobody
+// waits ends the next wait at once (it is not lost). One thread parks on it at a time.
+class Parker {
+public:
+    Parker();
+    ~Parker();
+    Parker(const Parker&) = delete;
+    Parker& operator=(const Parker&) = delete;
+    // Waits until unpark() or `when` (time_point::max(): for ever). False if the time ran out first.
+    bool park_until(std::chrono::steady_clock::time_point when);
+    void unpark();
+
+private:
+#if defined(_WIN32)
+    void* event_;
+#else
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool permit_ = false;
+#endif
+};
+
+// How a Doorbell's waiter waits: it spins for `spin` from the start of the wait, then parks `nap` at a time until
+// `napping` from the start, then `park` at a time; a ring ends a park at once. (The timeouts are for what changes
+// without ringing, the game's own stores: a doorbell every change rings can park for long.)
+struct WaitPlan {
+    std::chrono::microseconds spin{20}, nap{100}, napping{2000}, park{1000};
+};
+
+// What one thread waits for, which others change and ring for. Ringing costs a fence and a load when nobody waits.
+class Doorbell {
+public:
+    using Clock = std::chrono::steady_clock;
+    // Waits until ready() (asked after every wake: it reads what the ringers change), or `until`; true if ready. `since`
+    // is when the wait began (a wait taken up again for the same thing passes the same). One waiter at a time.
+    template <class Ready>
+    bool wait(Ready&& ready, Clock::time_point since, Clock::time_point until = Clock::time_point::max(), const WaitPlan& plan = {}) {
+        for (auto now = Clock::now(); now - since < plan.spin; now = Clock::now()) {
+            if (ready()) return true;
+            if (now >= until) return false;
+            cpu_relax();
+        }
+        begin();
+        bool came = ready();
+        while (!came) {
+            const auto now = Clock::now();
+            if (now >= until) break;
+            const auto step = now - since < plan.napping ? plan.nap : plan.park;
+            park(until - now < step ? until : now + step);
+            came = ready();
+        }
+        waiting_.store(false, std::memory_order_release);
+        return came;
+    }
+    // What the waiter waits for may have come: it looks again.
+    void ring() {
+        std::atomic_thread_fence(std::memory_order_seq_cst);  // (the change before, the look at waiting_ after)
+        if (waiting_.load(std::memory_order_relaxed)) {
+            rings_.fetch_add(1, std::memory_order_relaxed);
+            parker_.unpark();
+        }
+    }
+    bool waited_on() const { return waiting_.load(std::memory_order_relaxed); }
+    // How many times its waiters have woken (rung or timed out), and been rung while waiting (for tests).
+    uint64_t wakeups() const { return wakeups_.load(std::memory_order_relaxed); }
+    uint64_t rings() const { return rings_.load(std::memory_order_relaxed); }
+
+private:
+    void begin();  // a waiter parks from now on (a second at once stops the game)
+    void park(Clock::time_point when);
+
+    Parker parker_;
+    std::atomic<bool> waiting_{false};
+    std::atomic<uint64_t> wakeups_{0}, rings_{0};
 };
 
 }  // namespace rr7

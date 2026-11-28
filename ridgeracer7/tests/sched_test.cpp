@@ -305,6 +305,175 @@ void lend() {
     check(rr7::free_core_tokens() == 1, "the token back");
 }
 
+// A thread waiting for a lent token wakes when it may borrow, not every so often to look: a worse thread behind a holder
+// that never calls the system (lent after kLongPatience, 50 ms) and an equal one (after kPatience, 250 us) each wake a
+// few times at most, and on time.
+void lend_wakes() {
+    rr7::configure_scheduler(1, false, true);
+    become_guest(500);
+    std::vector<std::thread> threads;
+    static std::atomic<int64_t> took_us{-1};
+    const auto timed = [] {
+        const auto asked = std::chrono::steady_clock::now();
+        rr7::take_core();
+        took_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - asked).count();
+    };
+    for (const int32_t priority : {1000, 500}) {
+        took_us = -1;
+        const uint64_t before = rr7::core_wakeups();
+        threads.push_back(guest(static_cast<uint32_t>(priority) + 1, priority, timed, false));
+        const auto from = std::chrono::steady_clock::now();
+        while (took_us.load() < 0 && std::chrono::steady_clock::now() - from < 5s) {
+        }
+        join(threads);
+        const uint64_t woke = rr7::core_wakeups() - before;
+        std::printf("a thread of priority %d (the holder's 500) had a lent token after %lld us, having woken %llu times\n", priority,
+                    static_cast<long long>(took_us.load()), static_cast<unsigned long long>(woke));
+        check(took_us.load() >= 0, "the waiting thread was lent a token");
+        check(woke <= 3, "a thread waiting for a lent token wakes only when it may borrow");
+        if (priority == 1000) check(took_us.load() >= 50000 && took_us.load() < 80000, "a worse thread is lent a token after 50 ms");
+        else check(took_us.load() >= 250 && took_us.load() < 5000, "an equal thread is lent a token soon after 250 us");
+    }
+    check(rr7::free_core_tokens() == 0 && rr7::threads_waiting_for_core() == 0, "every lent token repaid");
+    rr7::give_up_core();
+}
+
+// A waiting thread is woken when a change of priority lets it borrow sooner than it was waiting to: the holder made worse
+// than it, it borrows at once, not when its 50 ms are up.
+void lend_hurry() {
+    rr7::configure_scheduler(1, false, true);
+    become_guest(100);
+    std::vector<std::thread> threads;
+    static std::atomic<int64_t> took_at{-1};
+    const auto origin = std::chrono::steady_clock::now();
+    threads.push_back(guest(600, 500, [origin] {
+        rr7::take_core();
+        took_at = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - origin).count();
+    }, false));
+    until([] { return rr7::threads_waiting_for_core() == 1; }, "the worse thread waits");
+    spin_for(5ms);
+    check(took_at.load() < 0, "no lent token yet for a thread worse than the holder");
+    const uint64_t before = rr7::core_wakeups();
+    const auto changed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - origin).count();
+    rr7::set_sched_priority(rr7::kFirstThreadId, 1000);  // (the holder, now worse than the waiting thread)
+    const auto from = std::chrono::steady_clock::now();
+    while (took_at.load() < 0 && std::chrono::steady_clock::now() - from < 5s) {
+    }
+    join(threads);
+    std::printf("lent a token %lld us after the holder became worse (woken %llu times)\n", static_cast<long long>(took_at.load() - changed),
+                static_cast<unsigned long long>(rr7::core_wakeups() - before));
+    check(took_at.load() >= 0 && took_at.load() - changed < 20000, "a thread let borrow by a change of priority is woken for it");
+    rr7::give_up_core();
+}
+
+// What the scheduler costs (not in ctest: `ridgeracer7_sched_test bench`): a token taken and given back with one free,
+// a switch point with nobody waiting, and a token handed between two threads of equal priority by yields.
+void bench() {
+    using Clock = std::chrono::steady_clock;
+    rr7::configure_scheduler(1, false, false);  // (no lending: the two threads take turns only by yielding)
+    become_guest(100);
+    rr7::give_up_core();
+    constexpr int kRounds = 1000000;
+    auto from = Clock::now();
+    for (int i = 0; i < kRounds; ++i) {
+        rr7::take_core();
+        rr7::give_up_core();
+    }
+    std::printf("take and give back, a token free: %.1f ns\n", std::chrono::duration<double, std::nano>(Clock::now() - from).count() / kRounds);
+    rr7::take_core();
+    from = Clock::now();
+    for (int i = 0; i < kRounds; ++i) rr7::switch_point();
+    std::printf("a switch point, nobody waiting: %.1f ns\n", std::chrono::duration<double, std::nano>(Clock::now() - from).count() / kRounds);
+    from = Clock::now();
+    for (int i = 0; i < kRounds; ++i) rr7::yield_core();
+    std::printf("a yield, nobody waiting: %.1f ns\n", std::chrono::duration<double, std::nano>(Clock::now() - from).count() / kRounds);
+    constexpr int kHandoffs = 20000;
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+    threads.push_back(guest(2, 100, [&] {
+        while (!stop.load()) rr7::yield_core();
+    }));
+    until([] { return rr7::threads_waiting_for_core() == 1; }, "the other thread waits");
+    const uint64_t wakeups = rr7::core_wakeups();
+    from = Clock::now();
+    for (int i = 0; i < kHandoffs; ++i) rr7::yield_core();
+    const double each = std::chrono::duration<double, std::micro>(Clock::now() - from).count() / kHandoffs;
+    stop = true;
+    rr7::give_up_core();
+    join(threads);
+    std::printf("a token handed to an equal thread and back by yields: %.2f us a round, %.2f wake-ups a round\n", each,
+                static_cast<double>(rr7::core_wakeups() - wakeups) / kHandoffs);
+}
+
+// ---------------------------------------------------------------- waiting without spinning
+
+// Short sleeps are short (the game polls the RSX with sys_timer_usleep(30)), and a doorbell's waiter wakes when rung, and
+// otherwise seldom: the wake-ups are counted.
+void waking() {
+    using Clock = std::chrono::steady_clock;
+    rr7::configure_scheduler(2, false, true);
+    // sys_timer_usleep(30), as the game's wait for the RSX's reference makes it.
+    become_guest(100);
+    std::vector<int64_t> slept;
+    for (int i = 0; i < 100; ++i) {
+        const auto from = Clock::now();
+        check(sc(141, {30}) == rr7::kOk, "sys_timer_usleep");
+        slept.push_back(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - from).count());
+    }
+    std::ranges::sort(slept);
+    std::printf("sys_timer_usleep(30) slept %lld us (median), %lld us (90th percentile)\n", static_cast<long long>(slept[50]), static_cast<long long>(slept[90]));
+    check(slept[0] >= 30, "a sleep is never short");
+    check(slept[50] < 1000, "a 30 us sleep is well under a millisecond");
+    rr7::give_up_core();
+
+    // A doorbell rung by every change: its waiter parks for long, and wakes once a ring.
+    rr7::Doorbell bell;
+    std::atomic<int> value{0};
+    constexpr rr7::WaitPlan kRung{.spin = std::chrono::microseconds(20), .nap = 100ms, .napping = 0ms, .park = 100ms};
+    std::atomic<int64_t> latency_sum{0};
+    std::atomic<int> done{0};
+    std::thread ringer([&] {
+        for (int i = 1; i <= 20; ++i) {
+            until([&] { return done.load() == i - 1 && bell.waited_on(); }, "the doorbell's waiter parks");
+            std::this_thread::sleep_for(2ms);
+            value.store(i, std::memory_order_relaxed);
+            latency_sum -= std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+            bell.ring();
+        }
+    });
+    for (int i = 1; i <= 20; ++i) {
+        check(bell.wait([&] { return value.load(std::memory_order_relaxed) >= i; }, Clock::now(), Clock::time_point::max(), kRung), "the doorbell's wait came");
+        latency_sum += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+        done = i;
+    }
+    ringer.join();
+    std::printf("a rung doorbell: 20 waits, %llu wake-ups, %llu rings, %lld us from ring to waking (mean)\n", static_cast<unsigned long long>(bell.wakeups()),
+                static_cast<unsigned long long>(bell.rings()), static_cast<long long>(latency_sum.load() / 20));
+    check(bell.wakeups() <= 25, "a waiter wakes about once a ring");
+    check(latency_sum.load() / 20 < 2000, "a rung waiter wakes soon");
+
+    // A change nobody rings for (the game's own store): seen within the plan's naps, which are few.
+    rr7::Doorbell quiet;
+    std::atomic<int64_t> stored_at{0};
+    std::thread writer([&] {
+        std::this_thread::sleep_for(10ms);
+        stored_at = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+        value.store(1000, std::memory_order_relaxed);
+    });
+    check(quiet.wait([&] { return value.load(std::memory_order_relaxed) == 1000; }, Clock::now()), "the unrung wait came");
+    const int64_t seen = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count() - stored_at.load();
+    writer.join();
+    std::printf("an unrung doorbell: seen %lld us after the store, %llu wake-ups in 10 ms\n", static_cast<long long>(seen), static_cast<unsigned long long>(quiet.wakeups()));
+    check(seen < 3000, "an unrung change is seen within a park or two");
+    check(quiet.wakeups() < 60, "an unrung wait parks rather than spins");
+
+    // A wait that runs out.
+    rr7::Doorbell late;
+    const auto from = Clock::now();
+    check(!late.wait([] { return false; }, from, from + 5ms), "a wait that never comes runs out");
+    check(Clock::now() - from >= 5ms && Clock::now() - from < 50ms, "on time");
+}
+
 // RR7_FREE_THREADS: no tokens; every thread runs at once.
 void free_threads() {
     rr7::configure_scheduler(2, true);
@@ -638,6 +807,10 @@ int main(int argc, char** argv) {
     else if (name == "blocking") blocking();
     else if (name == "sleep") sleeping();
     else if (name == "lend") lend();
+    else if (name == "lend-wakes") lend_wakes();
+    else if (name == "lend-hurry") lend_hurry();
+    else if (name == "waking") waking();
+    else if (name == "bench") bench();
     else if (name == "free") free_threads();
     else if (name == "mutex-fifo") mutex_order(rr7::kSyncFifo);
     else if (name == "mutex-priority") mutex_order(rr7::kSyncPriority);

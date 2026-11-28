@@ -235,8 +235,22 @@ QILIN_FP_INLINE double fsqrts(double b) {
 // x + y rounded once to single, for an exact x and y that are not NaNs: the
 // sum in double, the error of that sum (exactly, by Knuth's two-sum), and
 // from the error's sign the single nearest the true sum.
+//
+// Most sums skip the two-sum: rounding the double to single gives the single nearest the true sum unless the
+// double is exactly halfway between two singles (any such halfway point is itself a double, so none can lie
+// between the true sum and its nearest double). That holds wherever a single's last place is a fixed bit of the
+// double: in the singles' normal range, [2^-126, 2^128), so the test is the low 29 bits of the double's
+// fraction. A zero is exact (a sum rounds to zero only when it is zero).
+// (single_once is the same test as 0 or 1, without branches, for testing four at once.)
+QILIN_FP_INLINE unsigned single_once(double r) {
+    const uint64_t b = bits(r) & ~kSign;
+    return static_cast<unsigned>(b == 0) |
+           (static_cast<unsigned>(b - 0x3810000000000000ull < 0x47F0000000000000ull - 0x3810000000000000ull) & static_cast<unsigned>((b & 0x1FFFFFFFull) != 0x10000000ull));
+}
+QILIN_FP_INLINE bool rounds_once_to_single(double r) { return single_once(r) != 0; }
 QILIN_FP_INLINE double add_to_single(double x, double y) {
     const double r = x + y;
+    if (rounds_once_to_single(r)) return static_cast<double>(static_cast<float>(r));
     if (!finite(r)) return r == r ? r : from_bits(kDefaultNan);  // an infinity, or infinity less infinity
     const double bv = r - x, av = r - bv;
     const double error = (x - av) + (y - bv);

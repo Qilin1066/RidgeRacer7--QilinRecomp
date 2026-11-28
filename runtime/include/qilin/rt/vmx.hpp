@@ -41,14 +41,14 @@ QILIN_INLINE void set_byte(Vec& v, unsigned i, unsigned b) {
 }
 
 // ---- memory: lvx and stvx ignore the low four bits of the address ----
-QILIN_INLINE Vec lvx(Cpu& c, uint32_t ea) {
+QILIN_INLINE Vec lvx(const uint8_t* m, uint32_t ea) {
     ea &= ~15u;
-    return {{static_cast<uint32_t>(read32(c, ea)), static_cast<uint32_t>(read32(c, ea + 4)), static_cast<uint32_t>(read32(c, ea + 8)),
-             static_cast<uint32_t>(read32(c, ea + 12))}};
+    return {{static_cast<uint32_t>(read32(m, ea)), static_cast<uint32_t>(read32(m, ea + 4)), static_cast<uint32_t>(read32(m, ea + 8)),
+             static_cast<uint32_t>(read32(m, ea + 12))}};
 }
-QILIN_INLINE void stvx(Cpu& c, uint32_t ea, const Vec& v) {
+QILIN_INLINE void stvx(uint8_t* m, uint32_t ea, const Vec& v) {
     ea &= ~15u;
-    for (unsigned i = 0; i < 4; ++i) write32(c, ea + 4 * i, v.w[i]);
+    for (unsigned i = 0; i < 4; ++i) write32(m, ea + 4 * i, v.w[i]);
 }
 // The permute controls for unaligned access: sixteen consecutive byte numbers, from the address's low four bits.
 inline Vec lvsl(uint32_t ea) {
@@ -76,20 +76,26 @@ QILIN_INLINE Vec vsel(const Vec& a, const Vec& b, const Vec& c) {
 }
 // Each byte chosen from the 32 of a and b by the low five bits of c's byte.
 inline Vec vperm(const Vec& a, const Vec& b, const Vec& c) {
-    Vec r{};
-    for (unsigned i = 0; i < 16; ++i) {
-        const unsigned n = byte(c, i) & 31;
-        set_byte(r, i, n < 16 ? byte(a, n) : byte(b, n - 16));
+    uint8_t from[32] = {};
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint32_t x = std::byteswap(a.w[i]), y = std::byteswap(b.w[i]);
+        std::memcpy(from + 4 * i, &x, 4);
+        std::memcpy(from + 16 + 4 * i, &y, 4);
+    }
+    Vec r;
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint32_t control = c.w[i];
+        r.w[i] = uint32_t{from[(control >> 24) & 31]} << 24 | uint32_t{from[(control >> 16) & 31]} << 16 | uint32_t{from[(control >> 8) & 31]} << 8 |
+                 from[control & 31];
     }
     return r;
 }
-// Sixteen bytes of a and b end to end, from byte `shift`.
-inline Vec vsldoi(const Vec& a, const Vec& b, unsigned shift) {
-    Vec r{};
-    for (unsigned i = 0; i < 16; ++i) {
-        const unsigned n = i + shift;
-        set_byte(r, i, n < 16 ? byte(a, n) : byte(b, n - 16));
-    }
+// Sixteen bytes of a and b end to end, from byte `shift` (0 to 15): whole words, and the bytes between two.
+QILIN_INLINE Vec vsldoi(const Vec& a, const Vec& b, unsigned shift) {
+    const uint32_t w[8] = {a.w[0], a.w[1], a.w[2], a.w[3], b.w[0], b.w[1], b.w[2], b.w[3]};
+    const unsigned word = shift >> 2, bits = 8 * (shift & 3);
+    Vec r;
+    for (unsigned i = 0; i < 4; ++i) r.w[i] = bits ? (w[word + i] << bits) | (w[word + i + 1] >> (32 - bits)) : w[word + i];
     return r;
 }
 QILIN_INLINE Vec vmrghw(const Vec& a, const Vec& b) { return {{a.w[0], b.w[0], a.w[1], b.w[1]}}; }
@@ -135,7 +141,8 @@ QILIN_INLINE uint32_t add32(uint32_t a, uint32_t b, bool subtract) {
     return r == r ? result(r) : kDefaultNan32;  // infinity less infinity
 }
 // a * c + b, or a * c - b, fused; the negative of it with `negate`.
-QILIN_INLINE uint32_t fused32(uint32_t a, uint32_t c, uint32_t b, bool subtract, bool negate) {
+// The general case: NaNs and infinities among the operands, and sums whose rounding needs the two-sum.
+QILIN_FP_SLOW uint32_t fused32_slow(uint32_t a, uint32_t c, uint32_t b, bool subtract, bool negate) {
     if (nan32(a)) return a | kQuiet32;
     if (nan32(b)) return b | kQuiet32;
     if (nan32(c)) return c | kQuiet32;
@@ -146,6 +153,49 @@ QILIN_INLINE uint32_t fused32(uint32_t a, uint32_t c, uint32_t b, bool subtract,
     if (r != r) return kDefaultNan32;
     return result(negate ? -r : r);
 }
+// The usual case first: finite operands (a denormal is a zero) and a sum that rounds once to a normal single or
+// zero (fp::rounds_once_to_single), so no denormal result to flush either.
+QILIN_INLINE uint32_t fused32(uint32_t a, uint32_t c, uint32_t b, bool subtract, bool negate) {
+    if (((a & 0x7f800000u) != 0x7f800000u) & ((b & 0x7f800000u) != 0x7f800000u) & ((c & 0x7f800000u) != 0x7f800000u)) {
+        const double product = value(operand(a)) * value(operand(c));  // exact: 24 bits by 24
+        const double addend = value(operand(b));
+        const double r = product + (subtract ? -addend : addend);
+        if (fp::rounds_once_to_single(r)) {
+            const uint32_t w = std::bit_cast<uint32_t>(static_cast<float>(r));
+            return negate ? w ^ 0x80000000u : w;
+        }
+    }
+    return fused32_slow(a, c, b, subtract, negate);
+}
+// A normal single or a zero: what the whole-vector fast paths below take, with no NaN, infinity or denormal to mind.
+// (Written with & and | on whole numbers, not && and ||: a compiler then tests four elements without a branch each.)
+QILIN_INLINE unsigned plain32(uint32_t w) { return static_cast<unsigned>(((w >> 23) & 0xffu) - 1u < 254u) | static_cast<unsigned>((w << 1) == 0); }
+// The four elements by the general path, out of line: what the fast path below leaves.
+QILIN_FP_SLOW Vec fused_vec_slow(const Vec& a, const Vec& c, const Vec& b, bool subtract, bool negate) {
+    Vec r;
+    for (unsigned i = 0; i < 4; ++i) r.w[i] = fused32(a.w[i], c.w[i], b.w[i], subtract, negate);
+    return r;
+}
+// a * c + b (or - b, negated with `negate`), all four elements: with plain operands, each sum in a double from the
+// exact product, and rounded once to single where fp::rounds_once_to_single says it may be; else element by element,
+// out of line (so that the inline code in a long lifted function stays small).
+QILIN_INLINE Vec fused_vec(const Vec& a, const Vec& c, const Vec& b, bool subtract, bool negate) {
+    unsigned plain = 1;
+    for (unsigned i = 0; i < 4; ++i) plain &= plain32(a.w[i]) & plain32(b.w[i]) & plain32(c.w[i]);
+    if (plain) {
+        Vec r;
+        unsigned fine = 1;
+        for (unsigned i = 0; i < 4; ++i) {
+            const double addend = value(b.w[i]);
+            const double sum = value(a.w[i]) * value(c.w[i]) + (subtract ? -addend : addend);
+            fine &= fp::single_once(sum);
+            r.w[i] = std::bit_cast<uint32_t>(static_cast<float>(sum)) ^ (negate ? 0x80000000u : 0u);
+        }
+        if (fine) return r;
+    }
+    return fused_vec_slow(a, c, b, subtract, negate);
+}
+// (Element by element: a whole-vector fast path, as fused_vec has, measured slower with MSVC and no faster with Clang.)
 QILIN_INLINE Vec vaddfp(const Vec& a, const Vec& b) {
     return {{add32(a.w[0], b.w[0], false), add32(a.w[1], b.w[1], false), add32(a.w[2], b.w[2], false), add32(a.w[3], b.w[3], false)}};
 }
@@ -153,17 +203,9 @@ QILIN_INLINE Vec vsubfp(const Vec& a, const Vec& b) {
     return {{add32(a.w[0], b.w[0], true), add32(a.w[1], b.w[1], true), add32(a.w[2], b.w[2], true), add32(a.w[3], b.w[3], true)}};
 }
 // vD = vA * vC + vB
-QILIN_INLINE Vec vmaddfp(const Vec& a, const Vec& c, const Vec& b) {
-    Vec r;
-    for (unsigned i = 0; i < 4; ++i) r.w[i] = fused32(a.w[i], c.w[i], b.w[i], false, false);
-    return r;
-}
+QILIN_INLINE Vec vmaddfp(const Vec& a, const Vec& c, const Vec& b) { return fused_vec(a, c, b, false, false); }
 // vD = -(vA * vC - vB)
-QILIN_INLINE Vec vnmsubfp(const Vec& a, const Vec& c, const Vec& b) {
-    Vec r;
-    for (unsigned i = 0; i < 4; ++i) r.w[i] = fused32(a.w[i], c.w[i], b.w[i], true, true);
-    return r;
-}
+QILIN_INLINE Vec vnmsubfp(const Vec& a, const Vec& c, const Vec& b) { return fused_vec(a, c, b, true, true); }
 // ---- the estimates (see the top of the file) ----
 // 1/x. A double holds more than twice a single's digits and two more, so its quotient rounds to the single's correctly.
 QILIN_INLINE uint32_t reciprocal32(uint32_t w) {

@@ -12,6 +12,7 @@
 
 #include "import_names.hpp"
 #include "kernel.hpp"
+#include "qilin/rt/dispatch.hpp"
 #include "qilin/rt/memory.hpp"
 #include "qilin/rt/report.hpp"
 #include "renderer.hpp"
@@ -34,6 +35,7 @@ struct Import {
 struct Machine {
     qilin::rt::AddressSpace space;
     std::span<const qilin::rt::LiftedFunction> functions;
+    qilin::rt::FunctionIndex function_index;  // the functions by address, for calls through a register
     std::span<const qilin::rt::LiftedSpuProgram> spu_programs;
     std::vector<Import> imports;
     std::chrono::steady_clock::time_point started;
@@ -52,11 +54,7 @@ uint32_t g_trace_thread = 0;
 bool g_trace_all = false;
 bool traced() { return g_trace_all || (g_trace_thread && current_thread() == g_trace_thread); }
 
-qilin::rt::GuestFn find_function(uint32_t address) {
-    const auto& functions = g_machine->functions;
-    const auto it = std::ranges::lower_bound(functions, address, {}, &qilin::rt::LiftedFunction::address);
-    return it != functions.end() && it->address == address ? it->fn : nullptr;
-}
+qilin::rt::GuestFn find_function(uint32_t address) { return g_machine->function_index.find(address); }
 
 // ---- the hooks lifted code calls ----
 
@@ -203,6 +201,7 @@ int run(const qilin::Elf& elf, std::span<const qilin::rt::LiftedFunction> functi
     machine.spu_programs = spu_programs;
     machine.info = std::move(info);
     machine.functions = functions;
+    machine.function_index = qilin::rt::FunctionIndex(functions);
     machine.started = std::chrono::steady_clock::now();
     if (!machine.space.base()) fatal("the host refused the 4 GiB of address space the guest's memory needs");
     uint8_t* const memory = machine.space.base();

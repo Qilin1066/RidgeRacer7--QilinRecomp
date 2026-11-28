@@ -119,37 +119,52 @@ inline uint32_t fpscr_fields(uint32_t old, unsigned fm, double b) {
 }
 
 // ---- memory: plain host memory at mem + address, in the guest's byte order ----
-QILIN_INLINE uint64_t read8(Cpu& c, uint32_t a) { return c.mem[a]; }
-QILIN_INLINE uint64_t read16(Cpu& c, uint32_t a) {
+// Lifted code passes a local copy of Cpu::mem (`m`), not the Cpu: a store through a byte pointer may alias anything,
+// so a compiler would otherwise read c.mem again after every store. A load is a memcpy and a byte swap: one mov and a
+// bswap (or a movbe, or a rev on ARM).
+QILIN_INLINE uint64_t read8(const uint8_t* m, uint32_t a) { return m[a]; }
+QILIN_INLINE uint64_t read16(const uint8_t* m, uint32_t a) {
     uint16_t v;
-    std::memcpy(&v, c.mem + a, 2);
+    std::memcpy(&v, m + a, 2);
     return std::byteswap(v);
 }
-QILIN_INLINE uint64_t read32(Cpu& c, uint32_t a) {
+QILIN_INLINE uint64_t read32(const uint8_t* m, uint32_t a) {
     uint32_t v;
-    std::memcpy(&v, c.mem + a, 4);
+    std::memcpy(&v, m + a, 4);
     return std::byteswap(v);
 }
-QILIN_INLINE uint64_t read64(Cpu& c, uint32_t a) {
+QILIN_INLINE uint64_t read64(const uint8_t* m, uint32_t a) {
     uint64_t v;
-    std::memcpy(&v, c.mem + a, 8);
+    std::memcpy(&v, m + a, 8);
     return std::byteswap(v);
 }
-QILIN_INLINE void write8(Cpu& c, uint32_t a, uint64_t v) { c.mem[a] = static_cast<uint8_t>(v); }
-QILIN_INLINE void write16(Cpu& c, uint32_t a, uint64_t v) {
+QILIN_INLINE void write8(uint8_t* m, uint32_t a, uint64_t v) { m[a] = static_cast<uint8_t>(v); }
+QILIN_INLINE void write16(uint8_t* m, uint32_t a, uint64_t v) {
     const uint16_t s = std::byteswap(static_cast<uint16_t>(v));
-    std::memcpy(c.mem + a, &s, 2);
+    std::memcpy(m + a, &s, 2);
 }
-QILIN_INLINE void write32(Cpu& c, uint32_t a, uint64_t v) {
+QILIN_INLINE void write32(uint8_t* m, uint32_t a, uint64_t v) {
     const uint32_t s = std::byteswap(static_cast<uint32_t>(v));
-    std::memcpy(c.mem + a, &s, 4);
+    std::memcpy(m + a, &s, 4);
 }
-QILIN_INLINE void write64(Cpu& c, uint32_t a, uint64_t v) {
+QILIN_INLINE void write64(uint8_t* m, uint32_t a, uint64_t v) {
     const uint64_t s = std::byteswap(v);
-    std::memcpy(c.mem + a, &s, 8);
+    std::memcpy(m + a, &s, 8);
 }
+// The same through a Cpu, for the runtime's own code.
+QILIN_INLINE uint64_t read8(const Cpu& c, uint32_t a) { return read8(c.mem, a); }
+QILIN_INLINE uint64_t read16(const Cpu& c, uint32_t a) { return read16(c.mem, a); }
+QILIN_INLINE uint64_t read32(const Cpu& c, uint32_t a) { return read32(c.mem, a); }
+QILIN_INLINE uint64_t read64(const Cpu& c, uint32_t a) { return read64(c.mem, a); }
+QILIN_INLINE void write8(const Cpu& c, uint32_t a, uint64_t v) { write8(c.mem, a, v); }
+QILIN_INLINE void write16(const Cpu& c, uint32_t a, uint64_t v) { write16(c.mem, a, v); }
+QILIN_INLINE void write32(const Cpu& c, uint32_t a, uint64_t v) { write32(c.mem, a, v); }
+QILIN_INLINE void write64(const Cpu& c, uint32_t a, uint64_t v) { write64(c.mem, a, v); }
 
 // ---- the condition register: a field is four bits, LT GT EQ SO from the top ----
+// (Lifted branches mostly read a compare's operands instead, lift.cpp: these are for the fields' values. A form
+// without branches, 2 << ((a < b) << 1 | (a > b)), was miscompiled by MSVC 19.44 in one of the differential test's
+// programs, so it isn't used.)
 QILIN_INLINE uint32_t compare_s(int64_t a, int64_t b, uint32_t so) { return (a < b ? 8u : a > b ? 4u : 2u) | so; }
 QILIN_INLINE uint32_t compare_u(uint64_t a, uint64_t b, uint32_t so) { return (a < b ? 8u : a > b ? 4u : 2u) | so; }
 // CR0 after a record form ("."): the sign of the 64-bit result, and XER's SO.

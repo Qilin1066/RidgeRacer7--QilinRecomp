@@ -12,9 +12,9 @@
 //   a frame, and the paused picture is the last one it made;
 // - the vertical blank: its thread (gcm.cpp), before it calls the game's
 //   handler, and on from the next blank when it goes on, not catching up;
-// - the sound: the mixer's thread (main.cpp's audio sink), so the game's
-//   sound ports aren't read on and its sound thread, which writes a block each
-//   time one has been read, waits.
+// - the sound: the mixer's thread (audio.cpp), before it takes a block, so
+//   the game's sound ports aren't read on and its sound thread, which writes
+//   a block each time one has been read, waits.
 //
 // What is not held: the game's own clock (the time base and the system's
 // time), and threads waiting on none of these (a loader thread, the SPUs),

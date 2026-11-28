@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -25,6 +26,10 @@
 #include "elf.hpp"
 #include "qilin/rt/cpu.hpp"
 #include "qilin/rt/lifted.hpp"
+
+namespace qilin::host {
+class AudioOut;  // qilin/host/audio.hpp
+}
 
 namespace rr7 {
 
@@ -139,9 +144,11 @@ void become_guest_thread(Cpu& c, uint32_t stack_size, int32_t priority);
 void call_descriptor(Cpu& c, uint32_t descriptor);
 // Tells the game of a system event at its next cellSysutilCheckCallback (sysutil.cpp): 0x0101 is "the player asks to quit".
 void system_event(uint64_t status, uint64_t parameter);
-// Where the game's sound goes (audio.cpp): called from the mixer's thread with 256 left-right pairs of 16-bit
-// samples at 48 kHz, 187.5 times a second. Set before run().
-void set_audio_sink(std::function<void(const int16_t* left_right, size_t frames)> sink);
+// Where the game's sound goes (audio.cpp): `open` is called once, on the mixer's thread, when the game starts the sound
+// library, and gives the host's output; nullptr for none (the ports are then taken by the host's clock alone). Set before
+// run(). audio_report() logs the run's sound counters (exit_process calls it).
+void set_audio_output(std::function<std::unique_ptr<qilin::host::AudioOut>()> open);
+void audio_report();
 // The console's time zone and summer time, in minutes (sysutil.cpp's settings).
 int32_t console_time_zone_minutes();
 int32_t console_summer_time_minutes();

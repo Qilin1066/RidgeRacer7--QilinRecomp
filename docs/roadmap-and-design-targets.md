@@ -68,7 +68,7 @@ The menu's slider (50% to 400%, greyed out) is to draw the game's surfaces at a 
 ## Settings, not platform branches
 All enhancements live behind a settings file with presets, as in the other recomps:
 - *Original:* the console's own picture and frame rate.
-- *Low-end:* reduced internal resolution, no AF, no MSAA.
+- *Low-end:* the game's own resolution, no AF, no MSAA. **Decided by the owner (2026-11-28): low-end hardware renders at native resolution, not below it**: the renderer must be efficient enough for that, not scaled down to fit. Internal resolution is an enhancement above native only (item 6 of the roadmap).
 - *Desktop:* scaled resolution, 16× AF, MSAA, widescreen beyond 16:9, high refresh rate.
 
 **The settings menu is the other Qilin recomps' menu** (Dear ImGui; PunchOutWii--QilinRecomp's `menu.cpp` is the model, WindWakerHD--QilinRecomp's the newest copy): F1 or Esc opens it over the game, which pauses (a controller: Back and Start together); Close and Quit top right; closing saves. Three pages:

@@ -40,6 +40,20 @@ option(QILIN_WERROR "Treat warnings in our own code as errors" OFF)
 # processor presets (QILIN_CPU: pi4, pi5, ...), the lifted code's level, LTO and PGO of the game. docs/toolchain.md.
 include(cmake/toolchain.cmake)
 
+# ---- The players' downloads (tools/player-kit) ----
+# The player kit: the game's runtime without the lifted code, as archives the launcher links the player's own lifted code
+# with (the section near the end). Windows: cross-compiled with llvm-mingw; Linux: with the zig it bundles; macOS:
+# universal (arm64 and x86_64), with Apple's clang.
+option(QILIN_PLAYER_KIT "Build the player kit (tools/player-kit): the game's runtime as archives, for the downloads" OFF)
+option(QILIN_REQUIRE_LAUNCHER_TESTS "Require the launcher's build test (CI): a native build, not a cross-compile" OFF)
+if(QILIN_REQUIRE_LAUNCHER_TESTS AND CMAKE_CROSSCOMPILING)
+    message(FATAL_ERROR "the launcher's build test needs a native build")
+endif()
+if(APPLE AND QILIN_PLAYER_KIT AND "x86_64" IN_LIST CMAKE_OSX_ARCHITECTURES)
+    # A universal build is neither processor to cmake/toolchain.cmake: its x86-64 half gets the SSSE3 every Intel Mac has.
+    add_compile_options("SHELL:-Xarch_x86_64 -mssse3")
+endif()
+
 # ---- Warnings for our own targets ----
 add_library(qilin_warnings INTERFACE)
 if(MSVC)
@@ -57,6 +71,10 @@ else()
     if(QILIN_WERROR)
         target_compile_options(qilin_warnings INTERFACE -Werror)
     endif()
+endif()
+if(MINGW)
+    # Windows 10's API: MinGW's headers default to an older Windows, MSVC's SDK to the newest.
+    target_compile_definitions(qilin_warnings INTERFACE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 endif()
 
 # Developer tools on macOS: macOS 13.3 or later (std::format).
@@ -88,6 +106,7 @@ target_link_libraries(qilin_game PRIVATE qilin_warnings)
 add_library(qilin_recomp STATIC
     recomp/src/archive.cpp
     recomp/src/cfg.cpp
+    recomp/src/identify.cpp
     recomp/src/lift.cpp
     recomp/src/ppu.cpp
     recomp/src/shaders.cpp
@@ -125,6 +144,11 @@ target_compile_definitions(qilin PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 
 enable_testing()
 find_package(Threads REQUIRED)
+# The downloads' launcher (tools/player-kit/launcher, the same files in every QilinRecomp project, copied unchanged from
+# Toy Commander's: ADOPTING.md there): its core and tests here, its program in the host section below (where SDL3, Dear
+# ImGui and volk are known). Its build test runs the real build with stand-in children, and qilin's identify.
+set(QILIN_LAUNCHER_QILIN qilin)
+include(tools/player-kit/launcher/launcher.cmake)
 add_executable(ridgeracer7_runtime_io_test ridgeracer7/tests/runtime_io_test.cpp
     ridgeracer7/src/fs.cpp ridgeracer7/src/threads.cpp ridgeracer7/src/kernel_sched.cpp)
 target_include_directories(ridgeracer7_runtime_io_test PRIVATE recomp/src runtime/include ridgeracer7/src)
@@ -175,6 +199,12 @@ add_executable(qilin_tests recomp/tests/tests.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_game qilin_recomp qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)
+# qilin identify, the players' launcher's check of their game folder (recomp/src/identify.hpp), on synthetic folders.
+add_executable(qilin_identify_test recomp/tests/identify_test.cpp)
+target_include_directories(qilin_identify_test PRIVATE recomp/tests)
+target_link_libraries(qilin_identify_test PRIVATE qilin_game qilin_recomp qilin_warnings)
+qilin_tool(qilin_identify_test)
+add_test(NAME qilin_identify_test COMMAND qilin_identify_test)
 # qilin's exit codes: a usage error is 2, a missing file 1, the version 0.
 add_test(NAME qilin_version COMMAND qilin --version)
 add_test(NAME qilin_missing_file COMMAND qilin info no-such-folder)
@@ -210,10 +240,18 @@ if(QILIN_HOST)
     FetchContent_Declare(volk GIT_REPOSITORY https://github.com/zeux/volk GIT_TAG vulkan-sdk-1.4.363.0 GIT_SHALLOW ON
                          SOURCE_SUBDIR no-cmake)
     FetchContent_MakeAvailable(SDL3 VulkanHeaders volk)
+    # SDL's Wayland protocol headers, made from its own XML, before the system's (as Toy Commander's): SDL adds them as a
+    # system folder, and zig's compiler (the Linux download's) searches the system's /usr/include first, whose older
+    # wayland-client-protocol.h (Ubuntu 22.04's) lacks what SDL uses. SDL includes them in quotes, and -iquote folders
+    # come before every -I and -isystem one.
+    if(TARGET SDL3-static AND EXISTS "${sdl3_BINARY_DIR}/wayland-generated-protocols" AND NOT MSVC)
+        target_compile_options(SDL3-static BEFORE PRIVATE "-iquote${sdl3_BINARY_DIR}/wayland-generated-protocols")
+    endif()
     add_library(qilin_volk STATIC ${volk_SOURCE_DIR}/volk.c)
     target_include_directories(qilin_volk PUBLIC ${volk_SOURCE_DIR})
     target_link_libraries(qilin_volk PUBLIC Vulkan::Headers ${CMAKE_DL_LIBS})
     target_compile_definitions(qilin_volk PUBLIC VK_NO_PROTOTYPES)
+    # (The launcher, `Play Ridge Racer 7`, below, once Dear ImGui is there.)
 
     # Dear ImGui (MIT) for the settings menu, as the other Qilin recomps draw
     # theirs: the same commit (v1.93.0), its core and its SDL3 and Vulkan
@@ -234,6 +272,19 @@ if(QILIN_HOST)
         target_compile_options(qilin_imgui PRIVATE /W0)  # third-party code: its warnings aren't ours
     else()
         target_compile_options(qilin_imgui PRIVATE -w)
+    endif()
+
+    # The downloads' launcher, `Play Ridge Racer 7` (Windows: .exe; macOS: the app's program), which reads kit/game.txt
+    # (tools/player-kit/launcher).
+    qilin_launcher_program(IMGUI_DIR ${imgui_SOURCE_DIR} LIBRARIES qilin_imgui qilin_volk SDL3::SDL3-static Threads::Threads)
+    if(WIN32)
+        # The launcher's icon for the game too, which the player's PC links (the player kit's icon.o;
+        # QILIN_WINDOWS_RESOURCES is launcher.cmake's).
+        if(QILIN_WINDOWS_RESOURCES)
+            add_library(qilin_game_icon OBJECT tools/player-kit/game_icon.rc)
+        elseif(QILIN_PLAYER_KIT)
+            message(FATAL_ERROR "the player kit needs QILIN_WINDOWS_RESOURCES=ON (the game's icon)")
+        endif()
     endif()
 
     add_library(qilin_host STATIC host/src/vulkan.cpp host/src/display.cpp host/src/audio.cpp host/src/paths.cpp)
@@ -371,7 +422,29 @@ target_include_directories(ridgeracer7_settings_test PRIVATE recomp/src runtime/
 target_link_libraries(ridgeracer7_settings_test PRIVATE qilin_rt qilin_warnings Threads::Threads)
 add_test(NAME ridgeracer7_settings_test COMMAND ridgeracer7_settings_test)
 set_tests_properties(ridgeracer7_settings_test PROPERTIES TIMEOUT 20)
+# The game's own program (main.cpp: its window, the settings menu, the game's thread), all but the lifted code. Linked
+# with stand-ins for that code (tools/player-kit/link_check.cpp) it shows that everything the game needs is built and
+# links, on every system CI builds (and the player kit is this library and what it links).
+add_library(ridgeracer7_main STATIC ridgeracer7/src/main.cpp)
+target_link_libraries(ridgeracer7_main PUBLIC ridgeracer7_machine ridgeracer7_window qilin_host SDL3::SDL3-static PRIVATE qilin_warnings)
+qilin_game_target(ridgeracer7_main)
+if(NOT QILIN_REAL_MSVC)
+    target_compile_options(ridgeracer7_main PRIVATE -Wno-missing-field-initializers)
+endif()
 set(QILIN_GEN_DIR "" CACHE PATH "The folder `qilin lift <game> --out` wrote: the lifted code of your own copy")
+if(QILIN_PLAYER_KIT AND QILIN_GEN_DIR)
+    message(FATAL_ERROR "the player kit is built without lifted code: leave QILIN_GEN_DIR empty")
+endif()
+if(NOT QILIN_GEN_DIR)
+    add_executable(ridgeracer7_link_check tools/player-kit/link_check.cpp)
+    target_link_libraries(ridgeracer7_link_check PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,ridgeracer7_main>" qilin_rt qilin_warnings)
+    if(MINGW)
+        target_link_options(ridgeracer7_link_check PRIVATE -static)
+    endif()
+    # Started with no game folder it stops at once with its usage (exit 2), having loaded everything it links.
+    add_test(NAME ridgeracer7_link_check COMMAND ridgeracer7_link_check)
+    set_tests_properties(ridgeracer7_link_check PROPERTIES WILL_FAIL TRUE)
+endif()
 if(QILIN_GEN_DIR)
     if(NOT EXISTS "${QILIN_GEN_DIR}/table.cpp" OR NOT EXISTS "${QILIN_GEN_DIR}/spu_table.cpp")
         message(FATAL_ERROR "QILIN_GEN_DIR (${QILIN_GEN_DIR}) holds no lifted code: run `qilin lift <game> --out ${QILIN_GEN_DIR}` first")
@@ -391,9 +464,9 @@ if(QILIN_GEN_DIR)
     if(NOT QILIN_REAL_MSVC)
         set_source_files_properties(ridgeracer7/src/shader_check.cpp PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
     endif()
-    add_executable(ridgeracer7 ridgeracer7/src/main.cpp ${qilin_lifted})
+    add_executable(ridgeracer7 ${qilin_lifted})
     target_include_directories(ridgeracer7 PRIVATE "${QILIN_GEN_DIR}")
-    target_link_libraries(ridgeracer7 PRIVATE ridgeracer7_machine ridgeracer7_window qilin_host SDL3::SDL3-static qilin_warnings)
+    target_link_libraries(ridgeracer7 PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,ridgeracer7_main>" qilin_warnings)
     # Lifted code is generated: its unused labels and the like are not warnings worth reading.
     if(MSVC)
         set(qilin_lifted_flags /w /bigobj ${QILIN_LIFTED_OPTIONS})
@@ -405,6 +478,119 @@ if(QILIN_GEN_DIR)
         target_compile_options(ridgeracer7 PRIVATE /MP)  # the lifted files side by side (Ninja runs clang-cl's in parallel itself)
     endif()
     qilin_game_target(ridgeracer7)
+endif()
+
+# ---- The player kit: everything the game needs but the code lifted and translated from the player's EBOOT.elf ----
+# For the downloads (tools/player-kit), as Toy Commander's and Rhythm Heaven Fever's:
+#   kit/lib/libridgeracer7_kit.a   the game's program (ridgeracer7_main: main.cpp), linked whole
+#   kit/lib/libridgeracer7_libs.a  what it links: the machine and the settings menu, the host layer, the runtime, the
+#                                  game's files' readers, volk, Dear ImGui, SDL3, FreeType and FFmpeg's libavcodec
+#   kit/lib/icon.o                 (Windows) the game's icon
+#   kit/include/                   the runtime's headers, which the lifted code includes
+#   kit/qilin                      the recompiler (identify, lift, shaders)
+#   kit/build-flags.txt            how the launcher (tools/player-kit/launcher, build.cpp) compiles and links the code
+#                                  `qilin lift` and `qilin shaders` make from the player's own EBOOT.elf
+# Windows: cross-compiled on Linux with llvm-mingw (package.sh). Linux: built with the zig the download bundles, so the
+# archives' libc++ is the one the player's compiles link with (package-linux.sh). macOS: universal, with Apple's clang
+# (package-macos.sh, tools/player-kit/macos.cmake).
+# What the lifted code is compiled with, in build-flags.txt: as the game's own build compiles it (cmake/toolchain.cmake:
+# -O2, no contraction, SSSE3 on x86-64), with no warnings. The launcher adds -Igen and this computer's processor.
+set(kit_lifted_options -ffp-contract=off)
+if(QILIN_FP_EXACT)
+    list(APPEND kit_lifted_options -DQILIN_FP_EXACT=1)
+endif()
+if(APPLE)
+    include(tools/player-kit/macos.cmake)
+endif()
+if(QILIN_PLAYER_KIT)
+    if(NOT TARGET SDL3-static)
+        message(FATAL_ERROR "the player kit needs SDL3 built statically")
+    endif()
+    if(MSVC)
+        message(FATAL_ERROR "the player kit is built with llvm-mingw, zig or Apple's clang (tools/player-kit), not ${CMAKE_CXX_COMPILER_ID} with MSVC's options")
+    endif()
+    set(kit_whole ridgeracer7_main)
+    set(kit_libraries ridgeracer7_machine ridgeracer7_window qilin_host qilin_rt qilin_game qilin_volk qilin_imgui SDL3-static freetype qilin_ffmpeg)
+    set(kit_runtime "${CMAKE_BINARY_DIR}/kit/libridgeracer7_kit.a")
+    set(kit_archive "${CMAKE_BINARY_DIR}/kit/libridgeracer7_libs.a")
+    if(APPLE)
+        # Each half of the universal archives' lifted code also gets x86-64's SSSE3 (build-flags.txt's native.x86_64).
+        string(JOIN " " lifted_text ${kit_lifted_options})
+        qilin_player_kit_macos()  # tools/player-kit/macos.cmake
+    else()
+        if(QILIN_X86_64)
+            list(APPEND kit_lifted_options -mssse3)
+        endif()
+        if(WIN32)
+            # (Lifted files hold more sections than a plain COFF object may.)
+            list(APPEND kit_lifted_options -Wa,-mbig-obj)
+        endif()
+        string(JOIN " " lifted_text ${kit_lifted_options})
+        set(mri "CREATE ${kit_archive}\n")
+        foreach(library IN LISTS kit_libraries)
+            string(APPEND mri "ADDLIB $<TARGET_FILE:${library}>\n")
+        endforeach()
+        string(APPEND mri "SAVE\nEND\n")
+        file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/kit/ridgeracer7_libs.mri" CONTENT "${mri}")
+        add_custom_command(OUTPUT "${kit_archive}" "${kit_runtime}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/kit"
+            COMMAND "${CMAKE_COMMAND}" "-DAR=${CMAKE_AR}" "-DMRI=${CMAKE_BINARY_DIR}/kit/ridgeracer7_libs.mri" "-DOUT=${kit_archive}"
+                    -P "${CMAKE_SOURCE_DIR}/tools/player-kit/merge.cmake"
+            COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:${kit_whole}>" "${kit_runtime}"
+            DEPENDS ${kit_libraries} ${kit_whole} "${CMAKE_BINARY_DIR}/kit/ridgeracer7_libs.mri"
+            COMMENT "Merging the player kit's libraries" VERBATIM)
+        add_custom_target(ridgeracer7_kit ALL DEPENDS "${kit_archive}" "${kit_runtime}")
+        if(WIN32)
+            # The system libraries SDL3 and the runtime need (MinGW's names). The game's threads take the program's stack
+            # size (8 MB, as on Linux): lifted calls nest as deeply as the guest's.
+            set(kit_system_libraries -lm -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32
+                -lsetupapi -lshell32 -ldinput8 -lwinspool -lcomdlg32 -ldwmapi -lsynchronization)
+            set(kit_ldflags "-static -O2 -Wl,--stack,8388608")
+            set(kit_icon " $kit/lib/icon.o")
+            set(kit_native "")  # the launcher's default, -march=native
+        elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            # SDL3 loads X11, Wayland, the sound servers and Vulkan at run time: the game links only glibc's own
+            # libraries (and zig's libc++).
+            set(kit_system_libraries -lm -ldl -lpthread -lrt)
+            set(kit_ldflags "-O2")
+            set(kit_icon "")
+            # For the player's processor: x86-64's -march, ARM's -mcpu.
+            if(QILIN_ARM64)
+                set(kit_native "native = -mcpu=native\n")
+            else()
+                set(kit_native "native = -march=native\n")
+            endif()
+        else()
+            message(FATAL_ERROR "no player kit for ${CMAKE_SYSTEM_NAME}")
+        endif()
+        string(JOIN " " kit_system_text ${kit_system_libraries})
+        # Read by the launcher (tools/player-kit/launcher/build.cpp): `name = value` lines, $kit the kit's folder. The
+        # game's program is linked whole (its main).
+        set(kit_whole_flags "-Wl,--whole-archive $kit/lib/libridgeracer7_kit.a -Wl,--no-whole-archive")
+        file(WRITE "${CMAKE_BINARY_DIR}/kit/build-flags.txt"
+            "# Written by CMake for the player kit (QILIN_PLAYER_KIT).\n"
+            "cxxflags = -O2 -DNDEBUG -std=c++23 -w ${lifted_text} -I$kit/include\n"
+            "${kit_native}"
+            "ldflags = ${kit_ldflags}\n"
+            "libs = ${kit_whole_flags} $kit/lib/libridgeracer7_libs.a${kit_icon} ${kit_system_text}\n")
+        # Linked with stand-ins for the lifted code: the kit is complete.
+        add_executable(ridgeracer7_kit_link_check tools/player-kit/link_check.cpp)
+        target_include_directories(ridgeracer7_kit_link_check PRIVATE runtime/include)
+        target_link_libraries(ridgeracer7_kit_link_check PRIVATE -Wl,--whole-archive "${kit_runtime}" -Wl,--no-whole-archive
+                              "${kit_archive}" ${kit_system_libraries})
+        add_dependencies(ridgeracer7_kit_link_check ridgeracer7_kit)
+        if(WIN32)
+            target_link_options(ridgeracer7_kit_link_check PRIVATE -static)
+            # The game's icon (the launcher's), linked into it on the player's PC.
+            add_dependencies(ridgeracer7_kit qilin_game_icon)
+            install(FILES $<TARGET_OBJECTS:qilin_game_icon> DESTINATION kit/lib RENAME icon.o COMPONENT ridgeracer7)
+        endif()
+        install(TARGETS qilin RUNTIME DESTINATION kit COMPONENT ridgeracer7)
+        install(FILES "${kit_runtime}" "${kit_archive}" DESTINATION kit/lib COMPONENT ridgeracer7)
+        install(FILES "${CMAKE_BINARY_DIR}/kit/build-flags.txt" DESTINATION kit COMPONENT ridgeracer7)
+    endif()
+    # What the lifted code includes.
+    install(DIRECTORY runtime/include/qilin DESTINATION kit/include COMPONENT ridgeracer7)
 endif()
 
 # ---- The differential test of the lifter ----

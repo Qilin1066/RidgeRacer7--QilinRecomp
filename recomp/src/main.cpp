@@ -20,7 +20,15 @@
 //   qilin spu-insns   <game>                 every word of the SPU programs' code
 //   qilin spu-profile <game>                 how often the SPU programs use each instruction
 //   qilin spu-disasm  <file> [--base address] [--ignore-reserved]   a file of raw SPU words
-//   qilin lift    <game> [--out folder]      lift the PPU code to C++: how many functions the lifter covers, and why not the rest
+//   qilin lift    <game> [--out folder] [--per-file N] [--file-kb K]
+//                                            lift the PPU code to C++: how many functions the lifter covers, and why not the
+//                                            rest; with --out, at most N functions to a file (256 if not given), and a new
+//                                            file once one holds K KiB of code (a larger function has a file to itself):
+//                                            what one compile of a file needs grows with its size
+//   qilin identify <game folder> [--json] [--build <name>]
+//                                            what the folder is, for the players' launcher (identify.hpp): one JSON object
+//                                            on standard output with --json; exit 0 the supported build with everything the
+//                                            game needs, 3 readable but not that, 2 unreadable
 //   qilin insns   <game>                     every word of the program's code: address, word, instruction
 //   qilin profile <game>                     how often the code uses each instruction, and what doesn't decode
 //   qilin disasm  <file> [--base address]    a file of raw big-endian PPU words, as `insns` prints them
@@ -47,6 +55,7 @@
 #include "bytes.hpp"
 #include "cfg.hpp"
 #include "elf.hpp"
+#include "identify.hpp"
 #include "import_names.hpp"
 #include "lift.hpp"
 #include "media.hpp"
@@ -93,7 +102,8 @@ int usage() {
                "  qilin spu-insns   <game>\n"
                "  qilin spu-profile <game>\n"
                "  qilin spu-disasm  <file of big-endian words> [--base address] [--ignore-reserved]\n"
-               "  qilin lift    <game> [--out folder]\n"
+               "  qilin lift    <game> [--out folder] [--per-file N] [--file-kb K]\n"
+               "  qilin identify <game folder> [--json] [--build <name>]\n"
                "  qilin insns   <game>\n"
                "  qilin profile <game>\n"
                "  qilin disasm  <file of big-endian words> [--base address]\n"
@@ -105,6 +115,8 @@ struct Args {
     std::string command, input;
     std::optional<std::string> json, out;
     uint32_t base = 0;
+    size_t per_file = 256;  // lift: functions to a file at most
+    size_t file_bytes = 0;  // lift: a new file once one holds this much code (0: no limit)
     bool list_files = false, ignore_reserved = false, keep_pc = false, keep_registers = false, disasm = false;
 };
 
@@ -128,6 +140,19 @@ Args parse_args(std::span<char*> argv) {
         else if (arg == "--out" && i + 1 < argv.size()) a.out = argv[++i];
         else if (arg == "--base" && i + 1 < argv.size()) a.base = parse_address(argv[++i]);
         else if (arg == "--files") a.list_files = true;
+        else if (arg == "--per-file" && i + 1 < argv.size()) {
+            const std::string_view n = argv[++i];
+            const auto [end, error] = std::from_chars(n.data(), n.data() + n.size(), a.per_file);
+            if (n.empty() || error != std::errc() || end != n.data() + n.size() || a.per_file == 0 || a.per_file > 65536)
+                throw Failure{std::format("--per-file takes a count of functions from 1 to 65536, not {}", n)};
+        } else if (arg == "--file-kb" && i + 1 < argv.size()) {
+            const std::string_view n = argv[++i];
+            size_t kb = 0;
+            const auto [end, error] = std::from_chars(n.data(), n.data() + n.size(), kb);
+            if (n.empty() || error != std::errc() || end != n.data() + n.size() || kb == 0 || kb > (size_t{1} << 20))
+                throw Failure{std::format("--file-kb takes a size in KiB from 1 to 1048576, not {}", n)};
+            a.file_bytes = kb << 10;
+        }
         else if (arg == "--disasm") a.disasm = true;
         else if (arg == "--pc") a.keep_pc = true;
         else if (arg == "--registers") a.keep_pc = a.keep_registers = true;
@@ -1068,11 +1093,36 @@ int cmd_lift(const Args& a) {
         write(folder / "functions.hpp", "// Lifted from the game's program by qilin: do not share.\n#pragma once\n#include <atomic>\n#include <bit>\n#include <cstdint>\n"
                                         "#include \"qilin/rt/cpu.hpp\"\nusing namespace qilin::rt;\n" + declarations);
         size_t files = 0;
-        for (size_t i = 0; i < code.size(); i += 256) {
+        // Functions in address order, so that neighbours (which often call each other, and may be inlined into each
+        // other only within a file) stay together.
+        for (size_t i = 0; i < code.size();) {
             std::string text = "// Lifted from the game's program by qilin: do not share.\n#include \"functions.hpp\"\n";
-            for (size_t k = i; k < code.size() && k < i + 256; ++k) text += "\n" + code[k];
+            size_t k = i, bytes = 0;
+            for (; k < code.size() && k < i + a.per_file && (k == i || !a.file_bytes || bytes + code[k].size() <= a.file_bytes); ++k) {
+                text += "\n" + code[k];
+                bytes += code[k].size() + 1;
+            }
             write(folder / std::format("lifted_{:03}.cpp", files++), text);
+            i = k;
         }
+        // An earlier lift's files past this one's last (other limits, another lifter): every .cpp in the folder is
+        // built, so they would define the same functions again.
+        std::vector<fs::path> stale;
+        std::error_code listing;
+        for (fs::directory_iterator it(folder, listing), end; !listing && it != end; it.increment(listing)) {
+            const std::string name = it->path().filename().string();
+            if (!name.starts_with("lifted_") || !name.ends_with(".cpp")) continue;
+            const std::string_view digits = std::string_view(name).substr(7, name.size() - 11);
+            size_t n = 0;
+            const auto [stop, error] = std::from_chars(digits.data(), digits.data() + digits.size(), n);
+            if (!digits.empty() && error == std::errc() && stop == digits.data() + digits.size() && n >= files) stale.push_back(it->path());
+        }
+        if (listing) throw Failure{std::format("cannot list {}: {}", folder.string(), listing.message())};
+        for (const fs::path& old : stale) {
+            std::error_code gone;
+            if (!fs::remove(old, gone) || gone) throw Failure{std::format("cannot remove {}, an earlier lift's file", old.string())};
+        }
+        const size_t removed = stale.size();
         write(folder / "stubs.cpp", "// The functions qilin doesn't lift yet: each stops the game if called.\n#include \"functions.hpp\"\n\n" + stubs);
         // Every function by address, in order, and which program they were lifted from.
         write(folder / "table.cpp", std::format("// Lifted from the game's program by qilin: do not share.\n#include \"functions.hpp\"\n#include \"qilin/rt/lifted.hpp\"\n\n"
@@ -1086,9 +1136,35 @@ int cmd_lift(const Args& a) {
                                                     spu_declarations, spu_table, images->size()));
         std::println("{} functions written to {} in {} files, with {} that stop if called, and the table of all {}", code.size(), folder.string(), files,
                      cfg->functions().size() - code.size(), cfg->functions().size());
-        std::println("{} files were new or changed", rewritten);
+        std::println("{} files were new or changed, {} of an earlier lift's removed", rewritten, removed);
     }
     return 0;
+}
+
+// `qilin identify <game folder> [--json] [--build <name>]` (identify.hpp). Whatever happens, the launcher gets its
+// answer: a failure of the tool itself is an unreadable folder (exit 2), its reason on standard error.
+int cmd_identify(std::span<char*> argv) {
+    bool json = false;
+    std::string build;
+    for (size_t i = 3; i < argv.size(); ++i) {
+        const std::string_view arg = argv[i];
+        if (arg == "--json") json = true;
+        else if (arg == "--build" && i + 1 < argv.size()) build = argv[++i];
+        else {
+            std::println(stderr, "qilin identify: unknown argument {}", arg);
+            return usage();
+        }
+    }
+    Identity id;
+    try {
+        id = identify(argv[2], {.want = build});
+    } catch (const std::exception& e) {
+        std::println(stderr, "qilin identify: {}", e.what());
+        id = Identity{2, false, "", "", "", "The game folder can't be read (" + std::string(e.what()) + ")."};
+    }
+    if (json) std::println("{}", to_json(id));
+    else std::println("{}", id.message);
+    return id.code;
 }
 
 }  // namespace
@@ -1099,6 +1175,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc < 3) return usage();
+    if (std::string_view(argv[1]) == "identify") return cmd_identify(std::span(argv, static_cast<size_t>(argc)));
     try {
         const Args a = parse_args(std::span(argv, static_cast<size_t>(argc)));
         if (a.command == "info") return cmd_info(a);

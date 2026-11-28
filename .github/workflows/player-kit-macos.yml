@@ -1,0 +1,141 @@
+name: macOS download
+
+# Builds the macOS download (tools/player-kit/package-macos.sh), as Toy
+# Commander's and Rhythm Heaven Fever's: one universal disk image,
+# RidgeRacer7--QilinRecomp-X.Y.Z-macos.dmg, for Apple silicon and Intel
+# Macs. On every push, as an artifact to check, checked on both kinds of Mac
+# (tools/player-kit/check-macos.sh); on a version tag (vX.Y.Z), attached to
+# that tag's GitHub Release. No game data is used or included, and no PS3
+# keys: players lift the code of the EBOOT.elf they decrypt from their own
+# disc, and compile it with Apple's clang (the Command Line Tools), which the
+# launcher offers to install. (No iOS kit: "Play on iPad" isn't offered.)
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to create the release and attach the download
+
+env:
+  # MoltenVK (Apache-2.0, KhronosGroup): its macOS release, pinned and checked.
+  MOLTENVK_VERSION: v1.4.2
+  MOLTENVK_SHA256: f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
+  # The licences of what its library contains, at the revisions MoltenVK
+  # v1.4.2 names (its ExternalRevisions folder).
+  SPIRV_CROSS_REV: 6c09849fe88c48eaed08413aa022aaa136a3a057
+  SPIRV_CROSS_LICENSE_SHA256: cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+  SPIRV_TOOLS_REV: 0d6fd73ca73830ccab5fa1f00ed5ed40124e2c55
+  SPIRV_TOOLS_LICENSE_SHA256: cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+  SPIRV_HEADERS_REV: 29981f65241605e08b0ede4cfeb999fe3b723c6a
+  SPIRV_HEADERS_LICENSE_SHA256: ea43b1de38a6f90c488800d66dec1ed671e68cda530266bc96951fb5b6307613
+  CEREAL_REV: a56bad8bbb770ee266e930c95d37fff2a5be7fea
+  CEREAL_LICENSE_SHA256: 58604a126af6a671ea390ee3d5b3e42228aa59b2858fb7af1d5b20b31739ccbb
+  PACKAGE: RidgeRacer7--QilinRecomp
+  TITLE: Ridge Racer 7
+  DISC: "Ridge Racer 7, the USA disc (BLUS30001, version 01.02): its folder holding PS3_GAME, with the EBOOT.elf RPCS3 decrypts from its EBOOT.BIN (Utilities, Decrypt PS3 Binaries) and the PS3's system software installed in RPCS3 for its fonts"
+
+jobs:
+  package:
+    runs-on: macos-15   # Apple silicon, Xcode 16
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # the tags, for the version of an untagged build
+      - name: Get MoltenVK and the licences (pinned, checked)
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/tools/moltenvk" "$RUNNER_TEMP/tools/notices" && cd "$RUNNER_TEMP/tools"
+          curl -sSfL -o MoltenVK-macos.tar "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-macos.tar"
+          echo "$MOLTENVK_SHA256  MoltenVK-macos.tar" | shasum -a 256 -c
+          tar xf MoltenVK-macos.tar -C moltenvk MoltenVK/LICENSE MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
+          get() {  # <name> <url> <sha256>
+            curl -sSfL -o "notices/$1-LICENSE" "$2"
+            echo "$3  notices/$1-LICENSE" | shasum -a 256 -c
+          }
+          raw=https://raw.githubusercontent.com
+          get SPIRV-Cross "$raw/KhronosGroup/SPIRV-Cross/$SPIRV_CROSS_REV/LICENSE" "$SPIRV_CROSS_LICENSE_SHA256"
+          get SPIRV-Tools "$raw/KhronosGroup/SPIRV-Tools/$SPIRV_TOOLS_REV/LICENSE" "$SPIRV_TOOLS_LICENSE_SHA256"
+          get SPIRV-Headers "$raw/KhronosGroup/SPIRV-Headers/$SPIRV_HEADERS_REV/LICENSE" "$SPIRV_HEADERS_LICENSE_SHA256"
+          get cereal "$raw/USCiLab/cereal/$CEREAL_REV/LICENSE" "$CEREAL_LICENSE_SHA256"
+          echo "MOLTENVK=$PWD/moltenvk" >> "$GITHUB_ENV"
+          echo "MOLTENVK_NOTICES=$PWD/notices" >> "$GITHUB_ENV"
+      - name: Package
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="${GITHUB_REF_NAME#v}"
+          else version="$(git describe --tags --always --match 'v*')"; version="${version#v}"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          clang++ --version
+          tools/player-kit/package-macos.sh "$version" "$PWD/$PACKAGE-$version-macos.dmg"
+      - name: Check (Apple silicon)
+        run: tools/player-kit/check-macos.sh "$PWD/$PACKAGE-$VERSION-macos.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}-${{ env.VERSION }}-macos
+          path: ${{ env.PACKAGE }}-${{ env.VERSION }}-macos.dmg
+          retention-days: 14
+
+  # The same download on an Intel Mac: the x86_64 half, and Apple clang's
+  # -march=native there.
+  check-intel:
+    needs: package
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.PACKAGE }}-*-macos
+          merge-multiple: true
+      - name: Which download
+        run: |
+          set -- "$PACKAGE"-*-macos.dmg
+          [ $# = 1 ] && [ -f "$1" ] || { echo "expected one $PACKAGE dmg, found: $*" >&2; exit 1; }
+          version="${1#"$PACKAGE"-}"; version="${version%-macos.dmg}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Check (Intel)
+        run: |
+          clang++ --version
+          tools/player-kit/check-macos.sh "$PWD/$PACKAGE-$VERSION-macos.dmg"
+
+  # On a version tag: attached to its release, after both checks.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package, check-intel]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.PACKAGE }}-*-macos
+          merge-multiple: true
+      - name: Which download
+        run: |
+          set -- "$PACKAGE"-*-macos.dmg
+          [ $# = 1 ] && [ -f "$1" ] || { echo "expected one $PACKAGE dmg, found: $*" >&2; exit 1; }
+          version="${1#"$PACKAGE"-}"; version="${version%-macos.dmg}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          dmg="$PACKAGE-$VERSION-macos.dmg"
+          mac="On a Mac (macOS 14.5 or newer, Apple silicon or Intel): download $dmg, open it and drag $TITLE.app onto Applications, then open it. The app isn't signed by an Apple developer account, so the first time macOS stops it: open System Settings, Privacy & Security, click Open Anyway beside \"$TITLE was blocked\" and confirm; macOS asks only once. The game is compiled with Apple's own compiler: if the Mac doesn't have Apple's command line tools yet, the app offers Apple's installer."
+          attach() {
+            # The Windows and Linux workflows attach theirs to the same release:
+            # whichever comes first creates it.
+            if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+              gh release upload "$GITHUB_REF_NAME" "$dmg" --clobber || return 1
+              # Another workflow wrote the notes: add the Mac's steps once.
+              body=$(gh release view "$GITHUB_REF_NAME" --json body --jq .body) || return 1
+              case "$body" in
+                *"Open Anyway"*) ;;
+                *) gh release edit "$GITHUB_REF_NAME" --notes "$body"$'\n\n'"$mac" || return 1 ;;
+              esac
+            else
+              gh release create "$GITHUB_REF_NAME" "$dmg" --title "Ridge Racer 7 QilinRecomp $VERSION" \
+                --notes "$mac You need your own copy of the game, $DISC: choose its folder in the app (or drag it onto the window), and the first start builds the game from it. Changes: CHANGELOG.md."
+            fi
+          }
+          # One retry: another workflow may have created the release meanwhile.
+          attach || { sleep 20; attach; }

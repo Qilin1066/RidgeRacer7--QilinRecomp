@@ -3,7 +3,8 @@
 //   ridgeracer7 <game> [--flash <dev_flash>]
 //     <game>: your copy: the disc's folder (the one holding PS3_GAME), or EBOOT.elf
 //     --flash: a PS3's system software, for the console's own fonts (the dev_flash folder RPCS3 makes when it
-//              installs Sony's system software file). Without it, an RPCS3 folder beside the game's is looked in.
+//              installs Sony's system software file). Without it, it is looked for beside the game and in RPCS3's own
+//              folder (title.hpp's flash_candidates).
 //
 // The executable is built from your own copy of the game (tools/build-ridgeracer7.ps1):
 // it holds the lifted code of that copy's program, and at start-up checks
@@ -159,11 +160,9 @@ int main(int argc, char** argv) {
     if (argc == 4) {
         info.flash = argv[3];
         if (!std::filesystem::is_directory(info.flash / "data" / "font")) fatal("%s holds no data/font folder: it is not a PS3's system software", argv[3]);
-    } else if (!files->usrdir.empty()) {
-        // <disc>/PS3_GAME/USRDIR -> the folder the disc's folder is in, then RPCS3/dev_flash.
-        std::error_code error;
-        const auto beside = std::filesystem::weakly_canonical(files->usrdir, error).parent_path().parent_path().parent_path() / "RPCS3" / "dev_flash";
-        if (!error && std::filesystem::is_directory(beside / "data" / "font", error)) info.flash = beside;
+    } else {
+        // Beside the game, then RPCS3's own folder, then the data folder (title.hpp's flash_candidates).
+        info.flash = qilin::find_flash(*files);
     }
     info.hdd = qilin::host::user_folder() / "dev_hdd0";
     {

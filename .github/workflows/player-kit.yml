@@ -1,0 +1,114 @@
+name: Windows download
+
+# Builds the Windows download (tools/player-kit/package.sh), as Toy
+# Commander's and Rhythm Heaven Fever's: on every push, as an artifact to
+# check; on a version tag (vX.Y.Z), attached to that tag's GitHub Release as
+# RidgeRacer7--QilinRecomp-X.Y.Z-windows-x64.zip. No game data is used or
+# included, and no PS3 keys: players lift the code of the EBOOT.elf they
+# decrypt from their own disc with the bundled tools.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to create the release and attach the download
+
+env:
+  LLVM_MINGW: "20261104"
+  LLVM_MINGW_CROSS_SHA256: 919380403de87dca3c581c2053230cd298af5e891286628ba0613b7fed370926
+  LLVM_MINGW_WINDOWS_SHA256: 552191b5754c49a5a20723276a6fc56541ea1922c4c50b7b669022333fc1b40f
+  PACKAGE: RidgeRacer7--QilinRecomp
+  TITLE: Ridge Racer 7
+  DISC: "Ridge Racer 7, the USA disc (BLUS30001, version 01.02): its folder holding PS3_GAME, with the EBOOT.elf RPCS3 decrypts from its EBOOT.BIN (Utilities, Decrypt PS3 Binaries) and the PS3's system software installed in RPCS3 for its fonts"
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # the tags, for the version of an untagged build
+      - name: Ninja and zip (Linux, for the cross build)
+        run: sudo apt-get update -q && sudo apt-get install -y -q ninja-build zip
+      - name: Get the toolchains (pinned, checked)
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
+          base=https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW
+          curl -sSfL -o cross.tar.xz "$base/llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          curl -sSfL -o windows.zip "$base/llvm-mingw-$LLVM_MINGW-ucrt-x86_64.zip"
+          echo "$LLVM_MINGW_CROSS_SHA256  cross.tar.xz" | sha256sum -c
+          echo "$LLVM_MINGW_WINDOWS_SHA256  windows.zip" | sha256sum -c
+          mkdir cross windows
+          tar xJf cross.tar.xz -C cross
+          unzip -q windows.zip -d windows
+          echo "LLVM_MINGW_CROSS=$PWD/cross/llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64" >> "$GITHUB_ENV"
+          echo "LLVM_MINGW_WINDOWS=$PWD/windows/llvm-mingw-$LLVM_MINGW-ucrt-x86_64" >> "$GITHUB_ENV"
+      - name: Package
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="${GITHUB_REF_NAME#v}"
+          else version="$(git describe --tags --always --match 'v*')"; version="${version#v}"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          tools/player-kit/package.sh "$version" "$PWD/$PACKAGE-$version-windows-x64.zip"
+      # The download as a player unzips it: one folder, the launcher, the kit,
+      # and files.txt naming exactly what is there.
+      - name: Check the zip
+        run: |
+          set -eu
+          zip="$PACKAGE-$VERSION-windows-x64.zip"
+          mkdir -p "$RUNNER_TEMP/check" && unzip -q "$zip" -d "$RUNNER_TEMP/check"
+          top="$RUNNER_TEMP/check/$PACKAGE"
+          for f in "Play $TITLE.exe" README.txt kit/qilin.exe kit/lib/libridgeracer7_kit.a kit/lib/libridgeracer7_libs.a kit/lib/icon.o \
+                   kit/include/qilin/rt/cpu.hpp kit/include/qilin/rt/lifted.hpp kit/include/qilin/rt/shaders.hpp kit/build-flags.txt kit/game.txt \
+                   kit/files.txt kit/VERSION kit/toolchain/bin/x86_64-w64-mingw32-clang++.exe "LICENSES/$PACKAGE/LICENSE.txt" \
+                   LICENSES/llvm-mingw/LLVM-LICENSE.TXT LICENSES/SDL3/LICENSE.txt "LICENSES/Dear ImGui/LICENSE.txt" LICENSES/volk/LICENSE.md \
+                   LICENSES/FreeType/FTL.TXT LICENSES/FFmpeg/COPYING.LGPLv2.1 LICENSES/FFmpeg/README.txt; do
+            [ -f "$top/$f" ] || { echo "missing: $f" >&2; exit 1; }
+          done
+          tr -d '\r' < "$top/kit/game.txt" | grep -qx "release_asset_prefix=$PACKAGE-"
+          tr -d '\r' < "$top/kit/game.txt" | grep -qx 'release_tag_prefix=v'
+          (cd "$top" && find . -type f | sed 's|^\./||' | LC_ALL=C sort) > "$RUNNER_TEMP/present.txt"
+          tr -d '\r' < "$top/kit/files.txt" | LC_ALL=C sort > "$RUNNER_TEMP/listed.txt"
+          diff "$RUNNER_TEMP/listed.txt" "$RUNNER_TEMP/present.txt"
+          tr -d '\r' < "$top/kit/game.txt"
+      # The game's build as the launcher does it (tools/player-kit/launcher/build.cpp), with the cross-compiling twin of
+      # the bundled llvm-mingw: the kit's flags compile the lifted code's stand-in (tools/player-kit/link_check.cpp),
+      # which links with the kit's libraries into the game's program.
+      - name: Compile and link with the kit's flags
+        run: |
+          set -eu
+          top="$RUNNER_TEMP/check/$PACKAGE"
+          kit="$top/kit"
+          flag() { tr -d '\r' < "$kit/build-flags.txt" | sed -n "s/^$1[[:space:]]*=[[:space:]]*//p" | sed "s|\\\$kit|$kit|g"; }
+          cxx="$LLVM_MINGW_CROSS/bin/x86_64-w64-mingw32-clang++"
+          mkdir -p "$RUNNER_TEMP/game" && cd "$RUNNER_TEMP/game"
+          # shellcheck disable=SC2046
+          "$cxx" $(flag cxxflags) -march=x86-64-v2 -c "$GITHUB_WORKSPACE/tools/player-kit/link_check.cpp" -o stand_in.o
+          # shellcheck disable=SC2046
+          "$cxx" $(flag ldflags) -o ridgeracer7.exe stand_in.o $(flag libs)
+          ls -l ridgeracer7.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}-${{ env.VERSION }}-windows-x64
+          path: ${{ env.PACKAGE }}-${{ env.VERSION }}-windows-x64.zip
+          retention-days: 14
+      # The release may already be there (the Linux or macOS download's
+      # workflow made it), or be made by one of them at the same moment:
+      # upload if it exists, else create it, and once more after a pause if
+      # that lost the race.
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip="$PACKAGE-$VERSION-windows-x64.zip"
+          attach() {
+            if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+              gh release upload "$GITHUB_REF_NAME" "$zip" --clobber
+            else
+              gh release create "$GITHUB_REF_NAME" "$zip" --title "Ridge Racer 7 QilinRecomp $VERSION" \
+                --notes "To play on Windows: download $zip below, unzip it, open the folder and double-click Play $TITLE.exe. Choose your game folder (or drag it onto the window); the first start builds the game from it. You need your own copy of the game, $DISC. Changes: CHANGELOG.md."
+            fi
+          }
+          attach || { sleep 20; attach; }

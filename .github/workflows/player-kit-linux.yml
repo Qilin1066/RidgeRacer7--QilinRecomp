@@ -1,0 +1,111 @@
+name: Linux downloads
+
+# Builds the Linux downloads (tools/player-kit/package-linux.sh), as Toy
+# Commander's and Rhythm Heaven Fever's: x86-64 and ARM64, each on its own
+# processor. On every push, as artifacts to check; on a version tag
+# (vX.Y.Z), attached to that tag's GitHub Release as
+# RidgeRacer7--QilinRecomp-X.Y.Z-linux-x86_64.tar.gz and -linux-arm64.tar.gz.
+# Built on Ubuntu 22.04, whose glibc (2.35) is the oldest the downloads run
+# on. No game data is used or included, and no PS3 keys: players lift the
+# code of the EBOOT.elf they decrypt from their own disc with the bundled tools.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to create the release and attach the downloads
+
+env:
+  ZIG_VERSION: "0.17.1"   # the compiler the downloads bundle (MIT), checked against ziglang.org's index
+  ZIG_X86_64_SHA256: 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
+  ZIG_AARCH64_SHA256: a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795
+  GLIBC_FLOOR: "2.35"     # Ubuntu 22.04's: the smoke test fails anything that needs newer
+  PACKAGE: RidgeRacer7--QilinRecomp
+  TITLE: Ridge Racer 7
+  DISC: "Ridge Racer 7, the USA disc (BLUS30001, version 01.02): its folder holding PS3_GAME, with the EBOOT.elf RPCS3 decrypts from its EBOOT.BIN (Utilities, Decrypt PS3 Binaries) and the PS3's system software installed in RPCS3 for its fonts"
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { arch: x86_64, zig: x86_64, runner: ubuntu-22.04 }
+          - { arch: arm64, zig: aarch64, runner: ubuntu-22.04-arm }
+    name: linux-${{ matrix.target.arch }}
+    runs-on: ${{ matrix.target.runner }}
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/../zig-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/../zig-cache
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # the tags, for the version of an untagged build
+      - name: Build tools and SDL3's headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build python3-pip binutils
+          # What SDL3 builds against (it loads them at run time): without X11 or Wayland it refuses to configure.
+          sudo apt-get install -y -qq libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev \
+            libxtst-dev libxfixes-dev libxkbcommon-dev libwayland-dev libdecor-0-dev libegl-dev libdrm-dev libgbm-dev \
+            libasound2-dev libpulse-dev libudev-dev libdbus-1-dev
+          # CMake 3.25 or later (22.04's own is 3.22), the same on both processors.
+          python3 -m pip install --user --quiet cmake==3.31.6
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Get zig (pinned, checked)
+        env:
+          ZIG_ARCH: ${{ matrix.target.zig }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
+          name="zig-$ZIG_ARCH-linux-$ZIG_VERSION"
+          curl -sSfL --retry 3 -o zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/$name.tar.xz"
+          if [ "$ZIG_ARCH" = x86_64 ]; then sum=$ZIG_X86_64_SHA256; else sum=$ZIG_AARCH64_SHA256; fi
+          echo "$sum  zig.tar.xz" | sha256sum -c
+          tar xJf zig.tar.xz
+          echo "ZIG_DIR=$PWD/$name" >> "$GITHUB_ENV"
+          "$PWD/$name/zig" version
+          ldd --version | head -1
+      - name: Package
+        env:
+          ARCH: ${{ matrix.target.arch }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="${GITHUB_REF_NAME#v}"
+          else version="$(git describe --tags --always --match 'v*')"; version="${version#v}"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          tarball="$PACKAGE-$version-linux-$ARCH.tar.gz"
+          echo "TARBALL=$tarball" >> "$GITHUB_ENV"
+          BUILD_DIR="$PWD/build-player-kit-linux" tools/player-kit/package-linux.sh "$version" "$PWD/$tarball"
+      # The launcher's build test and its portable parts, built with the
+      # bundled zig, and qilin's own tests (identify's among them).
+      - name: Launcher and recompiler tests (zig)
+        run: |
+          cmake --build build-player-kit-linux --target qilin_launcher_test qilin_launcher_build_test qilin_launcher_stub qilin_tests qilin_identify_test --parallel
+          ctest --test-dir build-player-kit-linux -R 'qilin_launcher|qilin_tests|qilin_identify' --output-on-failure
+      - name: Smoke test (the unpacked download)
+        run: tools/player-kit/smoke-linux.sh "$TARBALL" "$GLIBC_FLOOR"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}-${{ env.VERSION }}-linux-${{ matrix.target.arch }}
+          path: ${{ env.TARBALL }}
+          retention-days: 14
+      # The release may already be there (the Windows or macOS download's
+      # workflow made it), or be made by one of them at the same moment:
+      # upload if it exists, else create it, and once more after a pause if
+      # that lost the race.
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          command -v gh > /dev/null || sudo apt-get install -y -qq gh
+          attach() {
+            if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+              gh release upload "$GITHUB_REF_NAME" "$TARBALL" --clobber
+            else
+              gh release create "$GITHUB_REF_NAME" "$TARBALL" --title "Ridge Racer 7 QilinRecomp $VERSION" \
+                --notes "To play on Windows: download $PACKAGE-$VERSION-windows-x64.zip below, unzip it, open the folder and double-click Play $TITLE.exe. On Linux: $PACKAGE-$VERSION-linux-x86_64.tar.gz, or -linux-arm64.tar.gz for 64-bit ARM computers; unpack it and double-click Play $TITLE. Choose your game folder (or drag it onto the window); the first start builds the game from it. You need your own copy of the game, $DISC. Changes: CHANGELOG.md."
+            fi
+          }
+          attach || { sleep 20; attach; }

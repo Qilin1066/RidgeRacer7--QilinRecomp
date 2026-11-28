@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 namespace rr7 {
 
@@ -40,15 +41,44 @@ inline void pixels_to_guest(uint32_t format, const uint8_t* from, uint8_t* to, s
 // compares floats, not 24-bit numbers: a stated difference. Each 24-bit depth is a float of its own, so order and the value
 // written back are kept; a fragment exactly at a stored depth may test otherwise than on the RSX*).
 inline uint32_t depth_to_host(uint32_t depth24, bool unorm) {
-    return unorm ? depth24 : std::bit_cast<uint32_t>(static_cast<float>(depth24) / 16777215.0f);
+    // (Through a signed conversion, exact below 2^24, which unlike an unsigned one is a vector instruction.)
+    return unorm ? depth24 : std::bit_cast<uint32_t>(static_cast<float>(static_cast<int32_t>(depth24 & 0xffffffu)) / 16777215.0f);
 }
 inline uint32_t depth_to_guest(uint32_t host, bool unorm) {
     if (unorm) return host & 0xffffffu;
     // (Rounded half away from zero, as lround, on a non-negative float below 2^24, in floats: the fraction left after the
-    // whole part is taken away is exact. The same as adding a half in a double, for every float: checked exhaustively.)
-    const float v = std::clamp(std::bit_cast<float>(host), 0.0f, 1.0f) * 16777215.0f;
-    const uint32_t whole = static_cast<uint32_t>(v);
-    return whole + (v - static_cast<float>(whole) >= 0.5f ? 1u : 0u);
+    // whole part is taken away is exact. The same as adding a half in a double, for every float but NaN, which is taken
+    // as 0: checked exhaustively. Written with no call and no unsigned conversion, so that a row of them is vector code.)
+    const float f = std::bit_cast<float>(host);
+    const float v = (f > 0.0f ? (f < 1.0f ? f : 1.0f) : 0.0f) * 16777215.0f;
+    const int32_t whole = static_cast<int32_t>(v);
+    return static_cast<uint32_t>(whole + (v - static_cast<float>(whole) >= 0.5f ? 1 : 0));
+}
+
+// A row of a Z24S8 surface: the image's depth words and stencil bytes (its two aspects, as copied out) to guest memory's
+// big-endian words, and back.
+inline void depth_row_to_guest(const uint32_t* depth, const uint8_t* stencil, uint8_t* to, size_t pixels, bool unorm) {
+    const auto row = [&](auto as_unorm) {  // (one loop for each depth format, with nothing to decide inside)
+        for (size_t i = 0; i < pixels; ++i) {
+            const uint32_t w = std::byteswap((depth_to_guest(depth[i], as_unorm) << 8) | stencil[i]);
+            std::memcpy(to + 4 * i, &w, 4);
+        }
+    };
+    if (unorm) row(std::true_type{});
+    else row(std::false_type{});
+}
+inline void depth_row_to_host(const uint8_t* from, uint32_t* depth, uint8_t* stencil, size_t pixels, bool unorm) {
+    const auto row = [&](auto as_unorm) {
+        for (size_t i = 0; i < pixels; ++i) {
+            uint32_t w;
+            std::memcpy(&w, from + 4 * i, 4);
+            w = std::byteswap(w);
+            depth[i] = depth_to_host(w >> 8, as_unorm);
+            stencil[i] = static_cast<uint8_t>(w);
+        }
+    };
+    if (unorm) row(std::true_type{});
+    else row(std::false_type{});
 }
 
 // A half (big-endian bytes) as a float. A normal one is built from its bits (exactly 1.m times 2 to the e - 15).

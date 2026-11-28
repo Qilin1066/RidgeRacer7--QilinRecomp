@@ -9,6 +9,7 @@
 // Runtime code: no std::format.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -105,6 +106,15 @@ inline constexpr auto kStateBits = [] {
     return bits;
 }();
 constexpr bool is_state(uint32_t method) { return method < 0x10000 && ((kStateBits[method / 4 / 64] >> (method / 4 % 64)) & 1) != 0; }
+// How many state methods in a row from each method on (0 for one that isn't state): a command's arguments to them are
+// stored in one pass.
+inline constexpr auto kStateRun = [] {
+    std::array<uint16_t, 0x10000 / 4> run{};
+    for (uint32_t word = 0x10000 / 4; word-- > 0;)
+        run[word] = is_state(word * 4) ? static_cast<uint16_t>(word + 1 < run.size() ? run[word + 1] + 1 : 1) : uint16_t{0};
+    return run;
+}();
+static_assert(kStateRun[0x1a00 / 4] == 128 && kStateRun[0x1a04 / 4] == 127 && kStateRun[0x1a00 / 4 + 128] == 0 && kStateRun[0x0100 / 4] == 0);
 // (Every run's ends are in, and methods that act are not.)
 static_assert([] {
     for (const StateMethods& m : kState)
@@ -119,6 +129,10 @@ inline uint32_t load_be32(const uint8_t* p) {
     std::memcpy(&w, p, 4);
     return std::byteswap(w);
 }
+// `count` big-endian words to host words, in one pass (the compiler makes it a run of vector shuffles).
+inline void load_be32s(uint32_t* to, const uint8_t* from, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) to[i] = load_be32(from + 4 * i);
+}
 
 struct RsxState {
     std::array<uint32_t, 0x10000 / 4> state{};  // the last argument given to each method
@@ -126,6 +140,7 @@ struct RsxState {
     // word written to each goes.
     std::array<uint32_t, 512 * 4> program{};
     uint32_t program_at = 0;
+    uint64_t program_version = 0;  // counts uploads to it (gather_draw remakes a draw's program only when this changes)
     std::array<float, 468 * 4> constants{};
     uint32_t constant_at = 0;
     uint64_t constants_version = 0;  // counts writes to them: the renderer reuses its copy while this is unchanged
@@ -136,6 +151,10 @@ struct RsxState {
         bool indexed;  // DRAW_INDEX_ARRAY's: first and count are of the index array
     };
     std::vector<Range> ranges;
+    // The vertex program as the last draw had it (gather_draw): from slot `made_start`, at `made_version`, as bytes.
+    uint32_t made_start = UINT32_MAX;
+    uint64_t made_version = 0;
+    std::vector<uint8_t> made_program;
 
     uint32_t operator[](uint32_t method) const { return state[method / 4]; }
     float as_float(uint32_t method) const { return std::bit_cast<float>(state[method / 4]); }
@@ -158,6 +177,7 @@ void run_method(RsxState& s, uint32_t method, uint32_t argument, uint32_t at, Ac
     if (method >= 0x0b80 && method < 0x0c00) {  // SET_TRANSFORM_PROGRAM: a word of a vertex program
         if (s.program_at >= s.program.size()) fatal("a vertex program written past its 512 instructions (at offset %08x)", at);
         s.program[s.program_at++] = argument;
+        ++s.program_version;
         return;
     }
     if (method >= 0x1f00 && method < 0x1f80) {  // SET_TRANSFORM_CONSTANT: a word of the constants
@@ -198,13 +218,49 @@ void run_method(RsxState& s, uint32_t method, uint32_t argument, uint32_t at, Ac
     }
 }
 
-// A command's methods: `count` arguments (big-endian, at `args`) from `method` on, or all to `method` (`same`).
+// A command's methods: `count` arguments (big-endian, at `args`) from `method` on, or all to `method` (`same`), as
+// run_method would run them one by one. Runs of state methods are stored in one pass (all to the one method: its last
+// argument), as are words of the vertex programs and their constants; the rest go one at a time.
 template <class Acts>
 void run_command(RsxState& s, uint32_t method, uint32_t count, bool same, const uint8_t* args, uint32_t at, Acts& acts) {
-    for (uint32_t i = 0; i < count; ++i) {
-        const uint32_t m = same ? method : method + 4 * i, argument = load_be32(args + 4 * i);
-        if (acts.trace) qilin::rt::log("(rsx) %08x: %04x = %08x", at, m, argument);
-        run_method(s, m, argument, at, acts);
+    using qilin::rt::fatal;
+    if (acts.trace) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t m = same ? method : method + 4 * i, argument = load_be32(args + 4 * i);
+            qilin::rt::log("(rsx) %08x: %04x = %08x", at, m, argument);
+            run_method(s, m, argument, at, acts);
+        }
+        return;
+    }
+    for (uint32_t i = 0; i < count;) {
+        const uint32_t m = same ? method : method + 4 * i, left = count - i;
+        if (const uint32_t run = m < 0x10000 ? kStateRun[m / 4] : 0) {
+            if (same) {  // (every argument left to this one method: the last is what stays)
+                s.state[m / 4] = load_be32(args + 4 * (count - 1));
+                return;
+            }
+            const uint32_t n = std::min(run, left);
+            load_be32s(&s.state[m / 4], args + 4 * i, n);
+            i += n;
+            continue;
+        }
+        if (m >= 0x1f00 && m < 0x1f80) {  // SET_TRANSFORM_CONSTANT: words of the constants
+            const uint32_t n = same ? left : std::min(left, (0x1f80 - m) / 4);
+            if (n > s.constants.size() - s.constant_at) fatal("vertex constants written past the 468 (at offset %08x)", at);
+            float* to = s.constants.data() + s.constant_at;
+            for (uint32_t k = 0; k < n; ++k) to[k] = std::bit_cast<float>(load_be32(args + 4 * (i + k)));
+            s.constant_at += n, s.constants_version += n, i += n;
+            continue;
+        }
+        if (m >= 0x0b80 && m < 0x0c00) {  // SET_TRANSFORM_PROGRAM: words of a vertex program
+            const uint32_t n = same ? left : std::min(left, (0x0c00 - m) / 4);
+            if (n > s.program.size() - s.program_at) fatal("a vertex program written past its 512 instructions (at offset %08x)", at);
+            load_be32s(s.program.data() + s.program_at, args + 4 * i, n);
+            s.program_at += n, s.program_version += n, i += n;
+            continue;
+        }
+        run_method(s, m, load_be32(args + 4 * i), at, acts);
+        ++i;
     }
 }
 
@@ -222,6 +278,7 @@ uint32_t surface_location(uint32_t object);
 
 // One draw of vertices [first, first + count) (of the index array, when `indexed`), with the state the methods have left,
 // into `d`; false if there is nothing to draw (indices that are all restarts). What the renderer doesn't take stops the game.
-bool gather_draw(const RsxState& s, const GuestView& g, uint32_t first, uint32_t count, bool indexed, uint32_t at, Draw& d);
+// (`s` keeps the vertex program last made into bytes, for the next draw with the same one.)
+bool gather_draw(RsxState& s, const GuestView& g, uint32_t first, uint32_t count, bool indexed, uint32_t at, Draw& d);
 
 }  // namespace rr7

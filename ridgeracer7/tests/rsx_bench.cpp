@@ -28,6 +28,7 @@
 #include "qilin/host/vulkan.hpp"
 #include "qilin/rt/memory.hpp"
 #include "qilin/rt/shaders.hpp"
+#include "render_formats.hpp"
 #include "renderer.hpp"
 #include "rsx_state.hpp"
 
@@ -601,6 +602,29 @@ int main(int argc, char** argv) {
     time(Depth::parse, "commands only (rsx_state.hpp: run_command)");
     time(Depth::gather, "commands and draws gathered (gather_draw)");
     time(Depth::draw, "commands, gathered and drawn (renderer, stubs)");
+    // A surface's conversions to and from guest memory (render_formats.hpp), as a write-back or an upload makes them.
+    {
+        const size_t pixels = size_t{kWidth} * kHeight;
+        std::vector<uint8_t> host(pixels * 5);
+        std::vector<uint8_t> guest_bytes(pixels * 4, 0x5a);
+        uint8_t* guest = guest_bytes.data();
+        const auto best_of = [](auto&& work) {
+            double best = 1e30;
+            for (int i = 0; i < 10; ++i) {
+                const Clock::time_point start = Clock::now();
+                work();
+                best = std::min(best, static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count()) / 1e3);
+            }
+            return best;
+        };
+        const double to_host = best_of([&] { rr7::pixels_to_host(8, guest, host.data(), pixels); });
+        const double to_guest = best_of([&] { rr7::pixels_to_guest(8, host.data(), guest, pixels); });
+        const double depth = best_of([&] {
+            rr7::depth_row_to_guest(reinterpret_cast<const uint32_t*>(host.data()), host.data() + pixels * 4, guest, pixels, false);
+        });
+        const double depth_in = best_of([&] { rr7::depth_row_to_host(guest, reinterpret_cast<uint32_t*>(host.data()), host.data() + pixels * 4, pixels, false); });
+        std::printf("  a %ux%u surface: to the image %.1f us, back %.1f us; a depth surface to the image %.1f us, back %.1f us\n", kWidth, kHeight, to_host, to_guest, depth_in, depth);
+    }
     // The digest of everything the stubs were given (in the first frame drawn and in one more), and of the surfaces as
     // guest memory holds them then.
     {

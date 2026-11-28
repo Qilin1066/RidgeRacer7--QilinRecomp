@@ -21,7 +21,7 @@ uint32_t surface_location(uint32_t object) {
     fatal("a surface in context object %08x, which this runtime doesn't know", object);
 }
 
-bool gather_draw(const RsxState& s, const GuestView& g, uint32_t first, uint32_t count, bool indexed, uint32_t at, Draw& d) {
+bool gather_draw(RsxState& s, const GuestView& g, uint32_t first, uint32_t count, bool indexed, uint32_t at, Draw& d) {
     const auto state = [&](uint32_t method) { return s[method]; };
     const auto state_float = [&](uint32_t method) { return s.as_float(method); };
     d.reset();
@@ -124,17 +124,25 @@ bool gather_draw(const RsxState& s, const GuestView& g, uint32_t first, uint32_t
         const uint32_t base = guest_address(g, dma & 1, state(0x181c), "an index array") + first * size;
         uint32_t lowest = UINT32_MAX, highest = 0;
         d.indices.resize(count);
-        for (uint32_t i = 0; i < count; ++i) {
-            const uint32_t v = size == 2 ? (uint32_t{g.memory[base + 2 * i]} << 8 | g.memory[base + 2 * i + 1]) : load_be32(g.memory + base + 4 * i);
-            if (restart && v == restart_index) {
-                d.indices[i] = kRestart;
-                continue;
-            }
-            d.indices[i] = v, lowest = std::min(lowest, v), highest = std::max(highest, v);
+        uint32_t* out = d.indices.data();
+        const uint8_t* from = g.memory + base;
+        // (Read in one pass and rebased in another, each a loop the compiler can make vector code of; a restart is only
+        // looked for where it is on.)
+        if (size == 2)
+            for (uint32_t i = 0; i < count; ++i) out[i] = uint32_t{from[2 * i]} << 8 | from[2 * i + 1];
+        else
+            load_be32s(out, from, count);
+        if (!restart) {
+            for (uint32_t i = 0; i < count; ++i) lowest = std::min(lowest, out[i]), highest = std::max(highest, out[i]);
+            for (uint32_t i = 0; i < count; ++i) out[i] -= lowest;
+        } else {
+            for (uint32_t i = 0; i < count; ++i)
+                if (out[i] == restart_index) out[i] = kRestart;
+                else lowest = std::min(lowest, out[i]), highest = std::max(highest, out[i]);
+            if (lowest > highest) return false;  // (nothing but restarts)
+            for (uint32_t i = 0; i < count; ++i)
+                if (out[i] != kRestart) out[i] -= lowest;
         }
-        if (lowest > highest) return false;  // (nothing but restarts)
-        for (uint32_t& v : d.indices)
-            if (v != kRestart) v -= lowest;
         d.first = lowest, d.count = highest - lowest + 1;
         d.indexed = true;
     }
@@ -145,18 +153,23 @@ bool gather_draw(const RsxState& s, const GuestView& g, uint32_t first, uint32_t
         d.attribute_address[a] = guest_address(g, offset >> 31, (offset & 0x7fffffffu) + state(0x1738), "a vertex array");
     }
     d.vertex_constants = s.constants.data(), d.constants_version = s.constants_version;
-    // The vertex program: from its start to the instruction marked last, as big-endian bytes.
+    // The vertex program: from its start to the instruction marked last, as big-endian bytes (made again only when the
+    // start or the programs' memory has changed since the last draw).
     {
         const uint32_t start = state(0x1ea0);
         if (start >= 512) fatal("a vertex program started at slot %u, past the 512", start);
-        uint32_t last = start;
-        while (last < 512 && !(s.program[4 * last + 3] & 1)) ++last;
-        if (last == 512) fatal("the vertex program from slot %u has no last instruction", start);
-        d.vertex_program.resize(size_t{last - start + 1} * 16);
-        for (size_t w = 0; w < d.vertex_program.size() / 4; ++w) {
-            const uint32_t big = std::byteswap(s.program[4 * start + w]);
-            std::memcpy(d.vertex_program.data() + 4 * w, &big, 4);
+        if (start != s.made_start || s.program_version != s.made_version) {
+            uint32_t last = start;
+            while (last < 512 && !(s.program[4 * last + 3] & 1)) ++last;
+            if (last == 512) fatal("the vertex program from slot %u has no last instruction", start);
+            s.made_program.resize(size_t{last - start + 1} * 16);
+            for (size_t w = 0; w < s.made_program.size() / 4; ++w) {
+                const uint32_t big = std::byteswap(s.program[4 * start + w]);
+                std::memcpy(s.made_program.data() + 4 * w, &big, 4);
+            }
+            s.made_start = start, s.made_version = s.program_version;
         }
+        d.vertex_program.assign(s.made_program.begin(), s.made_program.end());
     }
     // The fragment program: from its address to the instruction marked as the end, with its inline constants.
     {
@@ -164,7 +177,9 @@ bool gather_draw(const RsxState& s, const GuestView& g, uint32_t first, uint32_t
         const uint32_t location = program & 3;
         if (location != 1 && location != 2) fatal("a fragment program in location %u (at offset %08x)", location, at);
         const uint32_t address = guest_address(g, location == 1 ? 0 : 1, program & ~3u, "a fragment program");
-        for (uint32_t offset = 0;;) {
+        // (Its length found first, then copied at once.)
+        uint32_t offset = 0;
+        for (;;) {
             const uint8_t* p = g.memory + address + offset;
             const auto word = [&](unsigned i) {
                 const uint32_t w = load_be32(p + 4 * i);
@@ -172,12 +187,11 @@ bool gather_draw(const RsxState& s, const GuestView& g, uint32_t first, uint32_t
             };
             const bool end = word(0) & 1, branch = word(2) >> 31;
             const bool constant = !branch && ((word(1) & 3) == 2 || (word(2) & 3) == 2 || (word(3) & 3) == 2);
-            const uint32_t size = constant ? 32 : 16;
-            d.fragment_program.insert(d.fragment_program.end(), p, p + size);
-            offset += size;
+            offset += constant ? 32 : 16;
             if (end) break;
             if (offset > 0x10000) fatal("the fragment program at %08x has no end in 64 KiB", address);
         }
+        d.fragment_program.assign(g.memory + address, g.memory + address + offset);
     }
     // The viewport and the window.
     for (unsigned i = 0; i < 4; ++i) d.viewport_offset[i] = state_float(0x0a20 + 4 * i), d.viewport_scale[i] = state_float(0x0a30 + 4 * i);

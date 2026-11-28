@@ -136,6 +136,7 @@ uint64_t system_time() {
 }
 
 void exit_process(int code) {
+    audio_report();
     log("the process ended with code %d", code);
     // At once: other threads may be running, and the objects they use must not be torn down under them.
     std::_Exit(code);

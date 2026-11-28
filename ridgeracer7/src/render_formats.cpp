@@ -22,8 +22,26 @@ float component(const uint8_t* p, uint32_t c) {
     if constexpr (Type == 5) return static_cast<float>(static_cast<int16_t>((p[2 * c] << 8) | p[2 * c + 1]));                         // S32K
     if constexpr (Type == 7) return static_cast<float>(p[c]);                                                                          // UB256
 }
+// (By its size, 1 to 4, known when compiled: each vertex's four floats made in registers and stored at once.)
+template <uint32_t Type, uint32_t Size>
+void decode_sized(const uint8_t* p, size_t stride, uint32_t count, float* out) {
+    for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) {
+        float f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        for (uint32_t c = 0; c < Size; ++c) f[c] = component<Type>(p, c);
+        std::memcpy(out, f, sizeof f);
+    }
+}
 template <uint32_t Type>
 void decode_attribute(const uint8_t* p, size_t stride, uint32_t size, uint32_t count, float* out) {
+    switch (size) {
+    case 1: return decode_sized<Type, 1>(p, stride, count, out);
+    case 2: return decode_sized<Type, 2>(p, stride, count, out);
+    case 3: return decode_sized<Type, 3>(p, stride, count, out);
+    case 4: return decode_sized<Type, 4>(p, stride, count, out);
+    default: break;
+    }
+    // (A size past four, as the format word allows: written as it always was, its components past the fourth into the next
+    // vertex's, which that vertex's own then replace.)
     for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) {
         out[0] = out[1] = out[2] = 0.0f, out[3] = 1.0f;
         for (uint32_t c = 0; c < size; ++c) out[c] = component<Type>(p, c);

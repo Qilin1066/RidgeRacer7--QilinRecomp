@@ -9,6 +9,7 @@
 #include "ref.hpp"
 
 #include <cstring>
+#include <vector>
 
 namespace spu_difftest {
 
@@ -357,6 +358,59 @@ bool step(State& s, const Insn& in, uint32_t pc) {
     case Op::nop: case Op::lnop: case Op::sync: case Op::dsync: case Op::hbr: case Op::hbra: case Op::hbrr: return true;
     default: return step_fp(s, in);
     }
+}
+
+
+// Branches, from the definition: a relative branch's target is pc plus four times its 16-bit field; brz and brnz
+// test the preferred word, brhz and brhnz its lower halfword; brsl puts pc + 4 in rt's preferred word (the rest zero).
+// A `bi $0` is taken as the return the lifter takes it for (a stack of the calls made), not as a jump to $0.
+bool run_program(State& s, const uint32_t* words, size_t count) {
+    std::vector<uint32_t> returns;
+    uint32_t pc = 0x3000;
+    for (size_t steps = 0; steps < 1000000; ++steps) {
+        if (pc < 0x3000 || (pc - 0x3000) / 4 >= count) return false;
+        const Insn in = qilin::spu::decode(words[(pc - 0x3000) / 4]);
+        const uint64_t word = get(s.r[in.rt()], 4, 0), half = get(s.r[in.rt()], 2, 1);
+        const auto ret = [&] {
+            if (returns.empty()) return false;
+            pc = returns.back();
+            returns.pop_back();
+            return true;
+        };
+        switch (in.op) {
+        case Op::brz: pc = word == 0 ? in.relative(pc) : pc + 4; break;
+        case Op::brnz: pc = word != 0 ? in.relative(pc) : pc + 4; break;
+        case Op::brhz: pc = half == 0 ? in.relative(pc) : pc + 4; break;
+        case Op::brhnz: pc = half != 0 ? in.relative(pc) : pc + 4; break;
+        case Op::br: pc = in.relative(pc); break;
+        case Op::brsl:
+            std::memset(s.r[in.rt()], 0, 16);
+            set(s.r[in.rt()], 4, 0, pc + 4);
+            returns.push_back(pc + 4);
+            pc = in.relative(pc);
+            break;
+        case Op::bi:
+            if (in.ra() != 0) return false;
+            if (!ret()) return true;  // the first function's return: the end
+            break;
+        case Op::biz: case Op::binz: case Op::bihz: case Op::bihnz: {
+            if (in.ra() != 0) return false;
+            const bool zero = (in.op == Op::biz || in.op == Op::binz) ? word == 0 : half == 0;
+            const bool taken = (in.op == Op::biz || in.op == Op::bihz) ? zero : !zero;
+            if (!taken) pc += 4;
+            else if (!ret()) return true;
+            break;
+        }
+        default:
+            if (qilin::spu::spec(in.op).flags & qilin::spu::kBranch) return false;
+            // (A halt that fired stays fired: step() says only whether this one does.)
+            const bool halted = s.halted;
+            if (!step(s, in, pc)) return false;
+            s.halted = s.halted || halted;
+            pc += 4;
+        }
+    }
+    return false;
 }
 
 }  // namespace spu_difftest

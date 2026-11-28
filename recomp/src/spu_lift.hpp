@@ -3,11 +3,13 @@
 //
 // The shape is the PPU lifter's (lift.hpp), and simpler: an SPU has no
 // condition register and no table of contents, calls are `brsl` and returns
-// `bi $0`. A lifted function is `void fn_XXXXX(Spu& s)`. Registers are read
-// and written in the Spu itself (128 of 16 bytes: copying them in and out
-// around every call, as the PPU's locals are, would cost more than it
-// saves; to be measured). Each instruction is one call of a helper in
-// runtime/include/qilin/rt/spu.hpp.
+// `bi $0`. A lifted function is `void fn_XXXXX(Spu& s)`. The registers it
+// uses are locals, read from the Spu at its start and again after each call
+// it makes, and those it writes are written back before each call, tail call
+// and return (as the PPU's are): within a function they live in the host's
+// vector registers. Each instruction is one call of a helper in
+// runtime/include/qilin/rt/spu.hpp; constants are folded within a block
+// (`ilhu` then `iohl` is one constant), and the compiler's moves are copies.
 //
 // A program's functions call each other by name. A branch through a
 // register goes to `call(s, target, pc)`, which the program's file defines:

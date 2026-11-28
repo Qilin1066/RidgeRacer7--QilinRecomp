@@ -19,6 +19,15 @@ struct Case {
 extern const Case kCases[];
 extern const size_t kCaseCount;
 
+// A small program: its first function (at 0x3000) lifted, and its words for the reference.
+struct Program {
+    void (*fn)(qilin::rt::Spu&);
+    const uint32_t* words;  // from 0x3000
+    size_t count;
+};
+extern const Program kPrograms[];
+extern const size_t kProgramCount;
+
 // The reference's state: registers as sixteen bytes each, in the SPU's order.
 struct State {
     uint8_t r[128][16];
@@ -37,6 +46,9 @@ struct State {
 bool step(State& s, const qilin::spu::Insn& in, uint32_t pc);
 // The floating-point instructions (ref_fp.cpp); `step` calls it.
 bool step_fp(State& s, const qilin::spu::Insn& in);
+// Runs a program from 0x3000 until its first function returns, with the branches the generator's programs use: the
+// relative branches, `brsl`, and `bi $0` and its conditional forms as returns. False if it can't.
+bool run_program(State& s, const uint32_t* words, size_t count);
 
 // What reading a channel, or asking its count, gives in the test (the runner's hooks answer the same).
 inline uint32_t channel_value(uint32_t channel) { return 0xC0DE0000u + channel * 0x101u; }

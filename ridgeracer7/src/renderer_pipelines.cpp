@@ -150,8 +150,11 @@ VkPipeline PipelineCache::pipeline(const Draw& d, const qilin::rt::TranslatedSha
                   d.stencil_back.zfail, d.stencil_back.zpass,
                   std::bit_cast<uint32_t>(d.bias_factor), std::bit_cast<uint32_t>(d.bias_units),
                   d.depth_bounds, std::bit_cast<uint32_t>(d.bounds_min), std::bit_cast<uint32_t>(d.bounds_max), static_cast<uint32_t>(rasterising.mode), d.logic, d.logic ? d.logic_op : 0u};
+    // (A draw like the one before, as most are: its pipeline without a look in the table.)
+    if (last_pipeline_ && key == last_key_) return last_pipeline_;
     auto& p = pipelines_[key];
-    if (p) return p;
+    last_key_ = key;
+    if (p) return last_pipeline_ = p;
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = module_of(vs, forms.vertex), stages[0].pName = "main";
     // The clip form's planes' tests, as its specialisation constants.
@@ -244,7 +247,7 @@ VkPipeline PipelineCache::pipeline(const Draw& d, const qilin::rt::TranslatedSha
     info.pDepthStencilState = &depth;
     info.layout = layout_;
     host::check(vkCreateGraphicsPipelines(gpu_->device, VK_NULL_HANDLE, 1, &info, nullptr, &p), "vkCreateGraphicsPipelines");
-    return p;
+    return last_pipeline_ = p;
 }
 
 void PipelineCache::start(const host::Gpu& gpu, VkPipelineLayout layout, VkFormat depth_format) {

@@ -1,0 +1,35 @@
+# Efficiency: what other projects do, and what applies here
+
+A survey made on 2026-11-28 for the owner's goal that low-end hardware (Raspberry Pi 4 and 5 class ARM64 boards, low-power laptops) plays the game without trouble. Sources are public pages: READMEs, blogs, release notes and Mesa's v3dv driver. **No GPL project's code is read** (RPCS3, Dolphin, Xenia, Cemu, Ryujinx/Yuzu, Unleashed Recompiled): their descriptions of techniques only. XenonRecomp, N64Recomp, ps3recomp, SIMDe, sse2neon and Mesa are MIT; Highway is Apache-2.0. Items marked *(unverified)* were not confirmed from a fetched source.
+
+Ranked by expected gain for this project.
+
+## Tier 1
+
+1. **Guest registers as locals across whole functions, the context touched only where needed.** XenonRecomp's options (`cr_as_local`, `xer_as_local`, `ctr_as_local`, `non_volatile_as_local`, `non_argument_as_local`, `skip_lr`) shrank Unleashed Recompiled's executable by about 20 MB and cut frame times by several milliseconds (github.com/hedge-dev/XenonRecomp). With flags in locals the compiler drops every CR or CA result nobody reads: lazy flags for free (Box64 reports up to 30% from flag liveness: box86.org/2024/07/revisiting-the-dynarec). The next step here: sync only what a callee reads or changes, arguments and results by value, non-volatile registers saved only where used. Only where analysis proves it safe.
+2. **Pipelines made ahead of time.** The shaders are already a closed set translated at build time; the pipelines (shader pair, vertex layout, blend, formats) can be created at start-up or during loading and kept in a serialised `VkPipelineCache` (as Unleashed Recompiled does on loading screens). On a Pi a pipeline made mid-race can stall a frame.
+3. **Toolchain: Clang for the generated code, ThinLTO, PGO.** XenonRecomp recommends Clang (clang-cl on Windows) for its output and advises against other compilers. ThinLTO lets the many small guest leaf functions inline across files; profile-guided optimisation (one scripted race as the profile) drives inlining and puts hot code together, which matters on a Pi whose instruction cache is 48 KB (A72) or 64 KB (A76). `-O2` for the generated code. `-mcpu=cortex-a76` for the Pi 5; `-mcpu=cortex-a72 -moutline-atomics` for the Pi 4 (no LSE atomics).
+4. **SPU programs: the hot ones replaced natively.** Six SPUs at 3.2 GHz outrun a Pi's four cores in SIMD; RPCS3 on a Pi 5 reached about 30 fps at low resolution in its best cases (tomshardware.com, omgubuntu.co.uk, December 2024). The lifted programs stay as the reference; the few that take the most time (found by profile) get native C++/NEON versions on host-order data, each checked against the lifted one for identical results.
+5. **No spinning.** Guest threads 1:1 on host threads with waits on futexes / `WaitOnAddress`; the game's polling loops (a word, a channel count) found and turned into a short spin then a wait. 128-byte SPU atomics as a seqlock or lock per line.
+
+## Tier 2
+
+6. **Memory accesses as one load and a swap.** The flat 4 GB reservation already needs no bounds check. Guest addresses as `uint32_t` so AArch64 uses `ldr w, [x, w, uxtw]` then `rev`; `movbe` on x86 with `-mmovbe`. No `volatile` on ordinary accesses (it blocks combining and CSE), only on device and shared-sync data. The Pi 5's kernel uses 16 KB pages *(unverified per install)*: page-protection tricks are coarser there.
+7. **Indirect calls through a dense table**, one load: indexed by `(entry - text_base) >> 2` (XenonRecomp puts its table after guest memory). Direct calls for every `bl`; `[[clang::musttail]]` for tail branches.
+8. **Floating point: exactness where it matters, not everywhere.** XenonRecomp ignores FPSCR and NaN details; RPCS3's "approximate xfloat" for the SPU is much faster than exact and fixed the games plain "relaxed" broke. Changing the floating-point mode per instruction serialises the pipeline: once per thread or function instead. **Open (the owner's decision): a relaxed mode for play beside the exact one for tests.**
+9. **SIMD on ARM too.** MSVC has no vector extensions, so x86 keeps SSE intrinsics; ARM64 gets NEON (hand-written for the hot shuffles: `shufb`, `vperm` via TBL) or GCC/Clang `vector_size` code, with the plain C++ kept as the reference. SIMDe and sse2neon (MIT) translate SSE to NEON; Highway (Apache-2.0) is portable with runtime dispatch.
+
+## Tier 3: the GPU
+
+10. **Surfaces stay on the GPU**, written back only when the CPU or an SPU reads them (done here by page faults since the first renderer rounds); better still, the few functions of the game that read pictures back found and handled where they are.
+11. **What v3dv gives** (Mesa's `v3dv_device.c`): dynamic rendering, synchronization2, timeline semaphores, extended dynamic state 1 and 2, buffer device address, maintenance 1-5, inline uniform blocks, multi-draw. Not there: descriptor indexing (no bindless), extended dynamic state 3 (blend stays in the pipeline), multi-draw indirect, tessellation; push descriptors, descriptor buffers, pipeline libraries and host image copy not seen. One queue only.
+12. **A renderer for a tiler.** One queue, one submission a frame, timeline semaphores for pacing. Extended dynamic state 1 and 2 to fold cull, depth, stencil, topology and depth bias out of the pipeline key. Few descriptor sets, a pool reset each frame, push constants or inline uniform blocks for per-draw data. V3D's memory is shared: vertices, indices and constants written straight into mapped rings, no staging. Fewer render-pass breaks; `DONT_CARE` stores for depth not used again. An internal resolution of 480p to 540p on a Pi.
+
+## Tier 4: C++23 and design
+
+13. **Zero-cost C++.** `std::byteswap`, `std::bit_cast`; `[[assume]]` and `std::unreachable()` for facts the lifter knows (checked in debug builds); `constexpr` tables (decoders, RSX method tables, shuffle masks); templates and concepts instead of virtual calls in hot paths; `std::flat_map` for small caches; `std::expected` on cold paths; ranges in tools, not generated code.
+14. **Object-oriented structure where it is cheap, data-oriented layout where it is hot** (Acton, *Data-Oriented Design and C++*, CppCon 2014; Fabian, *Data-Oriented Design*). A virtual call per frame, batch or job is noise; inside per-vertex, per-instruction or per-access loops, flat arrays and static dispatch. `final` classes and LTO let the compiler devirtualise.
+
+## Not found
+
+No ARM64 results for Unleashed Recompiled or Zelda64Recomp (Unleashed requires AVX); no benchmark of MSVC against Clang on generated code; v3dv's exact descriptor limits.

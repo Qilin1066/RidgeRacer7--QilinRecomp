@@ -286,7 +286,7 @@ void lend() {
     while (recorded() == 0 && std::chrono::steady_clock::now() - from < 5s) {
     }
     check(recorded() == 1 && rr7::lent_tokens() == 1, "the better thread ran on a lent token");
-    // At once, not after a wait (kPatience is 1 ms; the first design waited 2 ms and more).
+    // At once, not after a wait (kPatience, for equals, is 250 us; the first design waited 2 ms and more).
     std::printf("the better thread had its token %lld us after asking\n", static_cast<long long>(took_us.load()));
     check(took_us.load() >= 0 && took_us.load() < 500, "the better thread lent a token at once");
     join(threads);

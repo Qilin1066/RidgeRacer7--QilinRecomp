@@ -415,21 +415,34 @@ void waking() {
     // sys_timer_usleep(30), as the game's wait for the RSX's reference makes it.
     become_guest(100);
     std::vector<int64_t> slept;
+    std::printf("the host's timer floor: %lld us\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(rr7::timer_floor()).count()));
+    const uint64_t yields_before = rr7::host_yields();
     for (int i = 0; i < 100; ++i) {
         const auto from = Clock::now();
         check(sc(141, {30}) == rr7::kOk, "sys_timer_usleep");
         slept.push_back(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - from).count());
     }
     std::ranges::sort(slept);
-    std::printf("sys_timer_usleep(30) slept %lld us (median), %lld us (90th percentile)\n", static_cast<long long>(slept[50]), static_cast<long long>(slept[90]));
+    std::printf("sys_timer_usleep(30) slept %lld us (median), %lld us (90th percentile), yielding the host core %.1f times a sleep\n",
+                static_cast<long long>(slept[50]), static_cast<long long>(slept[90]), static_cast<double>(rr7::host_yields() - yields_before) / 100);
     check(slept[0] >= 30, "a sleep is never short");
-    check(slept[50] < 1000, "a 30 us sleep is well under a millisecond");
+    check(slept[50] < 200, "a 30 us sleep is about 30 us");
+    // A sleep longer than the timer's floor is mostly the timer's: few yields.
+    {
+        const uint64_t before = rr7::host_yields();
+        const auto from = Clock::now();
+        check(sc(141, {5000}) == rr7::kOk, "sys_timer_usleep");
+        const auto took = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - from).count();
+        std::printf("sys_timer_usleep(5000) slept %lld us, yielding %llu times\n", static_cast<long long>(took),
+                    static_cast<unsigned long long>(rr7::host_yields() - before));
+        check(took >= 5000 && took < 6000, "a 5 ms sleep is 5 ms");
+    }
     rr7::give_up_core();
 
     // A doorbell rung by every change: its waiter parks for long, and wakes once a ring.
     rr7::Doorbell bell;
     std::atomic<int> value{0};
-    constexpr rr7::WaitPlan kRung{.spin = std::chrono::microseconds(20), .nap = 100ms, .napping = 0ms, .park = 100ms};
+    constexpr rr7::WaitPlan kRung{.spin = std::chrono::microseconds(20), .yielding = std::chrono::microseconds(20), .park = 100ms};
     std::atomic<int64_t> latency_sum{0};
     std::atomic<int> done{0};
     std::thread ringer([&] {
@@ -452,20 +465,28 @@ void waking() {
     check(bell.wakeups() <= 25, "a waiter wakes about once a ring");
     check(latency_sum.load() / 20 < 2000, "a rung waiter wakes soon");
 
-    // A change nobody rings for (the game's own store): seen within the plan's naps, which are few.
-    rr7::Doorbell quiet;
-    std::atomic<int64_t> stored_at{0};
-    std::thread writer([&] {
-        std::this_thread::sleep_for(10ms);
-        stored_at = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
-        value.store(1000, std::memory_order_relaxed);
-    });
-    check(quiet.wait([&] { return value.load(std::memory_order_relaxed) == 1000; }, Clock::now()), "the unrung wait came");
-    const int64_t seen = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count() - stored_at.load();
-    writer.join();
-    std::printf("an unrung doorbell: seen %lld us after the store, %llu wake-ups in 10 ms\n", static_cast<long long>(seen), static_cast<unsigned long long>(quiet.wakeups()));
-    check(seen < 3000, "an unrung change is seen within a park or two");
-    check(quiet.wakeups() < 60, "an unrung wait parks rather than spins");
+    // A change nobody rings for (the game's own store, as of put): seen within microseconds while the waiter yields (its
+    // first 2 ms), within a park (1 ms) after; the yields and wake-ups it costs are counted.
+    for (const auto after : {std::chrono::microseconds(1000), std::chrono::microseconds(10000)}) {
+        rr7::Doorbell quiet;
+        std::atomic<int> word{0};
+        std::atomic<int64_t> stored_at{0};
+        const auto from = Clock::now();
+        const uint64_t yields = rr7::host_yields();
+        std::thread writer([&] {
+            rr7::sleep_until_precisely(from + after);
+            stored_at = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+            word.store(1, std::memory_order_relaxed);
+        });
+        check(quiet.wait([&] { return word.load(std::memory_order_relaxed) == 1; }, from), "the unrung wait came");
+        const int64_t seen = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count() - stored_at.load();
+        writer.join();
+        const double ms = static_cast<double>(after.count()) / 1000;
+        std::printf("an unrung store after %.0f ms: seen %lld us after it; %.0f yields and %.1f wake-ups a millisecond of waiting\n", ms,
+                    static_cast<long long>(seen), static_cast<double>(rr7::host_yields() - yields) / ms, static_cast<double>(quiet.wakeups()) / ms);
+        check(seen < (after.count() < 2000 ? 200 : 3000), "an unrung change is seen soon");
+        check(quiet.wakeups() < 30, "an unrung wait parks after its yields");
+    }
 
     // A wait that runs out.
     rr7::Doorbell late;

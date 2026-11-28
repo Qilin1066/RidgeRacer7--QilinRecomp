@@ -63,8 +63,7 @@ std::atomic<bool> g_rsx_equal{false};
 // The command buffer's callback's wait for the RSX to leave a piece, which the RSX rings for every time get jumps
 // (rsx_get_moved): it parks for long. (Its timeout only bounds a ring missed, which the code below has no case of.)
 Doorbell g_get_bell;
-constexpr WaitPlan kRungEveryTime{.spin = std::chrono::microseconds(20), .nap = std::chrono::milliseconds(100),
-                                  .napping = std::chrono::microseconds(0), .park = std::chrono::milliseconds(100)};
+constexpr WaitPlan kRungEveryTime{.spin = std::chrono::microseconds(20), .yielding = std::chrono::microseconds(20), .park = std::chrono::milliseconds(100)};
 
 // Room for `words` more commands in the context, as the game's own code makes it: through the context's callback.
 // (Used by the functions here that put commands in the stream.)
@@ -318,6 +317,7 @@ void vblank_thread() {
         // Held while the settings menu pauses the game (pause.hpp), then on from the next blank, not catching up.
         if (hold_while_paused(HoldPoint::vertical_blank)) n = next_vertical_blank();
         sleep_until_precisely(vblank_time(n));  // (a plain sleep on Windows is late by up to a millisecond or more)
+        rsx_poke();  // (a RSX parked waiting for put, which the game moves by its own stores, looks at least once a blank)
         g_vblanks.store(n, std::memory_order_relaxed);
         if (const uint32_t handler = g_vblank_handler.load()) {
             cpu.r[3] = 1;

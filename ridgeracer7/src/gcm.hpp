@@ -48,9 +48,10 @@ uint64_t next_vertical_blank();
 void wait_for_vertical_blank(uint64_t n);
 
 // The RSX's thread waits without spinning (gcm.cpp). What it waits for is a word in guest memory the game's own code
-// writes (put, a label, a jump being written over), so it can't be told of each store: it spins briefly, then parks a
-// tenth of a millisecond at a time for 2 ms, then a millisecond at a time; and is woken at once by any guest thread's
-// call into the system (rsx_poke) that finds the word as wanted, and by the runtime's own writes of put.
+// writes (put, a label, a jump being written over), so it can't be told of each store: it spins 20 us,
+// then yields the host core in a loop, looking each time, for 2 ms (a store is seen within microseconds, and the core goes to
+// any thread that wants it), then parks a millisecond at a time; and is woken at once by any guest thread's call into the
+// system (rsx_poke) that finds the word as wanted, by each vertical blank, and by the runtime's own writes of put.
 //
 // Waits until the word at `address` is `value` (with `equal`) or isn't (without), or `until` passes; `since` is when the
 // RSX began waiting for it. Returns the word.

@@ -2,6 +2,7 @@
 #include "kernel_sched.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -403,9 +404,8 @@ void precise_timers() {
 }
 #endif
 
-}  // namespace
-
-void sleep_until_precisely(std::chrono::steady_clock::time_point when) {
+// The host's timer alone, until `when`.
+void timer_sleep_until(std::chrono::steady_clock::time_point when) {
     if (when <= std::chrono::steady_clock::now()) return;
 #if defined(_WIN32)
     WaitForSingleObject(timer_at(when), INFINITE);
@@ -414,6 +414,45 @@ void sleep_until_precisely(std::chrono::steady_clock::time_point when) {
     std::this_thread::sleep_until(when);
 #endif
 }
+
+std::atomic<uint64_t> g_host_yields{0};
+
+}  // namespace
+
+std::chrono::nanoseconds timer_floor() {
+    // (The median of nine of the shortest timed sleeps, and a tenth more for the timer's jitter.)
+    static const std::chrono::nanoseconds floor = [] {
+        std::array<std::chrono::nanoseconds, 9> took{};
+        for (auto& t : took) {
+            const auto from = std::chrono::steady_clock::now();
+            timer_sleep_until(from + std::chrono::microseconds(1));
+            t = std::chrono::steady_clock::now() - from;
+        }
+        std::ranges::sort(took);
+        return took[4] + took[4] / 10;
+    }();
+    return floor;
+}
+
+void yield_host() {
+    g_host_yields.fetch_add(1, std::memory_order_relaxed);
+    std::this_thread::yield();
+}
+uint64_t host_yields() { return g_host_yields.load(std::memory_order_relaxed); }
+
+void sleep_until_precisely(std::chrono::steady_clock::time_point when) {
+    using Clock = std::chrono::steady_clock;
+    if (when <= Clock::now()) return;
+    // The timer for what lies above its floor (it then wakes at about `when - floor` or, for a part shorter than the
+    // floor, after the floor: never past `when`); the rest by a short spin, then yields.
+    for (const auto floor = timer_floor(); when - Clock::now() > floor;) timer_sleep_until(when - floor);
+    const auto spin_until = Clock::now() + std::chrono::microseconds(5);
+    for (auto t = Clock::now(); t < when; t = Clock::now()) {
+        if (t < spin_until) cpu_relax();
+        else yield_host();
+    }
+}
+
 
 #if defined(_WIN32)
 Parker::Parker() : event_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {

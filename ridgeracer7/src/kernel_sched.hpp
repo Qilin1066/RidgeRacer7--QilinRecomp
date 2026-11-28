@@ -41,6 +41,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(_M_X64) || defined(__x86_64__)
@@ -189,9 +190,19 @@ inline void cpu_relax() {
 #endif
 }
 
-// Sleeps until `when`, to within the host's timer: about 50 us on Linux and macOS (the calling thread's timer slack is made
-// 1 ns on Linux), half a millisecond on Windows (a high-resolution waitable timer: plain sleeps there are 1 to 15.6 ms).
+// The shortest a timed wait of the host's takes, measured once at the first use: about half a millisecond on Windows (a
+// high-resolution waitable timer: plain sleeps there are 1 to 15.6 ms), tens of microseconds on Linux (the calling
+// thread's timer slack is made 1 ns) and macOS.
+std::chrono::nanoseconds timer_floor();
+
+// Sleeps until `when`, to within a few microseconds: the host's timer for the part of the wait above timer_floor(), then
+// a few microseconds' spin and the host core yielded in a loop to the end (so a 30 us sleep is 30 us, not the timer's half
+// millisecond; the yields give the core to any other thread that wants it). Long sleeps cost a wake-up or two.
 void sleep_until_precisely(std::chrono::steady_clock::time_point when);
+// How many times precise sleeps and doorbells have yielded the host core (tests: what the short waits cost).
+uint64_t host_yields();
+// Yields the host core once (counted).
+void yield_host();
 
 // One thread's wait that others can end early, timed as precisely as sleep_until_precisely. A wake given while nobody
 // waits ends the next wait at once (it is not lost). One thread parks on it at a time.
@@ -215,11 +226,12 @@ private:
 #endif
 };
 
-// How a Doorbell's waiter waits: it spins for `spin` from the start of the wait, then parks `nap` at a time until
-// `napping` from the start, then `park` at a time; a ring ends a park at once. (The timeouts are for what changes
-// without ringing, the game's own stores: a doorbell every change rings can park for long.)
+// How a Doorbell's waiter waits: it spins for `spin` from the start of the wait, then yields the host core in a loop
+// until `yielding` from the start (looking each time: what it waits for is seen within microseconds, and the core goes
+// to any thread that wants it), then parks `park` at a time; a ring ends a park at once. (The yields and timeouts are for
+// what changes without ringing, the game's own stores: a doorbell every change rings yields not at all and parks long.)
 struct WaitPlan {
-    std::chrono::microseconds spin{20}, nap{100}, napping{2000}, park{1000};
+    std::chrono::microseconds spin{20}, yielding{2000}, park{1000};
 };
 
 // What one thread waits for, which others change and ring for. Ringing costs a fence and a load when nobody waits.
@@ -235,13 +247,17 @@ public:
             if (now >= until) return false;
             cpu_relax();
         }
+        for (auto now = Clock::now(); now - since < plan.yielding; now = Clock::now()) {
+            if (ready()) return true;
+            if (now >= until) return false;
+            yield_host();
+        }
         begin();
         bool came = ready();
         while (!came) {
             const auto now = Clock::now();
             if (now >= until) break;
-            const auto step = now - since < plan.napping ? plan.nap : plan.park;
-            park(until - now < step ? until : now + step);
+            park(until - now < plan.park ? until : now + plan.park);
             came = ready();
         }
         waiting_.store(false, std::memory_order_release);

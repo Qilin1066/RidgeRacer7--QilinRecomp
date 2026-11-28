@@ -188,6 +188,10 @@ std::unordered_map<VkDescriptorSet, std::vector<SetTexture>> g_sets;
 std::unordered_map<VkBuffer, FakeBuffer*> g_buffers;
 uint32_t g_vertex_bindings_first = 0, g_vertex_bindings_count = 0;
 uint64_t g_vk_draws = 0;
+// Rendering instances begun, and their attachments loaded (read from memory first: what a tiler would rather not) and
+// cleared by their load operations.
+uint64_t g_passes = 0, g_loads = 0, g_load_clears = 0;
+VkRect2D g_render_area{};
 
 // A vertex attribute's value as the GPU reads it, by its Vulkan format (little-endian components; missing ones 0, 0, 0, 1).
 std::array<float, 4> read_attribute(VkFormat format, const uint8_t* p) {
@@ -475,14 +479,45 @@ void stub_vulkan() {
     NOP(vkCmdResetQueryPool);
     NOP(vkCmdWriteTimestamp2);
     NOP(vkCmdPipelineBarrier2);
-    NOP(vkCmdBeginRendering);
+    // A rendering instance: an attachment cleared as it begins is digested as a clear of the whole area would be
+    // (vkCmdClearAttachments), so that a clear made a load operation is shown to give the same.
+    vkCmdBeginRendering = [](VkCommandBuffer, const VkRenderingInfo* info) {
+        ++g_passes;
+        g_render_area = info->renderArea;
+        VkClearAttachment clears[2] = {};
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < info->colorAttachmentCount; ++i) {
+            const VkRenderingAttachmentInfo& a = info->pColorAttachments[i];
+            if (a.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) ++g_loads;
+            if (a.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) clears[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, clears[n].colorAttachment = i, clears[n].clearValue.color = a.clearValue.color, ++n;
+        }
+        const VkRenderingAttachmentInfo* z = info->pDepthAttachment;
+        const VkRenderingAttachmentInfo* st = info->pStencilAttachment;
+        if ((z && z->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) || (st && st->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)) ++g_loads;
+        const bool clear_depth = z && z->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR, clear_stencil = st && st->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+        if (clear_depth || clear_stencil) {
+            clears[n].aspectMask = (clear_depth ? VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT} : 0u) | (clear_stencil ? VkImageAspectFlags{VK_IMAGE_ASPECT_STENCIL_BIT} : 0u);
+            clears[n].clearValue.depthStencil = {z ? z->clearValue.depthStencil.depth : 0.0f, st ? st->clearValue.depthStencil.stencil : 0u};
+            ++n;
+        }
+        if (!n) return;
+        g_load_clears += n;
+        for (uint32_t i = 0; i < n; ++i) digest_value(clears[i]);
+        digest_value(VkClearRect{info->renderArea, 0, 1});
+    };
     NOP(vkCmdEndRendering);
     NOP(vkCmdCopyImage);
     NOP(vkCmdCopyImageToBuffer);
     vkCmdSetViewport = [](VkCommandBuffer, uint32_t, uint32_t, const VkViewport* v) { g_bound.viewport = *v; };
     vkCmdClearAttachments = [](VkCommandBuffer, uint32_t count, const VkClearAttachment* clears, uint32_t, const VkClearRect* rects) {
         for (uint32_t i = 0; i < count; ++i) digest_value(clears[i]);
-        digest_value(rects[0]);
+        // (Its rectangle within the rendering's area: what is cleared.)
+        VkClearRect rect = rects[0];
+        const int32_t x1 = std::min(rect.rect.offset.x + static_cast<int32_t>(rect.rect.extent.width), g_render_area.offset.x + static_cast<int32_t>(g_render_area.extent.width));
+        const int32_t y1 = std::min(rect.rect.offset.y + static_cast<int32_t>(rect.rect.extent.height), g_render_area.offset.y + static_cast<int32_t>(g_render_area.extent.height));
+        rect.rect.offset.x = std::max(rect.rect.offset.x, g_render_area.offset.x), rect.rect.offset.y = std::max(rect.rect.offset.y, g_render_area.offset.y);
+        rect.rect.extent = {static_cast<uint32_t>(std::max(0, x1 - rect.rect.offset.x)), static_cast<uint32_t>(std::max(0, y1 - rect.rect.offset.y))};
+        digest_value(rect);
     };
     vkCmdSetScissor = [](VkCommandBuffer, uint32_t, uint32_t, const VkRect2D* r) { g_bound.scissor = *r; };
     vkCmdPushConstants = [](VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, uint32_t offset, uint32_t size, const void* data) {
@@ -833,14 +868,16 @@ int main(int argc, char** argv) {
     const auto time = [&](Depth depth, const char* what) {
         Acts acts;
         acts.s = &s, acts.depth = depth;
-        const uint64_t made_before = g_pipelines_made;
+        const uint64_t made_before = g_pipelines_made, passes_start = g_passes, loads_start = g_loads, load_clears_start = g_load_clears;
         run_frame(s, acts, bytes);  // (a frame first, for the caches: textures decoded, pipelines made)
         const uint64_t made_first = g_pipelines_made - made_before;
+        const uint64_t first_passes = g_passes - passes_start, first_loads = g_loads - loads_start, first_load_clears = g_load_clears - load_clears_start;
         if (touch && depth == Depth::draw) rr7::renderer_guest_access(rr7::kRsxLocal + kColour, uint64_t{kPitch} * kHeight * 2);
         g_digesting = false;
         // Each frame's time: the best and the median are given (other work on the computer only ever makes a frame slower).
         std::vector<double> times;
         const rr7::RendererCounters before = rr7::renderer_counters();
+        const uint64_t passes_before = g_passes, loads_before = g_loads, load_clears_before = g_load_clears;
         for (uint32_t i = 0; i < frames; ++i) {
             const Clock::time_point start = Clock::now();
             run_frame(s, acts, bytes);
@@ -854,6 +891,10 @@ int main(int argc, char** argv) {
             std::printf("  pipelines made: %llu in the first frame drawn, %llu in the %u after; a frame writes %.2f MB to the arenas, copies %.2f MB on the GPU\n",
                         static_cast<unsigned long long>(made_first), static_cast<unsigned long long>(g_pipelines_made - made_before - made_first), frames,
                         static_cast<double>(after.arena_bytes - before.arena_bytes) / frames / 1048576.0, static_cast<double>(after.copied_bytes - before.copied_bytes) / frames / 1048576.0);
+            std::printf("  rendering instances: %llu in the first frame drawn (%llu attachments loaded, %llu cleared as they begin); %.1f a frame after (%.1f loaded, %.1f cleared)\n",
+                        static_cast<unsigned long long>(first_passes), static_cast<unsigned long long>(first_loads), static_cast<unsigned long long>(first_load_clears),
+                        static_cast<double>(g_passes - passes_before) / frames, static_cast<double>(g_loads - loads_before) / frames,
+                        static_cast<double>(g_load_clears - load_clears_before) / frames);
         }
         g_digesting = true;
     };

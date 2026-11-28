@@ -119,12 +119,9 @@ inline void set_float_control(FloatControl c) { _mm_setcsr(c); }
 #elif QILIN_SPU_NEON
 using FloatControl = uint64_t;
 inline constexpr FloatControl kSingleBits = (uint64_t{3} << 22) | (uint64_t{1} << 24), kSingleMask = kSingleBits;
-inline FloatControl float_control() {
-    uint64_t c;
-    __asm__ __volatile__("mrs %0, fpcr" : "=r"(c) : : "memory");
-    return c;
-}
-inline void set_float_control(FloatControl c) { __asm__ __volatile__("msr fpcr, %0" : : "r"(c) : "memory"); }
+// (ACLE's system-register intrinsics, GCC 14 and Clang: no inline assembly, by the portability rule.)
+inline FloatControl float_control() { return __arm_rsr64("fpcr"); }
+inline void set_float_control(FloatControl c) { __arm_wsr64("fpcr", c); }
 #endif
 
 // The calling thread's float unit set for SPU single precision, and the process's way set to `mode` (every thread that

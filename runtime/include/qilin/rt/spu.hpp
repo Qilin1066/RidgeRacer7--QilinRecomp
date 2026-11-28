@@ -72,6 +72,7 @@
 #include QILIN_SPU_NEON_TEST
 #define QILIN_SPU_NEON 1
 #elif defined(__aarch64__) && !defined(__ARM_BIG_ENDIAN) && (defined(__GNUC__) || defined(__clang__)) && !defined(QILIN_SPU_PORTABLE)
+#include <arm_acle.h>
 #include <arm_neon.h>
 #define QILIN_SPU_NEON 1
 #else

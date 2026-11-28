@@ -351,9 +351,18 @@ DIFFTEST_NOINLINE void check_flushed(Report report) {
         {"vsubfp to a denormal", {rt::vmx::relaxed::vsubfp(small, normal), rt::vmx::exact::vsubfp(small, normal)}},
         {"vcmpeqfp of denormals", {rt::vmx::relaxed::vcmpeqfp(tiny, zero), rt::vmx::exact::vcmpeqfp(tiny, zero)}},
     };
+    size_t differ = 0;
     for (const auto& [what, r] : flushed)
         for (unsigned i = 0; i < 4; ++i)
-            if (r.first.w[i] != r.second.w[i]) report(what, tiny.w[i], half.w[i], r.first.w[i], r.second.w[i]);
+            if (r.first.w[i] != r.second.w[i]) ++differ, report(what, tiny.w[i], half.w[i], r.first.w[i], r.second.w[i]);
+#if defined(__x86_64__) || defined(_M_X64)
+    // (On a failure, what the hardware itself gives here: a plain subtract to a denormal, which a flushing unit makes 0.)
+    if (differ) {
+        const __m128 x = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(small.w[0]))), y = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(normal.w[0])));
+        std::println(stderr, "  (in the check: MXCSR {:#x}; the hardware's subtract of {:#x} and {:#x} gives {:#x})", _mm_getcsr(), small.w[0], normal.w[0],
+                     static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_castps_si128(_mm_sub_ps(x, y)))));
+    }
+#endif
 }
 
 RelaxedCounts run_relaxed() {

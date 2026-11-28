@@ -67,6 +67,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - `renderer.cpp` split: the shader modules, pipelines and samplers (`renderer_pipelines.*`, a `PipelineCache`), the pure state (`render_state.*`) and conversions (`render_formats.*`) are files of their own; `renderer.cpp` keeps the batches, surfaces, write-back and presentation (1,833 lines to 1,584).
 
 ### Changed
+- The sound mixer is paced by the sound card and waits for the game: its blocks follow the card's crystal on an absolute schedule trimmed by the card's queue (no resampling), it sleeps with a high-resolution timer at the host's highest priority (Windows' "Pro Audio" class), and a block the game hasn't written yet (a taken block is marked with a pattern, not zeroes) is waited for, up to 50 ms, instead of played empty. The game writes each block at the read index as it is when its sound core answers, so a late answer used to cost a gap and a lost block. Pausing fades the sound out and back in. Once a second the mixer logs late wake-ups, waits for the game, blocks missed, the card running dry and clipping when any happen (each second with `RR7_AUDIO_VERBOSE=1`), and their totals at the end of the run (`docs/runtime.md`, "The sound's timing").
 - The controller's layout is the settings' (`[controls]`), its defaults the keyboard layout `main.cpp` had; L2 and R2 bound to a pad's triggers keep their pressure.
 - `host/`: `present_again` no longer stops the frame times (as WindWakerHD's): showing the last picture again between the game's no longer drops the next frame time.
 - README rewritten to the layout shared by the QilinRecomp projects: what works and how to build and play it, without the development history.
@@ -79,6 +80,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - The RSX's state table, vertex programs and constants and the gathering of a draw are `rsx_state.hpp`/`.cpp`, which need no game; `rsx.cpp` keeps the thread and the methods that act.
 
 ### Checked
+- `ridgeracer7_audio_test`: the mixer's pacing simulated between a fake sound card and a fake game that answers as Ridge Racer 7's sound thread does, jittery and sometimes late: no block lost or missed in 3,751, the card never dry, its queue on its target, with drift of 1000 parts in a million either way, a large card request, stalls of 40 and 300 ms; the old mixer loses a tenth of the same game's blocks with a 1 ms timer, and most of them with the system's 15.6 ms one.
 - On the owner's PC: the game starts its sound core (`bnusCoreSpu.elf`) as an SPU thread, which runs; it reads and unpacks its first packs of `RR7.DAT`, and runs on to its first drawing: it stops at the RSX method that loads a vertex program. 110 of its 248 imports and 54 of its 78 system calls are provided.
 
 ### Fixed

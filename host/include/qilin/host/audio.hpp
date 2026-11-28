@@ -7,12 +7,19 @@
 // the queue near kTargetMs by playing up to 0.5% faster or slower (a pitch
 // change far below hearing), steered by the queue's smoothed length. Only a
 // stall that leaves more than kDropMs queued drops sound.
+//
+// A producer that paces itself by the card (audio_pacer.hpp) uses put()
+// instead: nothing is steered or dropped, and the card's requests are
+// watched for finding the queue short (underruns).
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 struct SDL_AudioStream;
@@ -24,7 +31,8 @@ public:
     static constexpr double kTargetMs = 40.0;  // queued sound aimed for: the latency it adds
     static constexpr double kDropMs = 200.0;   // more than this queued (a stall): drop it
 
-    AudioOut();  // fails loudly if there's no playback device
+    AudioOut() : AudioOut(32000) {}
+    explicit AudioOut(unsigned rate);  // fails loudly if there's no playback device
     ~AudioOut();
     AudioOut(const AudioOut&) = delete;
     AudioOut& operator=(const AudioOut&) = delete;
@@ -40,8 +48,31 @@ public:
     };
     Stats take_stats();
 
+    // ---- Paced by the producer (audio_pacer.hpp) ----
+    // Queue `frames` left/right pairs at the rate opened with; silence first, if fewer than `prime_frames` would be
+    // queued with them, to make that many (the producer asks for it at its start, after a pause, after a stall).
+    void put(const int16_t* left_right, size_t frames, size_t prime_frames = 0);
+    size_t queued_frames() const;
+    // How much the card takes at a time, in this stream's frames: its last request, or its buffer's size until then.
+    size_t pull_frames() const;
+    // Before a pause: a ramp from the last sample put down to silence (so the stop doesn't click); the card running
+    // dry after it is not an underrun.
+    void fade_out();
+    // Since the last call (any thread): the card's requests, how many found the queue short and by how many frames.
+    struct PacedStats {
+        uint32_t pulls = 0, underruns = 0;
+        uint64_t short_frames = 0;
+    };
+    PacedStats take_paced_stats();
+
+    struct Pulls;  // what the card's thread sees (audio.cpp)
+
 private:
     SDL_AudioStream* stream_ = nullptr;
+    std::unique_ptr<Pulls> pulls_;
+    size_t device_frames_ = 0;
+    std::array<int16_t, 2> last_{};  // the last frame put
+    bool started_ = false;
     unsigned rate_ = 0;
     double smoothed_ms_ = kTargetMs, ratio_ = 1.0;  // the guest thread's own
     std::vector<int16_t> silence_;
@@ -56,5 +87,18 @@ inline double audio_rate_ratio(double smoothed_ms, double target_ms) {
     const double err = (smoothed_ms - target_ms) / target_ms;
     return 1.0 + std::clamp(0.004 * err, -0.005, 0.005);
 }
+
+// ---- The threads that make sound ----
+enum class AudioThread {
+    mixer,   // wakes on time and does little: the host's highest priority short of real time (and on Windows the
+             // multimedia scheduler's "Pro Audio" class)
+    worker,  // makes the sound the mixer waits for (a guest's sound core): above the other threads, below the mixer
+};
+// For the calling thread. False if the system refused (on Linux without the rights to): it runs on as it was.
+bool set_audio_thread_priority(AudioThread role);
+
+// Sleeps until `when`, to within a fraction of a millisecond (on Windows a high-resolution waitable timer: a plain
+// sleep there is 1 ms at best, 15.6 ms when the system's timer resolution isn't raised).
+void sleep_precisely_until(std::chrono::steady_clock::time_point when);
 
 }  // namespace qilin::host

@@ -145,6 +145,14 @@ foreach(case fast priority two-tokens switch-point yield blocking sleep lend fre
     add_test(NAME ridgeracer7_sched_${case} COMMAND ridgeracer7_sched_test ${case})
     set_tests_properties(ridgeracer7_sched_${case} PROPERTIES TIMEOUT 30)
 endforeach()
+# The sound mixer's pacing against a fake sound card and a fake game, and its ports' blocks: no window, card or game.
+add_executable(ridgeracer7_audio_test ridgeracer7/tests/audio_test.cpp)
+target_include_directories(ridgeracer7_audio_test PRIVATE host/include ridgeracer7/src)
+target_link_libraries(ridgeracer7_audio_test PRIVATE qilin_warnings)
+foreach(case blocks restart jittery old coarse drift big-request stall)
+    add_test(NAME ridgeracer7_audio_${case} COMMAND ridgeracer7_audio_test ${case})
+    set_tests_properties(ridgeracer7_audio_${case} PROPERTIES TIMEOUT 60)
+endforeach()
 # The renderer's pure parts (textures' channel orders, surfaces' pixels, vertex attributes, primitives, rasterisation): no
 # GPU, no game.
 add_executable(ridgeracer7_render_test ridgeracer7/tests/render_test.cpp ridgeracer7/src/textures.cpp ridgeracer7/src/render_formats.cpp

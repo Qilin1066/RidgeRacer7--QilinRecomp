@@ -2,6 +2,7 @@
 #include "kernel_sched.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -13,6 +14,14 @@
 
 #include "qilin/rt/report.hpp"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#elif defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
 namespace rr7 {
 
 struct SchedThread {
@@ -22,7 +31,9 @@ struct SchedThread {
     bool granted = false, queued = false;  // under g_mutex
     int64_t seq = 0;                       // its place among equals while queued
     std::chrono::steady_clock::time_point since;  // queued since
-    std::condition_variable cv;
+    // When it wakes to look at lending again if not given a token before (under g_mutex): the earliest it may borrow.
+    std::chrono::steady_clock::time_point wake_at = std::chrono::steady_clock::time_point::max();
+    Parker parker;
 };
 
 namespace {
@@ -50,7 +61,7 @@ std::atomic<int32_t> g_best_waiting{INT32_MAX};  // the best priority in g_ready
 std::atomic<bool> g_free{false};
 std::atomic<bool> g_configured{false};
 bool g_lend = true;  // (under g_mutex)
-std::atomic<uint64_t> g_lent{0}, g_waits{0};
+std::atomic<uint64_t> g_lent{0}, g_waits{0}, g_wakeups{0};
 thread_local SchedThread* t_self = nullptr;
 
 void configure_locked(int tokens, bool free_threads, bool lend) {
@@ -99,7 +110,7 @@ void dequeue(SchedThread* t) {
 void grant(SchedThread* t) {
     dequeue(t);
     t->granted = true;
-    t->cv.notify_one();
+    t->parker.unpark();
 }
 
 // The worst priority among the threads holding a token (INT32_MIN if none holds one). Under g_mutex.
@@ -110,23 +121,38 @@ int32_t worst_holder() {
     return worst;
 }
 
-// Whether `t`, waiting this long, may run on a lent token. Under g_mutex.
-bool may_borrow(const SchedThread* t, std::chrono::steady_clock::duration waited) {
-    if (!g_lend) return false;
+// When `t` may run on a lent token, by the holders now: its time queued (t->since) at once, or after a patience; never
+// with lending off. Under g_mutex.
+std::chrono::steady_clock::time_point borrow_time(const SchedThread* t) {
+    if (!g_lend) return std::chrono::steady_clock::time_point::max();
     const int32_t worst = worst_holder(), mine = t->priority.load(std::memory_order_relaxed);
-    if (worst > mine) return true;  // (at once: the console would have preempted that holder)
-    return waited >= kLongPatience || (worst == mine && waited >= kPatience);
+    if (worst > mine) return t->since;  // (at once: the console would have preempted that holder)
+    return t->since + (worst == mine ? std::chrono::steady_clock::duration(kPatience) : kLongPatience);
+}
+
+// The holders or a priority have changed: a waiting thread that may now borrow sooner than it is waiting to is woken to
+// look again. (Nothing else changes when a thread may borrow but time: the waiters wake for that by themselves, so none
+// polls.) Under g_mutex.
+void hurry_waiters() {
+    for (SchedThread* const other : g_ready)
+        if (borrow_time(other) < other->wake_at) other->parker.unpark();
 }
 
 // Waits, queued, until `t` is given a token (or lent one). Under g_mutex.
 void wait_for_grant(std::unique_lock<std::mutex>& lock, SchedThread* t) {
     while (!t->granted) {
-        // (Asked before waiting at all, so that a thread outranking a holder runs at once, and again after each wait.)
-        const auto waited = std::chrono::steady_clock::now() - t->since;
-        if (!may_borrow(t, waited)) {
-            t->cv.wait_for(lock, kPatience);
+        // (Asked before waiting at all, so that a thread outranking a holder runs at once, and again after each wait: it
+        // wakes when given a token, when it may borrow one, and when hurry_waiters says that time has come sooner.)
+        const auto now = std::chrono::steady_clock::now();
+        if (const auto when = borrow_time(t); when > now) {
+            t->wake_at = when;
+            lock.unlock();
+            t->parker.park_until_precisely(when);  // (on time: the sound thread borrows at kPatience every 5.33 ms block)
+            lock.lock();
+            g_wakeups.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
+        const auto waited = now - t->since;
         // Lent: one waiting fewer, one token fewer free (below zero). Nothing else changes the word while some wait.
         uint64_t s = g_state.load();
         while (!g_state.compare_exchange_weak(s, pack(free_of(s) - 1, waiting_of(s) - 1))) {
@@ -149,7 +175,9 @@ void wait_for_grant(std::unique_lock<std::mutex>& lock, SchedThread* t) {
         break;
     }
     t->granted = false;
+    t->wake_at = std::chrono::steady_clock::time_point::max();
     t->holding.store(true, std::memory_order_relaxed);
+    hurry_waiters();  // (a holder more: one waiting may now outrank it, or equal it)
 }
 
 // A token given back: to the best waiting thread if one waits, else to the pool (or a lent one repaid).
@@ -224,13 +252,14 @@ void end_sched_thread() {
 void take_core() {
     SchedThread* const t = t_self;
     if (!t || t->holding.load(std::memory_order_relaxed) || g_free.load(std::memory_order_relaxed)) return;
+    // (Holding is marked before the token is taken, so that a thread queueing for one meanwhile counts this one among the
+    // holders when it works out when it may borrow: it is woken again only if that time comes sooner.)
+    t->holding.store(true, std::memory_order_seq_cst);
     uint64_t s = g_state.load(std::memory_order_relaxed);
     while (free_of(s) > 0 && waiting_of(s) == 0)
-        if (g_state.compare_exchange_weak(s, pack(free_of(s) - 1, 0), std::memory_order_acquire, std::memory_order_relaxed)) {
-            t->holding.store(true, std::memory_order_relaxed);
-            return;
-        }
+        if (g_state.compare_exchange_weak(s, pack(free_of(s) - 1, 0), std::memory_order_seq_cst, std::memory_order_relaxed)) return;
     std::unique_lock lock(g_mutex);
+    t->holding.store(false, std::memory_order_relaxed);
     s = g_state.load();
     for (;;) {
         if (free_of(s) > 0 && waiting_of(s) == 0) {
@@ -282,6 +311,7 @@ void set_sched_priority(uint32_t id, int32_t priority) {
     if (it == g_threads.end()) return;  // (a thread the scheduler never runs)
     it->second->priority.store(priority, std::memory_order_relaxed);
     if (it->second->queued) note_best();
+    hurry_waiters();
 }
 
 int32_t current_priority() {
@@ -290,6 +320,7 @@ int32_t current_priority() {
 }
 
 uint64_t lent_tokens() { return g_lent.load(); }
+uint64_t core_wakeups() { return g_wakeups.load(); }
 int32_t free_core_tokens() { return free_of(g_state.load()); }
 uint32_t threads_waiting_for_core() { return waiting_of(g_state.load()); }
 uint64_t waits_begun() { return g_waits.load(); }
@@ -334,5 +365,150 @@ Waiter* WaitQueue::pop() {
 }
 
 bool WaitQueue::remove(Waiter& w) { return std::erase(waiters_, &w) != 0; }
+
+// ---- waiting without spinning ----
+
+namespace {
+
+#if defined(_WIN32)
+// The calling thread's high-resolution waitable timer (Windows 10 1803 on; an ordinary one before, whose resolution is
+// the system timer's), made at its first timed wait and closed as the thread ends.
+struct ThreadTimer {
+    HANDLE handle = nullptr;
+    ThreadTimer() {
+        handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!handle) handle = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        if (!handle) qilin::rt::fatal("the host refused a waitable timer (error %lu)", GetLastError());
+    }
+    ~ThreadTimer() { CloseHandle(handle); }
+    ThreadTimer(const ThreadTimer&) = delete;
+    ThreadTimer& operator=(const ThreadTimer&) = delete;
+};
+// The timer, set to go off at `when` (which is in the future).
+HANDLE timer_at(std::chrono::steady_clock::time_point when) {
+    thread_local ThreadTimer timer;
+    const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(when - std::chrono::steady_clock::now()).count();
+    LARGE_INTEGER due;
+    due.QuadPart = -std::max<long long>(left / 100, 1);  // (relative, in 100 ns)
+    if (!SetWaitableTimer(timer.handle, &due, 0, nullptr, nullptr, FALSE)) qilin::rt::fatal("the host refused to set a timer (error %lu)", GetLastError());
+    return timer.handle;
+}
+#else
+// Linux delays a thread's timed waits by up to its timer slack (50 us unless changed) to gather wake-ups: a thread that
+// sleeps briefly to poll asks for 1 ns. (Other hosts have no such setting.)
+void precise_timers() {
+#if defined(__linux__)
+    thread_local const bool set = prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL) == 0;
+    static_cast<void>(set);
+#endif
+}
+#endif
+
+// The host's timer alone, until `when`.
+void timer_sleep_until(std::chrono::steady_clock::time_point when) {
+    if (when <= std::chrono::steady_clock::now()) return;
+#if defined(_WIN32)
+    WaitForSingleObject(timer_at(when), INFINITE);
+#else
+    precise_timers();
+    std::this_thread::sleep_until(when);
+#endif
+}
+
+std::atomic<uint64_t> g_host_yields{0};
+
+}  // namespace
+
+std::chrono::nanoseconds timer_floor() {
+    // (The median of nine of the shortest timed sleeps, and a tenth more for the timer's jitter.)
+    static const std::chrono::nanoseconds floor = [] {
+        std::array<std::chrono::nanoseconds, 9> took{};
+        for (auto& t : took) {
+            const auto from = std::chrono::steady_clock::now();
+            timer_sleep_until(from + std::chrono::microseconds(1));
+            t = std::chrono::steady_clock::now() - from;
+        }
+        std::ranges::sort(took);
+        return took[4] + took[4] / 10;
+    }();
+    return floor;
+}
+
+void yield_host() {
+    g_host_yields.fetch_add(1, std::memory_order_relaxed);
+    std::this_thread::yield();
+}
+uint64_t host_yields() { return g_host_yields.load(std::memory_order_relaxed); }
+
+void sleep_until_precisely(std::chrono::steady_clock::time_point when) {
+    using Clock = std::chrono::steady_clock;
+    if (when <= Clock::now()) return;
+    // The timer for what lies above its floor (it then wakes at about `when - floor` or, for a part shorter than the
+    // floor, after the floor: never past `when`); the rest by a short spin, then yields.
+    for (const auto floor = timer_floor(); when - Clock::now() > floor;) timer_sleep_until(when - floor);
+    const auto spin_until = Clock::now() + std::chrono::microseconds(5);
+    for (auto t = Clock::now(); t < when; t = Clock::now()) {
+        if (t < spin_until) cpu_relax();
+        else yield_host();
+    }
+}
+
+
+#if defined(_WIN32)
+Parker::Parker() : event_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {
+    if (!event_) qilin::rt::fatal("the host refused an event (error %lu)", GetLastError());
+}
+Parker::~Parker() { CloseHandle(event_); }
+void Parker::unpark() { SetEvent(event_); }
+bool Parker::park_until(std::chrono::steady_clock::time_point when) {
+    if (when == std::chrono::steady_clock::time_point::max()) return WaitForSingleObject(event_, INFINITE) == WAIT_OBJECT_0;
+    if (when <= std::chrono::steady_clock::now()) return WaitForSingleObject(event_, 0) == WAIT_OBJECT_0;
+    const HANDLE handles[2] = {event_, timer_at(when)};
+    return WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0;  // (the event first, if both)
+}
+#else
+Parker::Parker() = default;
+Parker::~Parker() = default;
+void Parker::unpark() {
+    {
+        const std::lock_guard lock(mutex_);
+        permit_ = true;
+    }
+    cv_.notify_one();
+}
+bool Parker::park_until(std::chrono::steady_clock::time_point when) {
+    precise_timers();
+    std::unique_lock lock(mutex_);
+    if (when == std::chrono::steady_clock::time_point::max()) cv_.wait(lock, [this] { return permit_; });
+    else cv_.wait_until(lock, when, [this] { return permit_; });
+    const bool woken = permit_;
+    permit_ = false;
+    return woken;
+}
+#endif
+
+bool Parker::park_until_precisely(std::chrono::steady_clock::time_point when) {
+    using Clock = std::chrono::steady_clock;
+    if (when == Clock::time_point::max()) return park_until(when);
+    for (const auto floor = timer_floor(); when - Clock::now() > floor;)
+        if (park_until(when - floor)) return true;
+    const auto spin_until = Clock::now() + std::chrono::microseconds(5);
+    for (auto t = Clock::now(); t < when; t = Clock::now()) {
+        if (park_until(Clock::time_point::min())) return true;  // (only a look: the time is past)
+        if (t < spin_until) cpu_relax();
+        else yield_host();
+    }
+    return park_until(Clock::time_point::min());
+}
+
+void Doorbell::begin() {
+    if (waiting_.exchange(true, std::memory_order_seq_cst)) qilin::rt::fatal("two threads waited on one doorbell at once");
+    std::atomic_thread_fence(std::memory_order_seq_cst);  // (marked waiting before looking: ring() looks the other way)
+}
+
+void Doorbell::park(Clock::time_point when) {
+    parker_.park_until(when);
+    wakeups_.fetch_add(1, std::memory_order_relaxed);
+}
 
 }  // namespace rr7

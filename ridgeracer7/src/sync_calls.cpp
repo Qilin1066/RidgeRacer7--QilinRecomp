@@ -11,6 +11,7 @@
 // threads greet each other by posting a semaphore and then waiting on it, and
 // a post the poster could take back itself left the game reading a null
 // pointer). A thread gives its core token up only when it really waits.
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <thread>
@@ -385,9 +386,13 @@ void sys_semaphore_get_value(Cpu& c) {
 // ---------------------------------------------------------------- sleeping, and the clock
 
 // sys_timer_usleep(microseconds), sys_timer_sleep(seconds): the core token is given up while sleeping.
+// A short sleep is how the game polls (its wait for the RSX's reference, the loop at 0x3a7120, sleeps 30 us a time): it is slept
+// precisely, not as the host's plain sleep, which on Windows is a millisecond or more.
 void sys_timer_usleep(Cpu& c) {
+    constexpr uint64_t kYear = uint64_t{366} * 24 * 3600 * 1000000;  // (longer is as good as for ever, and can't overflow)
+    const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(std::min(c.r[3], kYear));
     const ScopedBlocking blocking;
-    std::this_thread::sleep_for(std::chrono::microseconds(c.r[3]));
+    sleep_until_precisely(until);
     c.r[3] = kOk;
 }
 void sys_timer_sleep(Cpu& c) {

@@ -7,9 +7,10 @@
 // for an id, 75 a timer, a queue, a name and two numbers, 73 a timer, a time
 // a few milliseconds past the system time, and a period.
 //
-// One host thread serves every timer: it sleeps until the earliest is due.
+// One host thread serves every timer: it sleeps until the earliest is due, precisely (a condition variable's timeout on
+// Windows is whole milliseconds), and is woken early by any change to the timers.
+#include <algorithm>
 #include <chrono>
-#include <condition_variable>
 #include <thread>
 
 #include "events.hpp"
@@ -28,7 +29,7 @@ struct Timer {
 };
 
 std::mutex g_mutex;  // guards every timer, and the table
-std::condition_variable g_changed;
+Parker g_changed;    // the service thread's: woken when a timer changes
 std::map<uint32_t, Timer> g_timers;
 uint32_t g_next_id = 0x11000001u;
 std::thread g_service;
@@ -40,13 +41,14 @@ void serve() {
         Timer* next = nullptr;
         for (auto& [id, timer] : g_timers)
             if (timer.running && (!next || timer.due < next->due)) next = &timer;
-        if (!next) {
-            g_changed.wait(lock);
-            continue;
-        }
         const uint64_t now = system_time();
-        if (next->due > now) {
-            g_changed.wait_for(lock, std::chrono::microseconds(next->due - now));
+        if (!next || next->due > now) {
+            constexpr uint64_t kYear = uint64_t{366} * 24 * 3600 * 1000000;  // (as good as for ever, and can't overflow)
+            const auto when = next ? std::chrono::steady_clock::now() + std::chrono::microseconds(std::min(next->due - now, kYear))
+                                   : std::chrono::steady_clock::time_point::max();
+            lock.unlock();
+            g_changed.park_until(when);
+            lock.lock();
             continue;  // (the table may have changed: look again)
         }
         if (next->queue) send_event(next->queue, {next->source, next->data1, next->data2, 0});  // a full queue loses the event, as on the console
@@ -88,7 +90,7 @@ void sys_timer_destroy(Cpu& c) {
         return;
     }
     g_timers.erase(static_cast<uint32_t>(c.r[3]));
-    g_changed.notify_all();
+    g_changed.unpark();
     c.r[3] = kOk;
 }
 
@@ -116,7 +118,7 @@ void sys_timer_start(Cpu& c) {
     timer->due = c.r[4];
     timer->period = period;
     timer->running = true;
-    g_changed.notify_all();
+    g_changed.unpark();
     c.r[3] = kOk;
 }
 
@@ -129,7 +131,7 @@ void sys_timer_stop(Cpu& c) {
         return;
     }
     timer->running = false;
-    g_changed.notify_all();
+    g_changed.unpark();
     c.r[3] = kOk;
 }
 
@@ -167,7 +169,7 @@ void sys_timer_disconnect_event_queue(Cpu& c) {
     }
     timer->queue = 0;
     timer->running = false;
-    g_changed.notify_all();
+    g_changed.unpark();
     c.r[3] = kOk;
 }
 

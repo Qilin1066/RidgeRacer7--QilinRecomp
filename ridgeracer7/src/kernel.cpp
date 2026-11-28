@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "gcm.hpp"
 #include "kernel_sched.hpp"
 #include "machine.hpp"
 #include "qilin/rt/report.hpp"
@@ -93,6 +94,7 @@ EndOnExit::~EndOnExit() {
 
 void thread_enters(const char* what, uint32_t number, uint32_t from) {
     ++t_native_depth;
+    rsx_poke();  // (the RSX may be waiting for a word this thread has just written: put, a label)
     if (!t_where) return;
     t_where->number.store(number, std::memory_order_relaxed);
     t_where->from.store(from, std::memory_order_relaxed);

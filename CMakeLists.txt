@@ -140,7 +140,7 @@ add_executable(ridgeracer7_sched_test ridgeracer7/tests/sched_test.cpp
     ridgeracer7/src/kernel_sched.cpp ridgeracer7/src/sync.cpp ridgeracer7/src/sync_calls.cpp ridgeracer7/src/events.cpp)
 target_include_directories(ridgeracer7_sched_test PRIVATE recomp/src runtime/include ridgeracer7/src)
 target_link_libraries(ridgeracer7_sched_test PRIVATE qilin_warnings Threads::Threads)
-foreach(case fast priority two-tokens switch-point yield blocking sleep lend free mutex-fifo mutex-priority semaphore-fifo
+foreach(case fast priority two-tokens switch-point yield blocking sleep lend lend-wakes lend-hurry waking free mutex-fifo mutex-priority semaphore-fifo
         semaphore-priority lwmutex-fifo lwmutex-priority cond-priority cond-timeout events-fifo events-priority events-cancel stress)
     add_test(NAME ridgeracer7_sched_${case} COMMAND ridgeracer7_sched_test ${case})
     set_tests_properties(ridgeracer7_sched_${case} PROPERTIES TIMEOUT 30)

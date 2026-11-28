@@ -109,6 +109,12 @@ add_library(qilin_rt STATIC
     runtime/src/unwind.cpp
 )
 target_include_directories(qilin_rt PUBLIC runtime/include)
+# Floating point (fp.hpp, vmx.hpp): relaxed for play by default, by the owner's decision of 2026-11-28; ON builds the
+# runtime and the game in the exact, bit-for-bit mode the differential test uses.
+option(QILIN_FP_EXACT "Build the game's PPU floating point in the exact mode (default: relaxed, for play)" OFF)
+if(QILIN_FP_EXACT)
+    target_compile_definitions(qilin_rt PUBLIC QILIN_FP_EXACT=1)
+endif()
 target_link_libraries(qilin_rt PRIVATE qilin_warnings)
 
 # ---- The qilin tool ----

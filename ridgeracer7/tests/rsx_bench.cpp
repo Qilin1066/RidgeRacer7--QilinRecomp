@@ -5,9 +5,12 @@
 // indices, constants and push constants, the texels uploaded, the pipelines' state, the surfaces written back), so that a
 // change meant to be faster can be shown to give the GPU exactly the same.
 //
-//   ridgeracer7_rsx_bench [--frames N] [--lazy] [--touch]
-//     --lazy   surfaces are written back when touched (as when faults are handled), not at every flush
-//     --touch  ...and touched after every frame, as the game reading a surface would (implies --lazy)
+//   ridgeracer7_rsx_bench [--frames N] [--lazy] [--touch] [--pipelines FOLDER [--expect-ahead]]
+//     --lazy       surfaces are written back when touched (as when faults are handled), not at every flush
+//     --touch      ...and touched after every frame, as the game reading a surface would (implies --lazy)
+//     --pipelines  the pipelines made are recorded in FOLDER (as the game records them in its data folder), and those an
+//                  earlier run recorded there made ahead (waited for before the first frame)
+//     --expect-ahead  fails unless every pipeline drawn with was made ahead (a second run on the same folder)
 //
 // It prints microseconds per frame for each part, and the digest. In ctest it runs two frames, as a test that the whole
 // path runs.
@@ -85,13 +88,92 @@ struct Nop<R(VKAPI_PTR*)(A...)> {
 };
 #define NOP(name) name = Nop<PFN_##name>::call
 
-// What the command buffer has bound, for the digest at each draw.
+// What a pipeline fixes of a draw's GPU state, and what the command buffer's dynamic state commands set: at each draw the
+// stubs digest the state in effect (the pipeline's, with its dynamic states taken from the command buffer), not handles,
+// so that state moved out of the pipelines into dynamic state (or pipelines made fewer) can be shown to give the GPU the same.
+struct GpuState {
+    VkPrimitiveTopology topology{};
+    VkBool32 restart = VK_FALSE;
+    VkCullModeFlags cull = 0;
+    VkFrontFace front{};
+    VkPolygonMode polygon{};
+    VkBool32 bias = VK_FALSE;
+    float bias_constant = 0, bias_clamp = 0, bias_slope = 0;
+    VkBool32 depth_test = VK_FALSE, depth_write = VK_FALSE;
+    VkCompareOp depth_compare{};
+    VkBool32 bounds = VK_FALSE;
+    float bounds_min = 0, bounds_max = 0;
+    VkBool32 stencil = VK_FALSE;
+    VkStencilOpState stencil_front{}, stencil_back{};
+};
+void digest_stencil(const VkStencilOpState& s) {
+    digest_value(s.failOp), digest_value(s.passOp), digest_value(s.depthFailOp), digest_value(s.compareOp);
+    digest_value(s.compareMask), digest_value(s.writeMask), digest_value(s.reference);
+}
+void digest_state(const GpuState& s) {
+    digest_value(s.topology), digest_value(s.restart), digest_value(s.cull), digest_value(s.front), digest_value(s.polygon);
+    digest_value(s.bias), digest_value(s.bias_constant), digest_value(s.bias_clamp), digest_value(s.bias_slope);
+    digest_value(s.depth_test), digest_value(s.depth_write), digest_value(s.depth_compare);
+    digest_value(s.bounds), digest_value(s.bounds_min), digest_value(s.bounds_max);
+    digest_value(s.stencil), digest_stencil(s.stencil_front), digest_stencil(s.stencil_back);
+}
+// The dynamic states the renderer may use, as bits.
+enum Dynamic : uint32_t {
+    kCull = 1u << 0, kFront = 1u << 1, kTopology = 1u << 2, kRestart = 1u << 3, kDepthTest = 1u << 4, kDepthWrite = 1u << 5, kDepthCompare = 1u << 6,
+    kBoundsTest = 1u << 7, kStencilTest = 1u << 8, kStencilOp = 1u << 9, kBiasEnable = 1u << 10, kBias = 1u << 11, kBounds = 1u << 12,
+    kStencilCompareMask = 1u << 13, kStencilWriteMask = 1u << 14, kStencilReference = 1u << 15, kViewport = 1u << 16, kScissor = 1u << 17,
+};
+uint32_t dynamic_bit(VkDynamicState d) {
+    switch (d) {
+    case VK_DYNAMIC_STATE_CULL_MODE: return kCull;
+    case VK_DYNAMIC_STATE_FRONT_FACE: return kFront;
+    case VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY: return kTopology;
+    case VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE: return kRestart;
+    case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE: return kDepthTest;
+    case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE: return kDepthWrite;
+    case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP: return kDepthCompare;
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE: return kBoundsTest;
+    case VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE: return kStencilTest;
+    case VK_DYNAMIC_STATE_STENCIL_OP: return kStencilOp;
+    case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE: return kBiasEnable;
+    case VK_DYNAMIC_STATE_DEPTH_BIAS: return kBias;
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS: return kBounds;
+    case VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK: return kStencilCompareMask;
+    case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK: return kStencilWriteMask;
+    case VK_DYNAMIC_STATE_STENCIL_REFERENCE: return kStencilReference;
+    case VK_DYNAMIC_STATE_VIEWPORT: return kViewport;
+    case VK_DYNAMIC_STATE_SCISSOR: return kScissor;
+    default: qilin::rt::fatal("the bench's stubs don't know dynamic state %d", static_cast<int>(d));
+    }
+}
+// A pipeline as made: its fixed state, which of it is dynamic, its shaders and their constants, its blending, formats and
+// vertex input.
+struct PipelineRecord {
+    GpuState state;
+    uint32_t dynamic = 0;
+    std::array<VkShaderModule, 2> modules{};
+    std::vector<uint8_t> specialisation;
+    VkPipelineColorBlendAttachmentState blend{};
+    VkBool32 logic = VK_FALSE;
+    VkLogicOp logic_op{};
+    VkFormat colour{}, depth{}, stencil{};
+    std::vector<VkVertexInputAttributeDescription> attributes;
+    std::vector<VkVertexInputBindingDescription> bindings;
+};
+std::mutex g_pipelines_mutex;  // (pipelines may be made on the renderer's worker thread)
+std::unordered_map<VkPipeline, PipelineRecord> g_pipelines;
+std::unordered_map<VkShaderModule, uint64_t> g_modules;
+std::unordered_map<VkShaderModule, std::pair<uint32_t, uint32_t>> g_module_constants;  // a vertex program's constants read, [first, end)  // each module's code, hashed (not its handle: modules may be made in any order)
+uint64_t g_pipelines_made = 0;
+
+// What the command buffer has bound and set, for the digest at each draw.
 struct Bound {
     std::array<const uint8_t*, 16> vertices{};
     const uint8_t* indices = nullptr;
     std::array<uint32_t, 2> constant_offsets{};
     const uint8_t* arena = nullptr;  // the buffer set 0 points into (the batch's arena)
-    VkPipeline pipeline = VK_NULL_HANDLE;
+    const PipelineRecord* pipeline = nullptr;
+    GpuState dynamic;  // the dynamic state set
     VkDescriptorSet textures = VK_NULL_HANDLE;
     VkRect2D scissor{};
     VkViewport viewport{};
@@ -106,23 +188,113 @@ struct SetTexture {
 std::unordered_map<VkDescriptorSet, std::vector<SetTexture>> g_sets;
 std::unordered_map<VkBuffer, FakeBuffer*> g_buffers;
 uint32_t g_vertex_bindings_first = 0, g_vertex_bindings_count = 0;
-uint32_t g_attributes = 0;  // the bound pipeline's attributes (bit a for attribute a), from its creation
-std::unordered_map<VkPipeline, uint32_t> g_pipeline_attributes;
 uint64_t g_vk_draws = 0;
+// Rendering instances begun, and their attachments loaded (read from memory first: what a tiler would rather not) and
+// cleared by their load operations.
+uint64_t g_passes = 0, g_loads = 0, g_load_clears = 0;
+VkRect2D g_render_area{};
 
-// What a draw sees: its pipeline, textures, window, push constants, vertices and constants.
+// A vertex attribute's value as the GPU reads it, by its Vulkan format (little-endian components; missing ones 0, 0, 0, 1).
+std::array<float, 4> read_attribute(VkFormat format, const uint8_t* p) {
+    std::array<float, 4> v{0, 0, 0, 1};
+    const auto f32 = [&](uint32_t c) {
+        float x;
+        std::memcpy(&x, p + 4 * c, 4);
+        return x;
+    };
+    const auto s16 = [&](uint32_t c) {
+        int16_t x;
+        std::memcpy(&x, p + 2 * c, 2);
+        return x;
+    };
+    const auto f16 = [&](uint32_t c) {
+        const uint8_t be[2] = {p[2 * c + 1], p[2 * c]};
+        return rr7::half_float(be);
+    };
+    const auto components = [](VkFormat one, VkFormat two, VkFormat f) { return f == one ? 1u : f == two ? 2u : 4u; };
+    switch (format) {
+    case VK_FORMAT_R32_SFLOAT: v[0] = f32(0); break;
+    case VK_FORMAT_R32G32_SFLOAT: v[0] = f32(0), v[1] = f32(1); break;
+    case VK_FORMAT_R32G32B32_SFLOAT: v[0] = f32(0), v[1] = f32(1), v[2] = f32(2); break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: v = {f32(0), f32(1), f32(2), f32(3)}; break;
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+        for (uint32_t c = 0; c < components(VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, format); ++c) v[c] = f16(c);
+        break;
+    case VK_FORMAT_R16_SNORM:
+    case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM:
+        for (uint32_t c = 0; c < components(VK_FORMAT_R16_SNORM, VK_FORMAT_R16G16_SNORM, format); ++c) v[c] = std::max(-1.0f, static_cast<float>(s16(c)) / 32767.0f);
+        break;
+    case VK_FORMAT_R16_SSCALED:
+    case VK_FORMAT_R16G16_SSCALED:
+    case VK_FORMAT_R16G16B16A16_SSCALED:
+        for (uint32_t c = 0; c < components(VK_FORMAT_R16_SSCALED, VK_FORMAT_R16G16_SSCALED, format); ++c) v[c] = static_cast<float>(s16(c));
+        break;
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        for (uint32_t c = 0; c < components(VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, format); ++c) v[c] = static_cast<float>(p[c]) / 255.0f;
+        break;
+    case VK_FORMAT_R8_USCALED:
+    case VK_FORMAT_R8G8_USCALED:
+    case VK_FORMAT_R8G8B8A8_USCALED:
+        for (uint32_t c = 0; c < components(VK_FORMAT_R8_USCALED, VK_FORMAT_R8G8_USCALED, format); ++c) v[c] = static_cast<float>(p[c]);
+        break;
+    default: qilin::rt::fatal("the bench's stubs don't read vertex format %d", static_cast<int>(format));
+    }
+    return v;
+}
+
+// What a draw sees: its state, shaders, blending, textures, window, push constants, vertices (each attribute's values, as
+// the GPU reads them through the pipeline's formats) and constants.
 void digest_draw(uint32_t vertices) {
     if (!g_digesting) return;
-    digest_value(g_bound.pipeline), digest_value(g_bound.scissor), digest_value(g_bound.viewport), digest(g_bound.push.data(), g_bound.push.size());
+    const PipelineRecord& p = *g_bound.pipeline;
+    GpuState s = p.state;
+    const GpuState& d = g_bound.dynamic;
+    if (p.dynamic & kCull) s.cull = d.cull;
+    if (p.dynamic & kFront) s.front = d.front;
+    if (p.dynamic & kTopology) s.topology = d.topology;
+    if (p.dynamic & kRestart) s.restart = d.restart;
+    if (p.dynamic & kDepthTest) s.depth_test = d.depth_test;
+    if (p.dynamic & kDepthWrite) s.depth_write = d.depth_write;
+    if (p.dynamic & kDepthCompare) s.depth_compare = d.depth_compare;
+    if (p.dynamic & kBoundsTest) s.bounds = d.bounds;
+    if (p.dynamic & kBounds) s.bounds_min = d.bounds_min, s.bounds_max = d.bounds_max;
+    if (p.dynamic & kStencilTest) s.stencil = d.stencil;
+    if (p.dynamic & kBiasEnable) s.bias = d.bias;
+    if (p.dynamic & kBias) s.bias_constant = d.bias_constant, s.bias_clamp = d.bias_clamp, s.bias_slope = d.bias_slope;
+    const std::pair<VkStencilOpState*, const VkStencilOpState*> faces[2] = {{&s.stencil_front, &d.stencil_front}, {&s.stencil_back, &d.stencil_back}};
+    for (const auto& [face, set] : faces) {
+        if (p.dynamic & kStencilOp) face->failOp = set->failOp, face->passOp = set->passOp, face->depthFailOp = set->depthFailOp, face->compareOp = set->compareOp;
+        if (p.dynamic & kStencilCompareMask) face->compareMask = set->compareMask;
+        if (p.dynamic & kStencilWriteMask) face->writeMask = set->writeMask;
+        if (p.dynamic & kStencilReference) face->reference = set->reference;
+    }
+    digest_state(s);
+    for (const VkShaderModule m : p.modules) digest_value(g_modules.at(m));
+    digest(p.specialisation.data(), p.specialisation.size());
+    digest_value(p.blend), digest_value(p.logic), digest_value(p.logic_op), digest_value(p.colour), digest_value(p.depth), digest_value(p.stencil);
+    digest_value(g_bound.scissor), digest_value(g_bound.viewport), digest(g_bound.push.data(), g_bound.push.size());
     if (g_bound.textures)
         for (const SetTexture& t : g_sets.at(g_bound.textures)) digest_value(t.binding), digest_value(t.view), digest_value(t.sampler);
-    for (uint32_t a = 0; a < 16; ++a)
-        if ((g_attributes >> a) & 1) {
-            const uint32_t binding = a - g_vertex_bindings_first;
-            if (binding < g_vertex_bindings_count && g_bound.vertices[binding]) digest(g_bound.vertices[binding], size_t{vertices} * 16);
+    for (const VkVertexInputAttributeDescription& a : p.attributes) {
+        const auto binding = std::ranges::find_if(p.bindings, [&](const VkVertexInputBindingDescription& b) { return b.binding == a.binding; });
+        if (binding == p.bindings.end()) qilin::rt::fatal("a pipeline's attribute %u reads binding %u, which it doesn't describe", a.location, a.binding);
+        const uint32_t slot = a.binding - g_vertex_bindings_first;
+        if (slot >= g_vertex_bindings_count || !g_bound.vertices[slot]) qilin::rt::fatal("a draw reads binding %u, which isn't bound", a.binding);
+        digest_value(a.location);
+        for (uint32_t v = 0; v < vertices; ++v) {
+            const size_t at = a.offset + (binding->inputRate == VK_VERTEX_INPUT_RATE_INSTANCE ? 0 : size_t{v} * binding->stride);
+            digest_value(read_attribute(a.format, g_bound.vertices[slot] + at));
         }
+    }
     if (g_bound.arena) {
-        digest(g_bound.arena + g_bound.constant_offsets[0], 468 * 16);
+        // (The vertex constants its program reads: those the renderer must give it.)
+        const auto [first, end] = g_module_constants.at(p.modules[0]);
+        digest(g_bound.arena + g_bound.constant_offsets[0] + size_t{first} * 16, size_t{end - first} * 16);
         digest(g_bound.arena + g_bound.constant_offsets[1], 32);
     }
 }
@@ -176,20 +348,103 @@ void stub_vulkan() {
         digest_value(info->magFilter), digest_value(info->minFilter), digest_value(info->addressModeU), digest_value(info->maxLod);
         return *out = fake_handle<VkSampler>(), VK_SUCCESS;
     };
-    vkCreateShaderModule = [](VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule* out) { return *out = fake_handle<VkShaderModule>(), VK_SUCCESS; };
+    vkCreateShaderModule = [](VkDevice, const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks*, VkShaderModule* out) {
+        const std::lock_guard lock(g_pipelines_mutex);
+        *out = fake_handle<VkShaderModule>();
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < info->codeSize; ++i) h = (h ^ reinterpret_cast<const uint8_t*>(info->pCode)[i]) * 0x100000001b3ull;
+        g_modules[*out] = h;
+        // (A vertex program's constants read: all 468 where its table doesn't say.)
+        std::pair<uint32_t, uint32_t> constants{0, 468};
+        for (size_t i = 0; i < qilin::rt::kTranslatedShaderCount; ++i)
+            if (const qilin::rt::TranslatedShader& t = qilin::rt::kTranslatedShaders[i]; t.spirv == info->pCode && t.vertex && t.constants_end)
+                constants = {t.constants_first, t.constants_end};
+        g_module_constants[*out] = constants;
+        return VK_SUCCESS;
+    };
     vkCreateGraphicsPipelines = [](VkDevice, VkPipelineCache, uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* out) {
+        const std::lock_guard lock(g_pipelines_mutex);
         for (uint32_t i = 0; i < count; ++i) {
             const VkGraphicsPipelineCreateInfo& info = infos[i];
-            digest_value(info.pInputAssemblyState->topology);
-            digest_value(info.pRasterizationState->cullMode), digest_value(info.pRasterizationState->frontFace), digest_value(info.pRasterizationState->polygonMode);
-            digest_value(info.pColorBlendState->pAttachments[0]);
-            digest_value(info.pDepthStencilState->depthTestEnable), digest_value(info.pDepthStencilState->depthCompareOp), digest_value(info.pDepthStencilState->depthWriteEnable);
-            uint32_t attributes = 0;
-            for (uint32_t a = 0; a < info.pVertexInputState->vertexAttributeDescriptionCount; ++a) attributes |= 1u << info.pVertexInputState->pVertexAttributeDescriptions[a].location;
+            PipelineRecord p;
+            GpuState& s = p.state;
+            s.topology = info.pInputAssemblyState->topology, s.restart = info.pInputAssemblyState->primitiveRestartEnable;
+            const VkPipelineRasterizationStateCreateInfo& r = *info.pRasterizationState;
+            s.cull = r.cullMode, s.front = r.frontFace, s.polygon = r.polygonMode;
+            s.bias = r.depthBiasEnable, s.bias_constant = r.depthBiasConstantFactor, s.bias_clamp = r.depthBiasClamp, s.bias_slope = r.depthBiasSlopeFactor;
+            const VkPipelineDepthStencilStateCreateInfo& z = *info.pDepthStencilState;
+            s.depth_test = z.depthTestEnable, s.depth_write = z.depthWriteEnable, s.depth_compare = z.depthCompareOp;
+            s.bounds = z.depthBoundsTestEnable, s.bounds_min = z.minDepthBounds, s.bounds_max = z.maxDepthBounds;
+            s.stencil = z.stencilTestEnable, s.stencil_front = z.front, s.stencil_back = z.back;
+            if (info.pDynamicState)
+                for (uint32_t k = 0; k < info.pDynamicState->dynamicStateCount; ++k) p.dynamic |= dynamic_bit(info.pDynamicState->pDynamicStates[k]);
+            for (uint32_t k = 0; k < info.stageCount && k < 2; ++k) {
+                p.modules[k] = info.pStages[k].module;
+                if (const VkSpecializationInfo* sp = info.pStages[k].pSpecializationInfo) {
+                    const auto* bytes = static_cast<const uint8_t*>(sp->pData);
+                    p.specialisation.insert(p.specialisation.end(), bytes, bytes + sp->dataSize);
+                }
+            }
+            p.blend = info.pColorBlendState->pAttachments[0];
+            p.logic = info.pColorBlendState->logicOpEnable, p.logic_op = info.pColorBlendState->logicOpEnable ? info.pColorBlendState->logicOp : VkLogicOp{};
+            for (const auto* next = static_cast<const VkBaseInStructure*>(info.pNext); next; next = next->pNext)
+                if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) {
+                    const auto& rendering = *reinterpret_cast<const VkPipelineRenderingCreateInfo*>(next);
+                    p.colour = rendering.colorAttachmentCount ? rendering.pColorAttachmentFormats[0] : VK_FORMAT_UNDEFINED;
+                    p.depth = rendering.depthAttachmentFormat, p.stencil = rendering.stencilAttachmentFormat;
+                }
+            const VkPipelineVertexInputStateCreateInfo& v = *info.pVertexInputState;
+            p.attributes.assign(v.pVertexAttributeDescriptions, v.pVertexAttributeDescriptions + v.vertexAttributeDescriptionCount);
+            p.bindings.assign(v.pVertexBindingDescriptions, v.pVertexBindingDescriptions + v.vertexBindingDescriptionCount);
+            std::ranges::sort(p.attributes, {}, &VkVertexInputAttributeDescription::location);
             out[i] = fake_handle<VkPipeline>();
-            g_pipeline_attributes[out[i]] = attributes;
+            g_pipelines[out[i]] = std::move(p);
+            ++g_pipelines_made;
         }
         return VK_SUCCESS;
+    };
+    vkCreatePipelineCache = [](VkDevice, const VkPipelineCacheCreateInfo*, const VkAllocationCallbacks*, VkPipelineCache* out) {
+        return *out = fake_handle<VkPipelineCache>(), VK_SUCCESS;
+    };
+    vkGetPipelineCacheData = [](VkDevice, VkPipelineCache, size_t* size, void* data) {
+        // (A cache's data as a driver gives it: here 32 bytes of nothing.)
+        if (data) std::memset(data, 0, std::min<size_t>(*size, 32));
+        *size = 32;
+        return VK_SUCCESS;
+    };
+    NOP(vkDestroyPipeline);
+    NOP(vkDestroyPipelineCache);
+    vkCmdSetCullMode = [](VkCommandBuffer, VkCullModeFlags v) { g_bound.dynamic.cull = v; };
+    vkCmdSetFrontFace = [](VkCommandBuffer, VkFrontFace v) { g_bound.dynamic.front = v; };
+    vkCmdSetPrimitiveTopology = [](VkCommandBuffer, VkPrimitiveTopology v) { g_bound.dynamic.topology = v; };
+    vkCmdSetPrimitiveRestartEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.restart = v; };
+    vkCmdSetDepthTestEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.depth_test = v; };
+    vkCmdSetDepthWriteEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.depth_write = v; };
+    vkCmdSetDepthCompareOp = [](VkCommandBuffer, VkCompareOp v) { g_bound.dynamic.depth_compare = v; };
+    vkCmdSetDepthBoundsTestEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.bounds = v; };
+    vkCmdSetDepthBounds = [](VkCommandBuffer, float lo, float hi) { g_bound.dynamic.bounds_min = lo, g_bound.dynamic.bounds_max = hi; };
+    vkCmdSetStencilTestEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.stencil = v; };
+    vkCmdSetDepthBiasEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.bias = v; };
+    vkCmdSetDepthBias = [](VkCommandBuffer, float constant, float clamp, float slope) {
+        g_bound.dynamic.bias_constant = constant, g_bound.dynamic.bias_clamp = clamp, g_bound.dynamic.bias_slope = slope;
+    };
+    vkCmdSetStencilOp = [](VkCommandBuffer, VkStencilFaceFlags faces, VkStencilOp fail, VkStencilOp pass, VkStencilOp depth_fail, VkCompareOp compare) {
+        if (faces & VK_STENCIL_FACE_FRONT_BIT) g_bound.dynamic.stencil_front.failOp = fail, g_bound.dynamic.stencil_front.passOp = pass,
+                                                g_bound.dynamic.stencil_front.depthFailOp = depth_fail, g_bound.dynamic.stencil_front.compareOp = compare;
+        if (faces & VK_STENCIL_FACE_BACK_BIT) g_bound.dynamic.stencil_back.failOp = fail, g_bound.dynamic.stencil_back.passOp = pass,
+                                               g_bound.dynamic.stencil_back.depthFailOp = depth_fail, g_bound.dynamic.stencil_back.compareOp = compare;
+    };
+    vkCmdSetStencilCompareMask = [](VkCommandBuffer, VkStencilFaceFlags faces, uint32_t v) {
+        if (faces & VK_STENCIL_FACE_FRONT_BIT) g_bound.dynamic.stencil_front.compareMask = v;
+        if (faces & VK_STENCIL_FACE_BACK_BIT) g_bound.dynamic.stencil_back.compareMask = v;
+    };
+    vkCmdSetStencilWriteMask = [](VkCommandBuffer, VkStencilFaceFlags faces, uint32_t v) {
+        if (faces & VK_STENCIL_FACE_FRONT_BIT) g_bound.dynamic.stencil_front.writeMask = v;
+        if (faces & VK_STENCIL_FACE_BACK_BIT) g_bound.dynamic.stencil_back.writeMask = v;
+    };
+    vkCmdSetStencilReference = [](VkCommandBuffer, VkStencilFaceFlags faces, uint32_t v) {
+        if (faces & VK_STENCIL_FACE_FRONT_BIT) g_bound.dynamic.stencil_front.reference = v;
+        if (faces & VK_STENCIL_FACE_BACK_BIT) g_bound.dynamic.stencil_back.reference = v;
     };
     vkAllocateCommandBuffers = [](VkDevice, const VkCommandBufferAllocateInfo* info, VkCommandBuffer* out) {
         for (uint32_t i = 0; i < info->commandBufferCount; ++i) out[i] = fake_handle<VkCommandBuffer>();
@@ -233,22 +488,53 @@ void stub_vulkan() {
     NOP(vkCmdResetQueryPool);
     NOP(vkCmdWriteTimestamp2);
     NOP(vkCmdPipelineBarrier2);
-    NOP(vkCmdBeginRendering);
+    // A rendering instance: an attachment cleared as it begins is digested as a clear of the whole area would be
+    // (vkCmdClearAttachments), so that a clear made a load operation is shown to give the same.
+    vkCmdBeginRendering = [](VkCommandBuffer, const VkRenderingInfo* info) {
+        ++g_passes;
+        g_render_area = info->renderArea;
+        VkClearAttachment clears[2] = {};
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < info->colorAttachmentCount; ++i) {
+            const VkRenderingAttachmentInfo& a = info->pColorAttachments[i];
+            if (a.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) ++g_loads;
+            if (a.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) clears[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, clears[n].colorAttachment = i, clears[n].clearValue.color = a.clearValue.color, ++n;
+        }
+        const VkRenderingAttachmentInfo* z = info->pDepthAttachment;
+        const VkRenderingAttachmentInfo* st = info->pStencilAttachment;
+        if ((z && z->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) || (st && st->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)) ++g_loads;
+        const bool clear_depth = z && z->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR, clear_stencil = st && st->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+        if (clear_depth || clear_stencil) {
+            clears[n].aspectMask = (clear_depth ? VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT} : 0u) | (clear_stencil ? VkImageAspectFlags{VK_IMAGE_ASPECT_STENCIL_BIT} : 0u);
+            clears[n].clearValue.depthStencil = {z ? z->clearValue.depthStencil.depth : 0.0f, st ? st->clearValue.depthStencil.stencil : 0u};
+            ++n;
+        }
+        if (!n) return;
+        g_load_clears += n;
+        for (uint32_t i = 0; i < n; ++i) digest_value(clears[i]);
+        digest_value(VkClearRect{info->renderArea, 0, 1});
+    };
     NOP(vkCmdEndRendering);
     NOP(vkCmdCopyImage);
     NOP(vkCmdCopyImageToBuffer);
     vkCmdSetViewport = [](VkCommandBuffer, uint32_t, uint32_t, const VkViewport* v) { g_bound.viewport = *v; };
     vkCmdClearAttachments = [](VkCommandBuffer, uint32_t count, const VkClearAttachment* clears, uint32_t, const VkClearRect* rects) {
         for (uint32_t i = 0; i < count; ++i) digest_value(clears[i]);
-        digest_value(rects[0]);
+        // (Its rectangle within the rendering's area: what is cleared.)
+        VkClearRect rect = rects[0];
+        const int32_t x1 = std::min(rect.rect.offset.x + static_cast<int32_t>(rect.rect.extent.width), g_render_area.offset.x + static_cast<int32_t>(g_render_area.extent.width));
+        const int32_t y1 = std::min(rect.rect.offset.y + static_cast<int32_t>(rect.rect.extent.height), g_render_area.offset.y + static_cast<int32_t>(g_render_area.extent.height));
+        rect.rect.offset.x = std::max(rect.rect.offset.x, g_render_area.offset.x), rect.rect.offset.y = std::max(rect.rect.offset.y, g_render_area.offset.y);
+        rect.rect.extent = {static_cast<uint32_t>(std::max(0, x1 - rect.rect.offset.x)), static_cast<uint32_t>(std::max(0, y1 - rect.rect.offset.y))};
+        digest_value(rect);
     };
     vkCmdSetScissor = [](VkCommandBuffer, uint32_t, uint32_t, const VkRect2D* r) { g_bound.scissor = *r; };
     vkCmdPushConstants = [](VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, uint32_t offset, uint32_t size, const void* data) {
         std::memcpy(g_bound.push.data() + offset, data, size);
     };
     vkCmdBindPipeline = [](VkCommandBuffer, VkPipelineBindPoint, VkPipeline p) {
-        g_bound.pipeline = p;
-        g_attributes = g_pipeline_attributes.at(p);
+        const std::lock_guard lock(g_pipelines_mutex);
+        g_bound.pipeline = &g_pipelines.at(p);
     };
     vkCmdBindDescriptorSets = [](VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t first, uint32_t, const VkDescriptorSet* sets, uint32_t dynamic_count,
                                  const uint32_t* dynamic) {
@@ -323,19 +609,24 @@ std::vector<uint8_t> fragment_microcode(unsigned program, uint32_t constant_seed
     return out;
 }
 
-const uint32_t kSpirv[1] = {0x07230203u};
+// (Each program's own code: the magic number and its address.)
+uint32_t g_spirv[kVertexPrograms + kFragmentPrograms][2];
 const uint32_t kConstantSlots[2] = {16, 64};
 
 qilin::rt::TranslatedShader make_shader(bool vertex, unsigned program) {
     qilin::rt::TranslatedShader s{};
     s.vertex = vertex, s.address = (vertex ? 0x100000u : 0x200000u) + program * 0x100;
-    s.spirv = kSpirv, s.spirv_words = 1;
+    uint32_t* code = g_spirv[vertex ? program : kVertexPrograms + program];
+    code[0] = 0x07230203u, code[1] = s.address;
+    s.spirv = code, s.spirv_words = 2;
     std::vector<uint8_t> keyed;
     if (vertex) {
         for (unsigned i = 0; i < kVertexProgramLength; ++i)
             for (const uint32_t w : vertex_instruction(program, i)) keyed.resize(keyed.size() + 4), put_be32(keyed.data() + keyed.size() - 4, w);
         s.inputs = 1u << 0 | 1u << 3 | 1u << 8;  // position, colour, texture coordinate 0
         s.outputs = 1u << 0 | 1u << 1 | 1u << 7;  // position, COL0, TEX0
+        // The constants read: the matrix (0 to 3), and some of the 64 sent every 50th draw from 16; the last indexes them all.
+        s.constants_first = program == 2 ? 2 : 0, s.constants_end = program == kVertexPrograms - 1 ? 468 : 16 + 16 * program;
     } else {
         keyed = fragment_microcode(program, 0);
         std::memset(keyed.data() + 16, 0, 16), std::memset(keyed.data() + 64, 0, 16);
@@ -540,13 +831,16 @@ void run_frame(rr7::RsxState& s, Acts& acts, uint32_t bytes) {
 
 int main(int argc, char** argv) {
     uint32_t frames = 30;
-    bool touch = false;
+    bool touch = false, expect_ahead = false;
+    std::string pipelines;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--frames" && i + 1 < argc) frames = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (a == "--lazy") g_lazy = true;
         else if (a == "--touch") g_lazy = touch = true;
-        else return std::fprintf(stderr, "usage: ridgeracer7_rsx_bench [--frames N] [--lazy] [--touch]\n"), 2;
+        else if (a == "--pipelines" && i + 1 < argc) pipelines = argv[++i];
+        else if (a == "--expect-ahead") expect_ahead = true;
+        else return std::fprintf(stderr, "usage: ridgeracer7_rsx_bench [--frames N] [--lazy] [--touch] [--pipelines FOLDER [--expect-ahead]]\n"), 2;
     }
     static qilin::rt::AddressSpace space;
     g_space = &space;
@@ -565,7 +859,8 @@ int main(int argc, char** argv) {
     vkGetPhysicalDeviceMemoryProperties(gpu.physical, &gpu.memory);
     gpu.fill_non_solid = gpu.logic_op = gpu.clip_distance = gpu.depth_bounds = true;
     static std::mutex queue;
-    rr7::renderer_start(gpu, queue);
+    rr7::renderer_start(gpu, queue, pipelines);
+    rr7::renderer_pipelines_wait();
 
     static rr7::RsxState s;
     s.state[0x0198 / 4] = 0xFEED0000u, s.state[0x1454 / 4] = 1;
@@ -584,11 +879,16 @@ int main(int argc, char** argv) {
     const auto time = [&](Depth depth, const char* what) {
         Acts acts;
         acts.s = &s, acts.depth = depth;
+        const uint64_t made_before = g_pipelines_made, passes_start = g_passes, loads_start = g_loads, load_clears_start = g_load_clears;
         run_frame(s, acts, bytes);  // (a frame first, for the caches: textures decoded, pipelines made)
+        const uint64_t made_first = g_pipelines_made - made_before;
+        const uint64_t first_passes = g_passes - passes_start, first_loads = g_loads - loads_start, first_load_clears = g_load_clears - load_clears_start;
         if (touch && depth == Depth::draw) rr7::renderer_guest_access(rr7::kRsxLocal + kColour, uint64_t{kPitch} * kHeight * 2);
         g_digesting = false;
         // Each frame's time: the best and the median are given (other work on the computer only ever makes a frame slower).
         std::vector<double> times;
+        const rr7::RendererCounters before = rr7::renderer_counters();
+        const uint64_t passes_before = g_passes, loads_before = g_loads, load_clears_before = g_load_clears;
         for (uint32_t i = 0; i < frames; ++i) {
             const Clock::time_point start = Clock::now();
             run_frame(s, acts, bytes);
@@ -597,6 +897,16 @@ int main(int argc, char** argv) {
         }
         std::sort(times.begin(), times.end());
         std::printf("  %-48s best %8.1f us, median %8.1f us a frame (%.3f us a draw)\n", what, times.front(), times[times.size() / 2], times.front() / kDraws);
+        if (depth == Depth::draw) {
+            const rr7::RendererCounters after = rr7::renderer_counters();
+            std::printf("  pipelines made: %llu in the first frame drawn, %llu in the %u after; a frame writes %.2f MB to the arenas, copies %.2f MB on the GPU\n",
+                        static_cast<unsigned long long>(made_first), static_cast<unsigned long long>(g_pipelines_made - made_before - made_first), frames,
+                        static_cast<double>(after.arena_bytes - before.arena_bytes) / frames / 1048576.0, static_cast<double>(after.copied_bytes - before.copied_bytes) / frames / 1048576.0);
+            std::printf("  rendering instances: %llu in the first frame drawn (%llu attachments loaded, %llu cleared as they begin); %.1f a frame after (%.1f loaded, %.1f cleared)\n",
+                        static_cast<unsigned long long>(first_passes), static_cast<unsigned long long>(first_loads), static_cast<unsigned long long>(first_load_clears),
+                        static_cast<double>(g_passes - passes_before) / frames, static_cast<double>(g_loads - loads_before) / frames,
+                        static_cast<double>(g_load_clears - load_clears_before) / frames);
+        }
         g_digesting = true;
     };
     time(Depth::parse, "commands only (rsx_state.hpp: run_command)");
@@ -624,6 +934,19 @@ int main(int argc, char** argv) {
         });
         const double depth_in = best_of([&] { rr7::depth_row_to_host(guest, reinterpret_cast<uint32_t*>(host.data()), host.data() + pixels * 4, pixels, false); });
         std::printf("  a %ux%u surface: to the image %.1f us, back %.1f us; a depth surface to the image %.1f us, back %.1f us\n", kWidth, kHeight, to_host, to_guest, depth_in, depth);
+        // A frame's vertices (its three attributes, 100 vertices a draw), as four floats each and in their own formats.
+        const uint8_t* vertices = rr7::guest_memory() + rr7::kRsxLocal + kVertices;
+        const uint32_t all = kDraws * kVerticesPerDraw;
+        std::vector<uint8_t> out(size_t{all} * 16);
+        const uint32_t formats[3] = {2u | 3u << 4, 4u | 4u << 4, 2u | 2u << 4}, offsets[3] = {0, 12, 16};
+        const double floats = best_of([&] {
+            for (uint32_t a = 0; a < 3; ++a) rr7::decode_attributes(formats[a], vertices + offsets[a], kVertexStride, all, reinterpret_cast<float*>(out.data()));
+        });
+        const double own = best_of([&] {
+            for (uint32_t a = 0; a < 3; ++a) rr7::encode_attributes(static_cast<uint8_t>(formats[a]), vertices + offsets[a], kVertexStride, all, out.data());
+        });
+        std::printf("  a frame's vertices (%u, three attributes): as four floats %.1f us (%u bytes a vertex), in their own formats %.1f us (%u bytes)\n", all, floats,
+                    3 * 16, own, rr7::native_stride(0x32) + rr7::native_stride(0x44) + rr7::native_stride(0x22));
     }
     // The digest of everything the stubs were given (in the first frame drawn and in one more), and of the surfaces as
     // guest memory holds them then.
@@ -637,7 +960,15 @@ int main(int argc, char** argv) {
     digest(space.base() + rr7::kRsxLocal + kColour, size_t{kPitch} * kHeight);
     digest(space.base() + rr7::kRsxLocal + kDepth, size_t{kPitch} * kHeight);
     rr7::renderer_report();
+    const rr7::RendererCounters counted = rr7::renderer_counters();
+    if (!pipelines.empty()) {
+        rr7::renderer_pipelines_save();
+        std::printf("pipelines: %llu made ahead, %llu when a draw needed them; recorded in %s\n", static_cast<unsigned long long>(counted.pipelines_ahead),
+                    static_cast<unsigned long long>(counted.pipelines_drawing), pipelines.c_str());
+    }
     std::printf("%llu draws given to Vulkan; digest %016llx\n", static_cast<unsigned long long>(g_vk_draws), static_cast<unsigned long long>(g_digest));
     if (g_vk_draws != uint64_t{kDraws} * (frames + 2)) return std::fprintf(stderr, "expected %u draws a frame\n", kDraws), 1;
+    if (expect_ahead && (counted.pipelines_drawing != 0 || counted.pipelines_ahead == 0))
+        return std::fprintf(stderr, "expected every pipeline made ahead, from the folder's record\n"), 1;
     return 0;
 }

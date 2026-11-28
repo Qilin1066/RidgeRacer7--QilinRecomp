@@ -27,6 +27,9 @@ struct TranslatedShader {
     const uint32_t* variant_spirv[4];
     size_t variant_words[4];
     uint32_t clip_planes;  // a vertex program's: the user clip planes whose distances it writes (bit n for plane n)
+    // A vertex program's constants read, [first, end): all 468 if it indexes them; end 0 where not known (a table written
+    // before they were recorded) or none are read, when the renderer gives it all of them.
+    uint32_t constants_first, constants_end;
 };
 
 extern const TranslatedShader kTranslatedShaders[];

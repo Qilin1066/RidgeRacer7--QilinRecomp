@@ -769,9 +769,10 @@ int cmd_shaders(const Args& a) {
                 forms += std::format("{}{}", n ? ", " : "", variant_names[n].empty() ? "nullptr" : variant_names[n]);
                 sizes += std::format("{}{}", n ? ", " : "", variant_names[n].empty() ? "0" : std::format("std::size({})", variant_names[n]));
             }
-            table += std::format("    {{0x{:016x}ull, {}, 0x{:08x}u, kSpirv{}, std::size(kSpirv{}), 0x{:x}u, 0x{:x}u, 0x{:x}u, 0x{:x}u, {}, {}, {{{}}}, {{{}}}, 0x{:x}u}},\n", rsx::program_key(*p),
-                                 p->vertex ? "true" : "false", s.address, modules.size() - 1, modules.size() - 1, t->inputs, t->outputs, t->textures, t->cube_textures,
-                                 slots.empty() ? "nullptr" : std::format("kSlots{}", modules.size() - 1), t->constant_slots.size(), forms, sizes, t->clip_planes);
+            table += std::format("    {{0x{:016x}ull, {}, 0x{:08x}u, kSpirv{}, std::size(kSpirv{}), 0x{:x}u, 0x{:x}u, 0x{:x}u, 0x{:x}u, {}, {}, {{{}}}, {{{}}}, 0x{:x}u, {}u, {}u}},\n",
+                                 rsx::program_key(*p), p->vertex ? "true" : "false", s.address, modules.size() - 1, modules.size() - 1, t->inputs, t->outputs, t->textures,
+                                 t->cube_textures, slots.empty() ? "nullptr" : std::format("kSlots{}", modules.size() - 1), t->constant_slots.size(), forms, sizes,
+                                 t->clip_planes, t->constants_first, t->constants_end);
         }
     }
     std::println("translated to SPIR-V: {} of {}, with {} other forms for draw state", translated, programs->size(), variants);

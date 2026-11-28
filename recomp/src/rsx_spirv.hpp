@@ -58,6 +58,8 @@ struct Translation {
     uint32_t textures = 0, cube_textures = 0;  // fragment: units sampled, and which of them are cubes
     uint32_t clip_planes = 0;                  // vertex: the user clip planes whose distances it writes (bit n for plane n)
     std::vector<uint32_t> constant_slots;      // fragment: each inline constant's offset in the microcode, in bytes
+    // vertex: the constants it reads, [first, end) (all of them if it indexes them; none: 0, 0)
+    uint32_t constants_first = 0, constants_end = 0;
 };
 
 std::expected<Translation, std::string> translate(const CgProgram& program, const Variant& variant = {});

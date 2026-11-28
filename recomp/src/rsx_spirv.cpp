@@ -116,8 +116,14 @@ public:
                     refuse(std::format("instruction {}: a branch on the condition codes of more than one component", i));
                 if (in.branch_target >= insns_.size()) refuse(std::format("instruction {}: a branch to {}, past the program's end", i, in.branch_target));
             }
-            for (unsigned k = 0; k < 3; ++k)
+            for (unsigned k = 0; k < 3; ++k) {
                 if (in.src[k].type == VpRegister::input) inputs_ |= 1u << in.input;
+                // The constants it reads (for the renderer to give it only those): any, if it indexes them.
+                if (in.src[k].type == VpRegister::constant) {
+                    if (in.index_const) constants_indexed_ = true;
+                    constants_low_ = std::min(constants_low_, in.constant), constants_high_ = std::max(constants_high_, in.constant);
+                }
+            }
             if (in.vec_op && in.vec_op != kVecArl && in.vec_result && in.vec_mask) outputs_ |= 1u << in.dest;
             if (in.sca_op && in.sca_op != kScaBra && in.sca_result && in.sca_mask) outputs_ |= 1u << in.dest;
             // The clip planes' distances it writes: FOGC's (5) y, z, w for planes 0 to 2, PSZ's (6) for 3 to 5 (x = 8 in a mask).
@@ -275,6 +281,8 @@ public:
         out.inputs = inputs_;
         out.outputs = outputs_;
         out.clip_planes = clip_planes_;
+        if (constants_indexed_) out.constants_first = 0, out.constants_end = kVertexConstants;
+        else if (constants_low_ <= constants_high_) out.constants_first = constants_low_, out.constants_end = constants_high_ + 1;
         return out;
     }
 
@@ -379,6 +387,8 @@ private:
     Variant variant_;
     std::vector<VpInsn> insns_;
     uint32_t inputs_ = 0, outputs_ = 0, clip_planes_ = 0;
+    unsigned constants_low_ = ~0u, constants_high_ = 0;
+    bool constants_indexed_ = false;
     uint32_t clip_distance_ = 0;
     std::array<uint32_t, 6> clip_modes_{};  // the clip form's specialisation constants, one a plane
     std::array<uint32_t, 16> attributes_{};

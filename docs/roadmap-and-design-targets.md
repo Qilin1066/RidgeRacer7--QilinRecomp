@@ -52,6 +52,19 @@ The requirements and scope are the same as the other Qilin recomps' (GBTGhoulies
 ### Vulkan baseline: 1.3
 As the other recomps': dynamic rendering, synchronization2, extended dynamic state, timeline semaphores; optional features and limits bounded by v3dv; the features used are checked at start-up and a missing one is a clear message, never a fallback path. Anything an RSX feature needs beyond that is a decision to record here when the analysis shows the game uses it.
 
+The renderer uses extended dynamic state 1 and 2 as 1.3 has them (core, no extension): everything of depth, stencil, culling, depth bias and the topology within its class is set per draw. Not extended dynamic state 3 (v3dv lacks it): blending, the write mask and the logic operation stay in the pipeline, and pipelines are made ahead instead (`docs/runtime.md`). Vertex formats are checked one by one at the start; a missing one is given as floats and named (each is a format of the same values: not a different render path).
+
+### Internal resolution (designed, not built)
+The menu's slider (50% to 400%, greyed out) is to draw the game's surfaces at a scale of their size: 0.5 of 1080p on a Pi, 2 or more on a desktop. Guest memory stays the truth at the guest's size. What it takes, and why it wasn't built in the renderer round of 2026-11-28 (every one of these paths changes what the GPU is given, which the bench's digest can't hold to the unscaled picture, and the game wasn't to be run):
+- *Which surfaces.* Those of the display's size and their depth surfaces (the frame's own passes); smaller ones (the game's 256x64 float surface, reductions, shadow maps, post-effect chains read texel by texel) at 1, a stated choice to be checked on the picture. A surface the CPU touches often (faults counted a second) goes back to 1: each touch is a scaled copy each way.
+- *Drawing.* `SurfaceEntry` keeps a scale; its image is the scaled size. The viewport covers the scaled image (the programs' `clip_xy` push constants are relative to it and need no change); the scissor and a clear's rectangle are scaled (`window_mapping`'s rectangle times the scale, rounded out); line widths and point sizes scaled within the GPU's limits; depth bias units unchanged. The dirty rectangle stays in guest pixels.
+- *Write-back.* The scaled image is blitted (`vkCmdBlitImage`, linear for colour, nearest for depth and stencil: depth isn't averaged) into an image of the guest's size, which is then copied to the staging buffer as now; only the dirty rectangle, scaled. One more image a scaled surface, and one more copy at write-back (none at a flip from the GPU, which shows the scaled image).
+- *Upload.* Guest memory into the guest-size image, then blitted up (nearest: pixels the game didn't change stay as they were drawn only at scale 1, a stated loss when the game writes a surface on the CPU and draws on it again).
+- *Textures from surfaces.* The texture image made at the scaled size and copied from the scaled image, so the game's own post effects sample the sharper picture (normalised coordinates: the size doesn't show); a fragment program that reads a surface texel by texel (rectangle textures, unnormalised) keeps that surface at 1.
+- *Flips.* `renderer_flip` copies at the scaled size; the display scales to the window as it does now.
+- *The bench.* A scale option: at 1 its digest must not change; at 2 the bytes written back must be the guest's size and the rendering's area four times as large.
+
+
 ## Settings, not platform branches
 All enhancements live behind a settings file with presets, as in the other recomps:
 - *Original:* the console's own picture and frame rate.

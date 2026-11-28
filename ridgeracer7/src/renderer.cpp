@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -120,7 +121,7 @@ host::Buffer readback_buffer(const host::Gpu& gpu, VkDeviceSize size, bool& cohe
 struct CachedTexture {
     host::Image image;
     uint64_t hash = 0;
-    uint64_t used = 0;  // the batch it was last used in
+    uint64_t used = UINT64_MAX;  // the batch it was last used in (none yet)
     uint64_t checked = UINT64_MAX;  // the batch its hash was last taken in
     uint32_t address = 0;           // and the guest bytes hashed then
     uint64_t bytes = 0;
@@ -148,6 +149,7 @@ uint64_t hash_bytes(const uint8_t* p, size_t n) {
 }
 
 constexpr uint32_t kMostSets = 1024;                   // descriptor sets in a batch
+using Clock = std::chrono::steady_clock;
 
 // A texture set's contents: each texture's unit, view and sampler, in the order of the units.
 struct TextureSetKey {
@@ -174,6 +176,49 @@ struct TextureSetHash {
     }
 };
 constexpr uint32_t kBatchesInFlight = 3;               // submitted and not waited for, at most (renderer_flush)
+// A batch's arena: vertices, indices and constants the GPU reads where the CPU writes them, and texels it copies from. In
+// memory both the GPU's own and the CPU's to write, where there is enough of it (shared memory, as a Raspberry Pi's or an
+// integrated GPU's, or a discrete GPU's whole memory open to the CPU); else in the CPU's, which the GPU reads across the bus.
+// Never read by the CPU (it may be write-combined). Either way written in place: nothing is staged and copied.
+host::Buffer arena_buffer(const host::Gpu& gpu, VkDeviceSize size) {
+    constexpr VkBufferUsageFlags usage =
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    constexpr VkMemoryPropertyFlags shared = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // (A discrete GPU's window of 256 MB open to the CPU without resizable BAR is too small to give three arenas.)
+    const bool integrated = gpu.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || gpu.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    uint32_t chosen = UINT32_MAX;
+    for (uint32_t i = 0; i < gpu.memory.memoryTypeCount && chosen == UINT32_MAX; ++i)
+        if ((gpu.memory.memoryTypes[i].propertyFlags & shared) == shared &&
+            (integrated || gpu.memory.memoryHeaps[gpu.memory.memoryTypes[i].heapIndex].size >= (VkDeviceSize{1} << 30)))
+            chosen = i;
+    // (Said once, the first time.)
+    static bool told = false;
+    const auto tell = [](bool shared_memory) {
+        if (!told) qilin::rt::log("the renderer's arenas are in %s, written in place", shared_memory ? "memory the GPU and the CPU share" : "the CPU's memory (the GPU reads them across the bus)");
+        told = true;
+    };
+    const auto in_cpu_memory = [&](VkBuffer made) {
+        if (made) vkDestroyBuffer(gpu.device, made, nullptr);
+        tell(false);
+        return host::Buffer::host_visible(gpu, size, usage);
+    };
+    if (chosen == UINT32_MAX) return in_cpu_memory(VK_NULL_HANDLE);
+    host::Buffer b;
+    b.size = size;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size, bci.usage = usage;
+    host::check(vkCreateBuffer(gpu.device, &bci, nullptr, &b.buffer), "vkCreateBuffer");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(gpu.device, b.buffer, &req);
+    if (!(req.memoryTypeBits & (1u << chosen))) return in_cpu_memory(b.buffer);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size, mai.memoryTypeIndex = chosen;
+    if (vkAllocateMemory(gpu.device, &mai, nullptr, &b.memory) != VK_SUCCESS) return in_cpu_memory(b.buffer);  // (that heap full)
+    host::check(vkBindBufferMemory(gpu.device, b.buffer, b.memory, 0), "vkBindBufferMemory");
+    host::check(vkMapMemory(gpu.device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped), "vkMapMemory");
+    tell(true);
+    return b;
+}
 constexpr VkDeviceSize kArenaBytes = 64u << 20;        // vertices, indices, constants and texels of a batch
 
 struct Renderer {
@@ -219,6 +264,9 @@ struct Renderer {
     // waited for only when that comes round again (begin_batch).
     struct Batch {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
+        // Texture uploads that can run before the batch's draws (their images not used earlier in it): submitted first, so
+        // that an upload doesn't end the rendering instance it comes in the middle of.
+        VkCommandBuffer uploads = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         VkDescriptorPool descriptors = VK_NULL_HANDLE;
         host::Buffer arena;
@@ -229,6 +277,8 @@ struct Renderer {
     std::array<Batch, kBatchesInFlight> batches;
     // The batch being recorded (renderer.hpp), and the current batch's own (copied from batches[] by begin_batch).
     bool recording = false;
+    VkCommandBuffer uploads = VK_NULL_HANDLE;
+    bool uploads_begun = false;  // (begun at the batch's first upload ahead of its draws)
     PipelineCache cache;  // the shader modules, pipelines and samplers drawn with (renderer_pipelines.hpp)
     host::Buffer arena;
     VkDeviceSize arena_used = 0, align = 256;
@@ -236,6 +286,7 @@ struct Renderer {
     // constants are at `constants_version`.
     VkDeviceSize constants_at = 0;
     uint64_t constants_batch = UINT64_MAX, constants_version = 0;
+    uint32_t constants_first = 0, constants_end = 0;  // the constants it holds, [first, end)
     uint32_t sets_used = 0;  // texture sets taken from the batch's pool
     // The batch's texture sets by what they hold: a draw with the textures an earlier draw in the batch had binds that
     // draw's set again (a set is never written after it is first bound), rather than take and write another.
@@ -255,14 +306,21 @@ struct Renderer {
         VkRect2D scissor{};
         bool have_push = false;
         std::array<float, 8> vertex_push{}, fragment_push{};
+        bool have_dynamic = false;
+        DynamicState dynamic;  // the state set per draw (renderer_pipelines.hpp)
     } bound;
     std::unordered_map<std::array<uint32_t, 6>, CachedTexture, WordsHash> textures;  // by address, format, size, pitch, remap and cube
     std::vector<SurfaceEntry*> touched;     // the surfaces it draws to
     SurfaceEntry* rendering = nullptr;      // the surface a rendering instance is open on
     SurfaceEntry* rendering_depth = nullptr;  // and its depth surface, if any
+    uint32_t area_width = 0, area_height = 0;  // and its area
     VkFormat depth_format = VK_FORMAT_UNDEFINED;  // for Z24S8: D32_SFLOAT_S8_UINT, or D24_UNORM_S8_UINT where the GPU lacks it
     uint64_t draws = 0, flushes = 0;
     VkQueryPool timestamps = VK_NULL_HANDLE;  // three a batch: its start, before its copies back, its end
+    // The pipelines made for draws when last looked at (renderer_flush), and when that count last grew: the cache is
+    // written to disk once the game has made none for a while.
+    uint64_t pipelines_seen = 0;
+    Clock::time_point pipelines_grew{};
 };
 Renderer* g_renderer = nullptr;
 
@@ -273,11 +331,12 @@ struct Stats {
     std::atomic<uint64_t> gpu_draw_ns{0}, gpu_copy_ns{0};  // the GPU's own time: the batch's commands, and its copies back
     std::atomic<uint64_t> on_demand{0}, on_demand_ns{0};  // surfaces written back when touched
     std::atomic<uint64_t> surface_textures{0};            // textures copied from a surface on the GPU
+    std::atomic<uint64_t> arena_bytes{0};                 // written by the CPU into the arenas (vertices, indices, constants, texels)
+    std::atomic<uint64_t> copied_bytes{0};                // copied by the GPU between buffers and images (texels, surfaces up and back)
 };
 Stats g_stats;
 std::mutex g_flush_reasons_mutex;
 std::map<std::string, uint64_t, std::less<>> g_flush_reasons;  // flushes with work in them, by what asked for them (found without a string made)
-using Clock = std::chrono::steady_clock;
 uint64_t since(Clock::time_point t) { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
 
 // The surfaces drawn and not yet written back (SurfaceEntry::pending). The lock is held while the GPU may write their
@@ -405,7 +464,7 @@ void transition_texture(VkCommandBuffer cmd, VkImage image, VkImageLayout from, 
 
 }  // namespace
 
-void renderer_start(host::Gpu& gpu, std::mutex& queue) {
+void renderer_start(host::Gpu& gpu, std::mutex& queue, const std::filesystem::path& pipeline_folder) {
     auto* r = new Renderer;  // (for the process's life: it ends without unwinding)
     r->gpu = &gpu;
     r->queue = &queue;
@@ -418,6 +477,7 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
     VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     for (Renderer::Batch& b : r->batches) {
         host::check(vkAllocateCommandBuffers(gpu.device, &alloc, &b.cmd), "vkAllocateCommandBuffers");
+        host::check(vkAllocateCommandBuffers(gpu.device, &alloc, &b.uploads), "vkAllocateCommandBuffers");
         host::check(vkCreateFence(gpu.device, &fence, nullptr, &b.fence), "vkCreateFence");
     }
     host::check(vkCreateCommandPool(gpu.device, &pool, nullptr, &r->demand_pool), "vkCreateCommandPool");
@@ -459,9 +519,7 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
         r->fragment_range = std::max<VkDeviceSize>(r->fragment_range, qilin::rt::kTranslatedShaders[i].constant_slot_count * 16);
     if (r->fragment_range > gpu.properties.limits.maxUniformBufferRange)
         fatal("a fragment program has %llu bytes of inline constants, more than this GPU's uniform blocks take", static_cast<unsigned long long>(r->fragment_range));
-    for (Renderer::Batch& b : r->batches)
-        b.arena = host::Buffer::host_visible(gpu, kArenaBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                                                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    for (Renderer::Batch& b : r->batches) b.arena = arena_buffer(gpu, kArenaBytes);
     // D32S8 first: NVIDIA's copies of D24S8's depth out of the image took 32 ms a 1920 by 1080 surface against D32S8's 4.5,
     // and AMD has no D24S8 at all.
     for (const VkFormat f : {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT}) {
@@ -478,7 +536,7 @@ void renderer_start(host::Gpu& gpu, std::mutex& queue) {
     query.queryType = VK_QUERY_TYPE_TIMESTAMP, query.queryCount = 3;
     for (Renderer::Batch& b : r->batches) host::check(vkCreateQueryPool(gpu.device, &query, nullptr, &b.timestamps), "vkCreateQueryPool");
     r->align = std::max<VkDeviceSize>({256, gpu.properties.limits.minUniformBufferOffsetAlignment, gpu.properties.limits.optimalBufferCopyOffsetAlignment});
-    r->cache.start(gpu, r->layout, r->depth_format);
+    r->cache.start(gpu, r->layout, r->depth_format, pipeline_folder);
     g_renderer = r;
     qilin::rt::log("the renderer draws on %s, with %zu translated shaders", gpu.name.c_str(), qilin::rt::kTranslatedShaderCount);
 }
@@ -487,13 +545,16 @@ bool renderer_started() { return g_renderer != nullptr; }
 
 namespace {
 
-// Room in the batch's arena: an offset, aligned for any use (uniform buffers' alignment the strictest).
-VkDeviceSize arena_take(Renderer& r, VkDeviceSize size) {
+// Room in the batch's arena: an offset, aligned for any use (uniform buffers' alignment the strictest). `written`: how much of
+// it the CPU writes (counted: renderer_counters).
+VkDeviceSize arena_take(Renderer& r, VkDeviceSize size, VkDeviceSize written) {
     const VkDeviceSize at = (r.arena_used + r.align - 1) / r.align * r.align;
     if (at + size > r.arena.size) fatal("the renderer's arena is full mid-draw (a draw's needs are checked before it starts)");
     r.arena_used = at + size;
+    g_stats.arena_bytes += written;
     return at;
 }
+VkDeviceSize arena_take(Renderer& r, VkDeviceSize size) { return arena_take(r, size, size); }
 uint8_t* arena_at(Renderer& r, VkDeviceSize offset) { return static_cast<uint8_t*>(r.arena.mapped) + offset; }
 
 void end_rendering(Renderer& r) {
@@ -629,6 +690,7 @@ void write_back_pages(uint64_t from, uint64_t to) {
         VkBufferImageCopy copies[2];
         const uint32_t n = surface_copies(*s, copies);
         vkCmdCopyImageToBuffer(r.demand_cmd, s->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->staging.buffer, n, copies);
+        g_stats.copied_bytes += s->staging.size;
     }
     VkMemoryBarrier2 to_host_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     to_host_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, to_host_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -703,6 +765,7 @@ void surface_from_guest(VkCommandBuffer cmd, SurfaceEntry& s, bool discard) {
     VkBufferImageCopy copies[2];
     const uint32_t n = surface_copies(s, copies);
     vkCmdCopyBufferToImage(cmd, s.staging.buffer, s.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, copies);
+    g_stats.copied_bytes += s.staging.size;
     host::transition(cmd, s.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      s.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, aspects(s));
 }
@@ -775,9 +838,19 @@ SurfaceEntry& depth_entry(Renderer& r, const Surface& z) {
     return e;
 }
 
+// A clear a rendering instance may begin with: made its attachments' load operations if the instance is begun for it and
+// the rectangle covers its area (on a tiler, what is cleared as it begins is never read from memory); what is left (`*_done`
+// false) is the caller's to clear with vkCmdClearAttachments.
+struct LoadClear {
+    uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    bool color = false, depth = false, stencil = false;
+    VkClearValue color_value{}, depth_value{};
+    bool color_done = false, depth_done = false, stencil_done = false;
+};
+
 // A rendering instance open on these surfaces (either may be absent, not both), each brought from guest memory as the
 // batch first draws to it (`discard_*`: unless the batch begins by replacing every pixel of it).
-void open_rendering(Renderer& r, SurfaceEntry* target, SurfaceEntry* depth, bool discard_target, bool discard_depth) {
+void open_rendering(Renderer& r, SurfaceEntry* target, SurfaceEntry* depth, bool discard_target, bool discard_depth, LoadClear* clear = nullptr) {
     const VkCommandBuffer cmd = r.cmd;
     const bool first_touch = target && !target->touched, depth_first_touch = depth && !depth->touched;
     if (first_touch || depth_first_touch || r.rendering != target || r.rendering_depth != depth) end_rendering(r);
@@ -798,11 +871,14 @@ void open_rendering(Renderer& r, SurfaceEntry* target, SurfaceEntry* depth, bool
     if (target && !first_touch) host::transition(cmd, target->image.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     if (depth && !depth_first_touch)
         host::transition(cmd, depth->image.image, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, aspects(*depth));
+    // (Every attachment is stored: its image is the surface's only copy until it is written back, and the next batch may
+    // draw on it again.)
     VkRenderingAttachmentInfo depth_attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (depth) {
         depth_attachment.imageView = depth->attachment_view, depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     }
+    VkRenderingAttachmentInfo stencil_attachment = depth_attachment;
     VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
     // (Both images hold at least the clip drawn; either may be larger, from a larger clip drawn before: the area is what
@@ -812,12 +888,19 @@ void open_rendering(Renderer& r, SurfaceEntry* target, SurfaceEntry* depth, bool
         if (e) area_width = std::min(area_width, e->desc.width), area_height = std::min(area_height, e->desc.height);
     rendering.renderArea = {{0, 0}, {area_width, area_height}};
     rendering.layerCount = 1;
+    r.area_width = area_width, r.area_height = area_height;
     if (target) {
         attachment.imageView = target->image.view, attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         rendering.colorAttachmentCount = 1, rendering.pColorAttachments = &attachment;
     }
-    if (depth) rendering.pDepthAttachment = rendering.pStencilAttachment = &depth_attachment;
+    if (clear && clear->x0 == 0 && clear->y0 == 0 && clear->x1 >= area_width && clear->y1 >= area_height) {
+        if (target && clear->color) attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, attachment.clearValue = clear->color_value, clear->color_done = true;
+        if (depth && clear->depth) depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, clear->depth_done = true;
+        if (depth && clear->stencil) stencil_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, clear->stencil_done = true;
+        depth_attachment.clearValue = stencil_attachment.clearValue = clear->depth_value;
+    }
+    if (depth) rendering.pDepthAttachment = &depth_attachment, rendering.pStencilAttachment = &stencil_attachment;
     vkCmdBeginRendering(cmd, &rendering);
     r.rendering = target;
     r.rendering_depth = depth;
@@ -866,6 +949,7 @@ void begin_batch(Renderer& r) {
     finish_batch(r, b);
     host::check(vkResetDescriptorPool(r.gpu->device, b.descriptors, 0), "vkResetDescriptorPool");
     r.cmd = b.cmd, r.fence = b.fence, r.descriptors = b.descriptors, r.arena = b.arena, r.timestamps = b.timestamps;
+    r.uploads = b.uploads, r.uploads_begun = false;
     r.sets_used = 0, r.arena_used = 0;
     r.texture_sets.clear();
     r.bound = {};
@@ -907,6 +991,7 @@ void renderer_flush(const char* why) {
         VkBufferImageCopy copies[2];
         const uint32_t n = surface_copies(*s, copies);
         vkCmdCopyImageToBuffer(r.cmd, s->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s->staging.buffer, n, copies);
+        g_stats.copied_bytes += s->staging.size;
     }
     // Everything copied back is visible to the host once the fence is signalled.
     VkMemoryBarrier2 to_host_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -917,8 +1002,11 @@ void renderer_flush(const char* why) {
     vkCmdPipelineBarrier2(r.cmd, &dependency);
     vkCmdWriteTimestamp2(r.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.timestamps, 2);
     host::check(vkEndCommandBuffer(r.cmd), "vkEndCommandBuffer");
+    // (The uploads ahead of the draws first, in the same submission: the queue orders their barriers before the batch's.)
+    const VkCommandBuffer buffers[2] = {r.uploads, r.cmd};
+    if (r.uploads_begun) host::check(vkEndCommandBuffer(r.uploads), "vkEndCommandBuffer");
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1, submit.pCommandBuffers = &r.cmd;
+    submit.commandBufferCount = r.uploads_begun ? 2 : 1, submit.pCommandBuffers = r.uploads_begun ? buffers : buffers + 1;
     // Submitted, and (written back when touched) not waited for: whatever touches a surface it draws to copies it out by
     // a submission of its own, which the queue runs after this. (The lock: a fault mid-submission finds the surface as
     // it was before, or pending after.)
@@ -979,7 +1067,7 @@ void renderer_flush(const char* why) {
     // Textures unused for a while can go. (Unused in the last 300 batches: those that used them are no longer in flight.)
     if (r.textures.size() > 1024) {
         for (auto it = r.textures.begin(); it != r.textures.end();) {
-            if (it->second.used + 300 < r.flushes) {
+            if (r.flushes - it->second.used > 300) {  // (unsigned: one never used, UINT64_MAX, counts as long unused)
                 it->second.image.destroy(gpu);
                 it = r.textures.erase(it);
             } else {
@@ -987,6 +1075,9 @@ void renderer_flush(const char* why) {
             }
         }
     }
+    // The pipelines to disk once the game has made none for three seconds (on the cache's worker thread).
+    if (const uint64_t made = r.cache.counts().drawing; made != r.pipelines_seen) r.pipelines_seen = made, r.pipelines_grew = Clock::now();
+    else if (r.cache.made_since_save() && Clock::now() - r.pipelines_grew > std::chrono::seconds(3)) r.cache.save(false);
     r.recording = false;
     ++r.flushes;
     ++g_stats.flushes;
@@ -1056,10 +1147,27 @@ void renderer_report() {
                    static_cast<unsigned long long>(g_stats.flushes.load()), ms(g_stats.flush_ns), ms(g_stats.wait_ns), ms(g_stats.writeback_ns),
                    ms(g_stats.gpu_draw_ns), ms(g_stats.gpu_copy_ns));
     qilin::rt::log("renderer: %llu textures copied from surfaces on the GPU", static_cast<unsigned long long>(g_stats.surface_textures.load()));
+    const PipelineCache::Counts pipelines = g_renderer ? g_renderer->cache.counts() : PipelineCache::Counts{};
+    qilin::rt::log("renderer: %llu pipelines made ahead, %llu when a draw needed them (%llu draws waited for one being made ahead); %llu MB written to the arenas, %llu MB copied on the GPU",
+                   static_cast<unsigned long long>(pipelines.ahead), static_cast<unsigned long long>(pipelines.drawing), static_cast<unsigned long long>(pipelines.waited),
+                   static_cast<unsigned long long>(g_stats.arena_bytes.load() >> 20), static_cast<unsigned long long>(g_stats.copied_bytes.load() >> 20));
     qilin::rt::log("renderer: %llu surfaces written back when touched (%.0f ms)%s", static_cast<unsigned long long>(g_stats.on_demand.load()), ms(g_stats.on_demand_ns),
                    lazy_writeback() ? "" : " (RR7_EAGER_WRITEBACK, or faults not handled: written back at every flush)");
     const std::lock_guard lock(g_flush_reasons_mutex);
     for (const auto& [why, count] : g_flush_reasons) qilin::rt::log("renderer: %llu flushes for %s", static_cast<unsigned long long>(count), why.c_str());
+}
+
+RendererCounters renderer_counters() {
+    const PipelineCache::Counts pipelines = g_renderer ? g_renderer->cache.counts() : PipelineCache::Counts{};
+    return {g_stats.draws.load(), pipelines.ahead, pipelines.drawing, pipelines.waited, g_stats.arena_bytes.load(), g_stats.copied_bytes.load()};
+}
+
+void renderer_pipelines_wait() {
+    if (g_renderer) g_renderer->cache.wait_ahead();
+}
+
+void renderer_pipelines_save() {
+    if (g_renderer) g_renderer->cache.save(true);
 }
 
 void renderer_draw(const Draw& d) {
@@ -1157,6 +1265,7 @@ void renderer_draw(const Draw& d) {
         uint32_t unit;
         CachedTexture* cached;
         bool decode;    // its texels changed (or are new): decoded, and uploaded in this draw
+        bool ahead;     // ...and its image not used earlier in the batch: uploaded ahead of the batch's draws
         Texels texels;  // when decoded
         VkSampler sampler;
         // A colour surface the renderer holds whose pixels the texture is (texture_is_plain_argb): copied from its image on
@@ -1219,6 +1328,7 @@ void renderer_draw(const Draw& d) {
             } else {
                 up.decode = false;
             }
+            up.ahead = up.cached->used != r.flushes;
             up.cached->used = r.flushes;
             const auto fields = decode_sampler(t);
             if (!fields) fatal("texture %u: %s, which the renderer doesn't take yet", u, fields.error().c_str());
@@ -1236,13 +1346,23 @@ void renderer_draw(const Draw& d) {
         ++g_stats.textures, g_stats.texture_bytes += up.texels.rgba.size();
     }
     g_stats.texture_ns += since(texture_start);
-    bool any_decoded = false;  // (or copied from a surface: either is done outside a rendering instance)
-    for (const Upload& up : uploads) any_decoded = any_decoded || up.decode || up.surface;
+    bool any_decoded = false;  // (or copied from a surface: either is done outside a rendering instance, but uploads ahead)
+    for (const Upload& up : uploads) any_decoded = any_decoded || (up.decode && !up.ahead) || up.surface;
 
     // What the draw takes from the arena (a fragment program's inline constants as much as set 0's range), and a descriptor
     // set: if the batch hasn't room, it is flushed first.
-    const uint32_t attributes = static_cast<uint32_t>(std::popcount(vs.inputs & 0xffffu));
-    VkDeviceSize needed = r.align * 8 + VkDeviceSize{16} * attributes * d.count + index_list.size() * 4 + kVertexConstants * 16 + r.fragment_range;
+    // Each attribute read as the GPU is given it (renderer_pipelines.hpp: vertex_format), and the room its vertices take
+    // (each attribute's run beginning on 16 bytes).
+    std::array<uint8_t, 16> vertex_formats{};
+    VkDeviceSize vertex_bytes = 0;
+    uint32_t attributes = 0;
+    for (uint32_t a = 0; a < 16; ++a)
+        if (vs.inputs & (1u << a)) {
+            vertex_formats[a] = r.cache.vertex_format(d.attribute_format[a]);
+            const VertexInput in = vertex_input(vertex_formats[a]);
+            vertex_bytes += (in.per_instance ? 16 : (VkDeviceSize{in.stride} * d.count + 15) / 16 * 16), ++attributes;
+        }
+    VkDeviceSize needed = r.align * 8 + vertex_bytes + index_list.size() * 4 + kVertexConstants * 16 + r.fragment_range;
     for (const Upload& up : uploads) needed += up.decode ? up.texels.rgba.size() + r.align : 0;
     begin_batch(r);
     if (needed > r.arena.size) {
@@ -1255,8 +1375,7 @@ void renderer_draw(const Draw& d) {
         if (size > UINT32_MAX) fatal("a draw of %llu MB, past what set 0's dynamic offsets reach", static_cast<unsigned long long>(needed >> 20));
         host::Buffer& arena = r.batches[r.flushes % kBatchesInFlight].arena;
         arena.destroy(gpu);
-        arena = host::Buffer::host_visible(gpu, size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                                                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        arena = arena_buffer(gpu, size);
         r.arena = arena;
         write_constants_set(r);  // (on the new arena: nothing in the batch has used it yet)
         size_t texels = 0;
@@ -1269,32 +1388,40 @@ void renderer_draw(const Draw& d) {
         renderer_flush("a full batch");
         begin_batch(r);
     }
+    // (Used in the batch this draw is in, if one of those flushes began another: so that a later draw in it decoding one
+    // again doesn't upload it ahead of this one.)
+    for (const Upload& up : uploads) up.cached->used = r.flushes;
     VkCommandBuffer cmd = r.cmd;
 
-    // The vertices: every attribute the program reads, as four floats.
+    // The vertices: every attribute the program reads, in its own format where the GPU reads that (its components' bytes
+    // put in the host's order, no more), else as four floats.
     std::array<VkDeviceSize, 16> offsets{};  // each attribute read's place in the arena, by slot
-    const VkDeviceSize vertex_at = arena_take(r, std::max<VkDeviceSize>(16, VkDeviceSize{16} * attributes * d.count));
+    const VkDeviceSize vertex_at = arena_take(r, std::max<VkDeviceSize>(16, vertex_bytes));
+    VkDeviceSize run = 0;  // (the next attribute's run, from vertex_at)
     for (uint32_t a = 0, slot = 0; a < 16; ++a) {
         if (!(vs.inputs & (1u << a))) continue;
         const uint32_t format_word = d.attribute_format[a], stride = (format_word >> 8) & 0xff;
-        const VkDeviceSize at = vertex_at + VkDeviceSize{slot} * 16 * d.count;
-        float* out = reinterpret_cast<float*>(arena_at(r, at));
-        if (((format_word >> 4) & 0xf) == 0) {
+        const uint8_t f = vertex_formats[a];
+        const VertexInput in = vertex_input(f);
+        uint8_t* out = arena_at(r, vertex_at + run);
+        offsets[slot++] = vertex_at + run;
+        run += in.per_instance ? 16 : (VkDeviceSize{in.stride} * d.count + 15) / 16 * 16;
+        if (f == kVertexConstant) {
             // No array: every vertex reads the attribute's current value, which the RSX's immediate methods set
             // (SET_VERTEX_DATA*: none of them is sent by the game, and one would stop it as a method not provided), so
-            // the value it starts with: 0, 0, 0, 1 (*a stated choice, to be checked against the console*).
-            for (uint32_t v = 0; v < d.count; ++v) out[4 * v] = out[4 * v + 1] = out[4 * v + 2] = 0.0f, out[4 * v + 3] = 1.0f;
-            offsets[slot++] = at;
+            // the value it starts with: 0, 0, 0, 1 (*a stated choice, to be checked against the console*). One value,
+            // read for every vertex (a binding read per instance, and one instance drawn).
+            constexpr float kStart[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            std::memcpy(out, kStart, sizeof kStart);
             continue;
         }
-        if (!decode_attributes(format_word, guest_memory() + d.attribute_address[a] + size_t{d.first} * stride, stride, d.count, out))
+        const uint8_t* from = guest_memory() + d.attribute_address[a] + size_t{d.first} * stride;
+        if (f != kVertexFloats) encode_attributes(f, from, stride, d.count, out);
+        else if (!decode_attributes(format_word, from, stride, d.count, reinterpret_cast<float*>(out)))
             fatal("a vertex attribute of type %u, which the renderer doesn't take yet", format_word & 0xf);
-        if (d.logged && d.count) {
-            const uint8_t* raw = guest_memory() + d.attribute_address[a] + d.first * stride;
-            qilin::rt::log("(draw)   attribute %u format %08x: first vertex %g %g %g %g (bytes %02x %02x %02x %02x)", a, format_word, out[0], out[1], out[2], out[3], raw[0],
-                           raw[1], raw[2], raw[3]);
-        }
-        offsets[slot++] = at;
+        if (d.logged && d.count)
+            qilin::rt::log("(draw)   attribute %u format %08x, given as %02x: first vertex's bytes %02x %02x %02x %02x, as given %02x %02x %02x %02x", a, format_word, f, from[0],
+                           from[1], from[2], from[3], out[0], out[1], out[2], out[3]);
     }
     VkDeviceSize index_at = 0;
     if (!index_list.empty()) {
@@ -1302,11 +1429,18 @@ void renderer_draw(const Draw& d) {
         std::memcpy(arena_at(r, index_at), index_list.data(), index_list.size() * 4);
     }
     // The constants.
-    // (The vertex constants copied again only when the game has changed them since the batch's last copy.)
-    if (r.constants_batch != r.flushes || r.constants_version != d.constants_version) {
-        r.constants_at = arena_take(r, kVertexConstants * 16);
-        std::memcpy(arena_at(r, r.constants_at), d.vertex_constants, kVertexConstants * 16);
-        r.constants_batch = r.flushes, r.constants_version = d.constants_version;
+    // (The vertex constants the program reads, at their places in a block of all 468 whose start is the descriptor's offset:
+    // copied again only when the game has changed them since the batch's last copy, or the program reads some it hasn't,
+    // and then with those the last copy had too.)
+    const uint32_t constants_first = vs.constants_end ? std::min<uint32_t>(vs.constants_first, kVertexConstants) : 0;
+    const uint32_t constants_end = vs.constants_end ? std::min<uint32_t>(vs.constants_end, kVertexConstants) : kVertexConstants;
+    const bool same_constants = r.constants_batch == r.flushes && r.constants_version == d.constants_version;
+    if (!same_constants || constants_first < r.constants_first || constants_end > r.constants_end) {
+        const uint32_t from = same_constants ? std::min(constants_first, r.constants_first) : constants_first;
+        const uint32_t to = same_constants ? std::max(constants_end, r.constants_end) : constants_end;
+        r.constants_at = arena_take(r, kVertexConstants * 16, VkDeviceSize{to - from} * 16);
+        std::memcpy(arena_at(r, r.constants_at + VkDeviceSize{from} * 16), d.vertex_constants + 4 * from, size_t{to - from} * 16);
+        r.constants_batch = r.flushes, r.constants_version = d.constants_version, r.constants_first = from, r.constants_end = to;
     }
     const VkDeviceSize vertex_constants_at = r.constants_at;
     VkDeviceSize fragment_constants_at = 0;
@@ -1353,10 +1487,20 @@ void renderer_draw(const Draw& d) {
                 continue;
             }
             if (!up.decode) continue;
-            // (Draws earlier in the batch that sampled it are ordered before this copy by the transition's barrier.)
+            // (Draws earlier in the batch that sampled it are ordered before this copy by the transition's barrier. With none,
+            // the copy goes ahead of the batch's draws, where it ends no rendering instance; earlier batches' are ordered
+            // before it all the same, by the queue.)
             const VkDeviceSize at = arena_take(r, up.texels.rgba.size());
             std::memcpy(arena_at(r, at), up.texels.rgba.data(), up.texels.rgba.size());
-            transition_texture(cmd, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            const VkCommandBuffer copy_cmd = up.ahead ? r.uploads : cmd;
+            if (up.ahead && !r.uploads_begun) {
+                host::check(vkResetCommandBuffer(r.uploads, 0), "vkResetCommandBuffer");
+                VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                host::check(vkBeginCommandBuffer(r.uploads, &begin), "vkBeginCommandBuffer");
+                r.uploads_begun = true;
+            }
+            transition_texture(copy_cmd, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             static std::vector<VkBufferImageCopy> levels;  // (kept between draws: only the RSX's thread draws)
             levels.assign(size_t{up.texels.levels} * up.texels.faces, VkBufferImageCopy{});
             for (uint32_t face = 0; face < up.texels.faces; ++face)
@@ -1366,8 +1510,9 @@ void renderer_draw(const Draw& d) {
                     c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, face, 1};
                     c.imageExtent = {std::max(1u, up.texels.width >> l), std::max(1u, up.texels.height >> l), 1};
                 }
-            vkCmdCopyBufferToImage(cmd, r.arena.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(levels.size()), levels.data());
-            transition_texture(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            vkCmdCopyBufferToImage(copy_cmd, r.arena.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(levels.size()), levels.data());
+            g_stats.copied_bytes += up.texels.rgba.size();
+            transition_texture(copy_cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
     }
     // Set 1, the textures: the set bound already if it holds the same images and samplers at the same units (new texels
@@ -1404,8 +1549,12 @@ void renderer_draw(const Draw& d) {
     const VkRect2D scissor{{static_cast<int32_t>(window.x0), static_cast<int32_t>(window.y0)}, {window.x1 - window.x0, window.y1 - window.y0}};
 
     // What the draw binds and sets, where it differs from what the command buffer has.
-    if (const VkPipeline pipeline = r.cache.pipeline(d, vs, fs, forms, format, vulkan_topology(assembly->topology), *raster); pipeline != bound.pipeline)
+    const VkPrimitiveTopology topology = vulkan_topology(assembly->topology);
+    if (const VkPipeline pipeline = r.cache.pipeline(r.cache.key(d, vs, fs, forms, format, topology, *raster, vertex_formats)); pipeline != bound.pipeline)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline), bound.pipeline = pipeline;
+    const DynamicState dynamic = dynamic_state(d, topology, *raster, gpu.depth_bounds);
+    set_dynamic_state(cmd, dynamic, bound.have_dynamic ? &bound.dynamic : nullptr, r.cache.bounds_dynamic());
+    bound.dynamic = dynamic, bound.have_dynamic = true;
     const VkViewport viewport{0, 0, static_cast<float>(d.color.width), static_cast<float>(d.color.height), 0.0f, 1.0f};
     if (!bound.have_viewport || bound.viewport.width != viewport.width || bound.viewport.height != viewport.height) {
         vkCmdSetViewport(cmd, 0, 1, &viewport);
@@ -1474,27 +1623,38 @@ void renderer_clear(const Clear& c) {
     // A clear of every pixel of a surface (and, for a depth surface, of both depth and stencil) needn't read it first.
     // (Judged by the image's size: a clear of a small clip in the corner of a larger image keeps the rest.)
     const auto whole = [&](const SurfaceEntry& e) { return c.x0 == 0 && c.y0 == 0 && c.x1 >= e.desc.width && c.y1 >= e.desc.height; };
-    open_rendering(r, target, depth, target && whole(*target), depth && c.depth && c.stencil && whole(*depth));
+    LoadClear load;
+    load.x0 = c.x0, load.y0 = c.y0, load.x1 = c.x1, load.y1 = c.y1;
+    load.color = target != nullptr, load.depth = depth && c.depth, load.stencil = depth && c.stencil;
+    // The image's channels are R, G, B, A, each an 8-bit fraction: n / 255 comes back as n.
+    const uint32_t v = c.color_value;
+    load.color_value.color.float32[0] = static_cast<float>((v >> 16) & 0xff) / 255.0f;
+    load.color_value.color.float32[1] = static_cast<float>((v >> 8) & 0xff) / 255.0f;
+    load.color_value.color.float32[2] = static_cast<float>(v & 0xff) / 255.0f;
+    load.color_value.color.float32[3] = static_cast<float>(v >> 24) / 255.0f;
+    // Depth as depth_to_host makes it (render_formats.hpp): d / (2^24 - 1).
+    load.depth_value.depthStencil = {static_cast<float>(c.depth_value >> 8) / 16777215.0f, c.depth_value & 0xffu};
+    // A clear of only one of the surfaces of the rendering instance open (both drawn before, both first touched) keeps it,
+    // the other attached and not cleared, where its area holds the whole clear: a rendering instance fewer.
+    SurfaceEntry* pass_target = target;
+    SurfaceEntry* pass_depth = depth;
+    const bool open_on_both = r.rendering && r.rendering_depth && r.rendering->touched && r.rendering_depth->touched && c.x1 <= r.area_width && c.y1 <= r.area_height;
+    if (open_on_both && !depth && target == r.rendering) pass_depth = r.rendering_depth;
+    if (open_on_both && !target && depth == r.rendering_depth) pass_target = r.rendering;
+    open_rendering(r, pass_target, pass_depth, target && whole(*target), depth && c.depth && c.stencil && whole(*depth), &load);
     VkClearAttachment clears[2] = {};
     uint32_t n = 0;
-    if (target) {
-        // The image's channels are R, G, B, A, each an 8-bit fraction: n / 255 comes back as n.
-        const uint32_t v = c.color_value;
-        clears[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, clears[n].colorAttachment = 0;
-        clears[n].clearValue.color.float32[0] = static_cast<float>((v >> 16) & 0xff) / 255.0f;
-        clears[n].clearValue.color.float32[1] = static_cast<float>((v >> 8) & 0xff) / 255.0f;
-        clears[n].clearValue.color.float32[2] = static_cast<float>(v & 0xff) / 255.0f;
-        clears[n].clearValue.color.float32[3] = static_cast<float>(v >> 24) / 255.0f;
+    if (target && !load.color_done) clears[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, clears[n].colorAttachment = 0, clears[n].clearValue = load.color_value, ++n;
+    if (depth && ((c.depth && !load.depth_done) || (c.stencil && !load.stencil_done))) {
+        clears[n].aspectMask = (c.depth && !load.depth_done ? VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT} : VkImageAspectFlags{0}) |
+                               (c.stencil && !load.stencil_done ? VkImageAspectFlags{VK_IMAGE_ASPECT_STENCIL_BIT} : VkImageAspectFlags{0});
+        clears[n].clearValue = load.depth_value;
         ++n;
     }
-    if (depth) {
-        // Depth as depth_to_host makes it (render_formats.hpp): d / (2^24 - 1).
-        clears[n].aspectMask = (c.depth ? VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT} : VkImageAspectFlags{0}) | (c.stencil ? VkImageAspectFlags{VK_IMAGE_ASPECT_STENCIL_BIT} : VkImageAspectFlags{0});
-        clears[n].clearValue.depthStencil = {static_cast<float>(c.depth_value >> 8) / 16777215.0f, c.depth_value & 0xffu};
-        ++n;
-    }
-    const VkClearRect rect{{{static_cast<int32_t>(c.x0), static_cast<int32_t>(c.y0)}, {c.x1 - c.x0, c.y1 - c.y0}}, 0, 1};
-    vkCmdClearAttachments(r.cmd, n, clears, 1, &rect);
+    // (Within the rendering's area: there are no pixels past it.)
+    const uint32_t x1 = std::min(c.x1, r.area_width), y1 = std::min(c.y1, r.area_height);
+    const VkClearRect rect{{{static_cast<int32_t>(c.x0), static_cast<int32_t>(c.y0)}, {x1 > c.x0 ? x1 - c.x0 : 0u, y1 > c.y0 ? y1 - c.y0 : 0u}}, 0, 1};
+    if (n && rect.rect.extent.width && rect.rect.extent.height) vkCmdClearAttachments(r.cmd, n, clears, 1, &rect);
     if (target) target->written = true, target->add_drawn(c.x0, c.y0, c.x1, c.y1);
     if (depth) depth->written = true, depth->add_drawn(c.x0, c.y0, c.x1, c.y1);
 }

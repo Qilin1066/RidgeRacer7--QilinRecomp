@@ -1,7 +1,9 @@
 #include "spu_lift.hpp"
 
+#include <algorithm>
 #include <array>
 #include <format>
+#include <iterator>
 #include <map>
 #include <set>
 
@@ -72,14 +74,23 @@ constexpr std::string_view kOut = "@OUT@", kIn = "@IN@";
 
 class Emitter {
 public:
-    Emitter(const SpuCfg* cfg, const SpuFunction& f) : cfg_(cfg), f_(f) {
+    Emitter(const SpuCfg* cfg, const SpuFunction& f, std::set<unsigned> scalars = {}) : cfg_(cfg), f_(f), scalars_(std::move(scalars)) {
         for (const SpuJumpTable& t : f.tables) tables_[t.at] = &t;
+    }
+    // The registers that want a local for their preferred word: those whose preferred word the function read, and those
+    // whose word one with a local could have been made from.
+    // The registers some instruction gave a preferred word other than the vector's or a constant.
+    const std::set<unsigned>& given() const { return given_; }
+    std::set<unsigned> wanted() const {
+        std::set<unsigned> w = preferred_read_;
+        w.insert(wanted_.begin(), wanted_.end());
+        return w;
     }
 
     // One instruction (not a branch: those need the function around them), as a whole function's body.
     bool one(uint32_t pc, const Insn& in, std::string& out) {
         std::string line;
-        if (!insn(pc, in, line)) return false;
+        if (!instruction(pc, in, line)) return false;
         out = finish(line + std::format("   {}\n", kOut));
         return true;
     }
@@ -111,9 +122,10 @@ public:
             if (labels_.contains(a)) {
                 body += std::format("L_{:05X}: ;\n", a);
                 known_.clear();  // (another way in: what this block knew is not known there)
+                loaded_.clear();
             }
             std::string line;
-            if (!insn(a, in, line)) {
+            if (!instruction(a, in, line)) {
                 out.why = error_;
                 out.why_at = a;
                 return out;
@@ -146,8 +158,41 @@ private:
     }
     std::string D(unsigned n) {
         written_.insert(n);
+        written_now_.insert(n);
         known_.erase(n);
+        loaded_.erase(n);
+        std::erase_if(loaded_, [n](const auto& entry) { return entry.second.base == n; });
         return R(n);
+    }
+    // A register's preferred word as an expression, if it has one that doesn't read the register: a constant known
+    // here, or its local.
+    std::optional<std::string> scalar(unsigned n) {
+        if (const auto it = known_.find(n); it != known_.end()) return hex(it->second[0]);
+        if (scalars_.contains(n)) {
+            used_.insert(n);
+            return std::format("p{}", n);
+        }
+        return std::nullopt;
+    }
+    // The preferred word of the register this instruction writes, as `expression` (made of scalar()'s), if it has a
+    // local; otherwise it is copied from the register after the instruction (instruction()).
+    // (`constant`: a constant, which doesn't make a register worth a local by itself: within a block it is known anyway.)
+    void set_scalar(unsigned n, const std::string& expression, bool constant = false) {
+        if (!scalars_.contains(n)) return;
+        extra_ += std::format(" p{} = {};", n, expression);
+        scalar_now_.insert(n);
+        if (!constant) given_.insert(n);
+    }
+    // One instruction's line, with the locals of the preferred words it wrote kept.
+    bool instruction(uint32_t pc, const Insn& in, std::string& line) {
+        extra_.clear();
+        written_now_.clear();
+        scalar_now_.clear();
+        if (!insn(pc, in, line)) return false;
+        for (const unsigned n : written_now_)
+            if (scalars_.contains(n) && !scalar_now_.contains(n)) extra_ += std::format(" p{0} = r{0}.w[0];", n);
+        if (!extra_.empty() && !line.empty() && line.back() == '\n') line.insert(line.size() - 1, extra_);
+        return true;
     }
     std::string LS() {
         uses_ls_ = true;
@@ -161,6 +206,11 @@ private:
             head += std::format("    SpuReg r{0} = s.r[{0}];\n", n);
             in_s += std::format(" r{0} = s.r[{0}];", n);
         }
+        for (const unsigned n : scalars_)
+            if (used_.contains(n)) {
+                head += std::format("    uint32_t p{0} = r{0}.w[0];\n", n);
+                in_s += std::format(" p{0} = r{0}.w[0];", n);
+            }
         for (const unsigned n : written_) out_s += std::format(" s.r[{0}] = r{0};", n);
         if (uses_ls_) head += "    uint8_t* const ls = s.ls;\n";
         std::string r = head + body;
@@ -225,13 +275,38 @@ private:
         const auto set = [&](const Words& w) {
             line(std::format("{} = {};", D(t), constant(w)));
             known_[t] = w;
+            set_scalar(t, hex(w[0]), true);
         };
-        const auto preferred = [&](unsigned n) { return std::format("{}.w[0]", R(n)); };
+        // (A preferred word read: its local, or a constant known here.)
+        const auto preferred = [&](unsigned n) {
+            preferred_read_.insert(n);
+            if (const auto k = scalar(n)) return *k;
+            return std::format("{}.w[0]", R(n));
+        };
+        // The preferred word of a result, from those of its operands, when they have them.
+        // (An operand's, or nothing, and then the next pass gives it a local if the result has one.)
+        const auto operand = [&](unsigned target, unsigned x) {
+            auto p = scalar(x);
+            if (!p && scalars_.contains(target)) wanted_.insert(x);
+            return p;
+        };
+        const auto scalar2 = [&](unsigned target, unsigned x, unsigned y, const char* form) {
+            const auto p = operand(target, x), q = operand(target, y);
+            if (p && q) set_scalar(target, std::vformat(form, std::make_format_args(*p, *q)));
+        };
+        const auto scalar_k = [&](unsigned target, unsigned x, uint32_t k, const char* form) {
+            const std::string kk = hex(k);
+            if (const auto p = operand(target, x)) set_scalar(target, std::vformat(form, std::make_format_args(*p, kk)));
+        };
+        // (A hook may change the local store: what was loaded is not known to be there after it.)
+        const auto hook = [&] { loaded_.clear(); };
         const std::string count_i = hex(i7);
         const std::string link = std::format("spu::scalar({})", hex(pc + 4));
         const auto move = [&](unsigned from) {
             const std::string x = R(from);
+            const auto p = operand(t, from);
             line(std::format("{} = {};", D(t), x));
+            if (p) set_scalar(t, *p);
         };
 
         switch (in.op) {
@@ -239,6 +314,7 @@ private:
         case Op::lqd: {
             const std::string x = preferred(a);
             line(std::format("{} = spu::load({}, {} + {});", D(t), LS(), x, hex(i10 << 4)));
+            if (t != a) loaded_[t] = {a, i10 << 4};
             return true;
         }
         case Op::lqx: {
@@ -248,10 +324,10 @@ private:
         }
         case Op::lqa: line(std::format("{} = spu::load({}, {});", D(t), LS(), hex(in.absolute()))); return true;
         case Op::lqr: line(std::format("{} = spu::load({}, {});", D(t), LS(), hex(in.relative(pc)))); return true;
-        case Op::stqd: line(std::format("spu::store({}, {} + {}, {});", LS(), preferred(a), hex(i10 << 4), R(t))); return true;
-        case Op::stqx: line(std::format("spu::store({}, {} + {}, {});", LS(), preferred(a), preferred(b), R(t))); return true;
-        case Op::stqa: line(std::format("spu::store({}, {}, {});", LS(), hex(in.absolute()), R(t))); return true;
-        case Op::stqr: line(std::format("spu::store({}, {}, {});", LS(), hex(in.relative(pc)), R(t))); return true;
+        case Op::stqd: hook(), line(std::format("spu::store({}, {} + {}, {});", LS(), preferred(a), hex(i10 << 4), R(t))); return true;
+        case Op::stqx: hook(), line(std::format("spu::store({}, {} + {}, {});", LS(), preferred(a), preferred(b), R(t))); return true;
+        case Op::stqa: hook(), line(std::format("spu::store({}, {}, {});", LS(), hex(in.absolute()), R(t))); return true;
+        case Op::stqr: hook(), line(std::format("spu::store({}, {}, {});", LS(), hex(in.relative(pc)), R(t))); return true;
         case Op::cbd: case Op::chd: case Op::cwd: case Op::cdd: {
             const unsigned size = in.op == Op::cbd ? 1 : in.op == Op::chd ? 2 : in.op == Op::cwd ? 4 : 8;
             const std::string x = preferred(a);
@@ -293,13 +369,13 @@ private:
         case Op::fsmbi: set(byte_mask(u16)); return true;
 
         // ---------------------------------------------------------------- arithmetic
-        case Op::a: rr("a"); return true;
+        case Op::a: rr("a"), scalar2(t, a, b, "{} + {}"); return true;
         case Op::ah: rr("ah"); return true;
-        case Op::sf: rr("sf"); return true;
+        case Op::sf: rr("sf"), scalar2(t, b, a, "{} - {}"); return true;
         case Op::sfh: rr("sfh"); return true;
-        case Op::ai: ri("a", splat(i10)); return true;
+        case Op::ai: ri("a", splat(i10)), scalar_k(t, a, i10, "{} + {}"); return true;
         case Op::ahi: ri("ah", splat_half(i10)); return true;
-        case Op::sfi: ri("sf", splat(i10)); return true;
+        case Op::sfi: ri("sf", splat(i10)), scalar_k(t, a, i10, "{1} - {0}"); return true;
         case Op::sfhi: ri("sfh", splat_half(i10)); return true;
         case Op::addx: case Op::sfx: case Op::cgx: case Op::bgx: {
             const char* f = in.op == Op::addx ? "addx" : in.op == Op::sfx ? "sfx" : in.op == Op::cgx ? "cgx" : "bgx";
@@ -343,25 +419,25 @@ private:
         case Op::xswd: r1("xswd"); return true;
 
         // ---------------------------------------------------------------- logic
-        case Op::and_: rr("and_"); return true;
+        case Op::and_: rr("and_"), scalar2(t, a, b, "{} & {}"); return true;
         case Op::andc: rr("andc"); return true;
-        case Op::or_: rr("or_"); return true;
+        case Op::or_: rr("or_"), scalar2(t, a, b, "{} | {}"); return true;
         case Op::orc: rr("orc"); return true;
-        case Op::xor_: rr("xor_"); return true;
+        case Op::xor_: rr("xor_"), scalar2(t, a, b, "{} ^ {}"); return true;
         case Op::nand: rr("nand"); return true;
         case Op::nor: rr("nor"); return true;
         case Op::eqv: rr("eqv"); return true;
         case Op::orx: r1("orx"); return true;
-        case Op::andi: ri("and_", splat(i10)); return true;
+        case Op::andi: ri("and_", splat(i10)), scalar_k(t, a, i10, "{} & {}"); return true;
         case Op::andhi: ri("and_", splat_half(i10)); return true;
         case Op::andbi: ri("and_", splat_byte(i10)); return true;
         case Op::ori:
             if (i10 == 0) move(a);  // (the compiler's move)
-            else ri("or_", splat(i10));
+            else ri("or_", splat(i10)), scalar_k(t, a, i10, "{} | {}");
             return true;
         case Op::orhi: ri("or_", splat_half(i10)); return true;
         case Op::orbi: ri("or_", splat_byte(i10)); return true;
-        case Op::xori: ri("xor_", splat(i10)); return true;
+        case Op::xori: ri("xor_", splat(i10)), scalar_k(t, a, i10, "{} ^ {}"); return true;
         case Op::xorhi: ri("xor_", splat_half(i10)); return true;
         case Op::xorbi: ri("xor_", splat_byte(i10)); return true;
         case Op::selb: rrr("selb"); return true;
@@ -378,7 +454,11 @@ private:
         case Op::rotma: rr("rotma"); return true;
         // (one count for every element: the helpers' immediate forms)
         case Op::shlhi: ri("shlhi", count_i); return true;
-        case Op::shli: ri("shli", count_i); return true;
+        case Op::shli:
+            ri("shli", count_i);
+            if ((i7 & 0x3fu) > 31) set_scalar(t, "0u", true);
+            else scalar_k(t, a, i7 & 0x3fu, "{} << {}");
+            return true;
         case Op::rothi: ri("rothi", count_i); return true;
         case Op::roti: ri("roti", count_i); return true;
         case Op::rothmi: ri("rothmi", count_i); return true;
@@ -389,7 +469,16 @@ private:
         case Op::shlqby: ri("shlqby", preferred(b)); return true;
         case Op::shlqbybi: ri("shlqbybi", preferred(b)); return true;
         case Op::rotqbi: ri("rotqbi", preferred(b)); return true;
-        case Op::rotqby: ri("rotqby", preferred(b)); return true;
+        case Op::rotqby: {
+            // (After `lqd x, k(b)`, with nothing stored since: the word at b + k, which is one load, not a shuffle's.)
+            const auto from = loaded_.find(a);
+            const bool fused = from != loaded_.end() && from->second.base == b;
+            const uint32_t offset = fused ? from->second.offset : 0;
+            const auto base = fused ? operand(t, b) : std::nullopt;
+            ri("rotqby", preferred(b));
+            if (fused && base) set_scalar(t, std::format("spu::word_at({}, {} + {})", LS(), *base, hex(offset)));
+            return true;
+        }
         case Op::rotqbybi: ri("rotqbybi", preferred(b)); return true;
         case Op::rotqmbi: ri("rotqmbi", preferred(b)); return true;
         case Op::rotqmby: ri("rotqmby", preferred(b)); return true;
@@ -405,22 +494,22 @@ private:
         case Op::rotqmbyi: ri("rotqmby", count_i); return true;
 
         // ---------------------------------------------------------------- compares and halts
-        case Op::ceq: rr("ceq"); return true;
+        case Op::ceq: rr("ceq"), scalar2(t, a, b, "({} == {} ? 0xFFFFFFFFu : 0u)"); return true;
         case Op::ceqh: rr("ceqh"); return true;
         case Op::ceqb: rr("ceqb"); return true;
-        case Op::cgt: rr("cgt"); return true;
+        case Op::cgt: rr("cgt"), scalar2(t, a, b, "(static_cast<int32_t>({}) > static_cast<int32_t>({}) ? 0xFFFFFFFFu : 0u)"); return true;
         case Op::cgth: rr("cgth"); return true;
         case Op::cgtb: rr("cgtb"); return true;
-        case Op::clgt: rr("clgt"); return true;
+        case Op::clgt: rr("clgt"), scalar2(t, a, b, "({} > {} ? 0xFFFFFFFFu : 0u)"); return true;
         case Op::clgth: rr("clgth"); return true;
         case Op::clgtb: rr("clgtb"); return true;
-        case Op::ceqi: ri("ceq", splat(i10)); return true;
+        case Op::ceqi: ri("ceq", splat(i10)), scalar_k(t, a, i10, "({} == {} ? 0xFFFFFFFFu : 0u)"); return true;
         case Op::ceqhi: ri("ceqh", splat_half(i10)); return true;
         case Op::ceqbi: ri("ceqb", splat_byte(i10)); return true;
-        case Op::cgti: ri("cgt", splat(i10)); return true;
+        case Op::cgti: ri("cgt", splat(i10)), scalar_k(t, a, i10, "(static_cast<int32_t>({}) > static_cast<int32_t>({}) ? 0xFFFFFFFFu : 0u)"); return true;
         case Op::cgthi: ri("cgth", splat_half(i10)); return true;
         case Op::cgtbi: ri("cgtb", splat_byte(i10)); return true;
-        case Op::clgti: ri("clgt", splat(i10)); return true;
+        case Op::clgti: ri("clgt", splat(i10)), scalar_k(t, a, i10, "({} > {} ? 0xFFFFFFFFu : 0u)"); return true;
         case Op::clgthi: ri("clgth", splat_half(i10)); return true;
         case Op::clgtbi: ri("clgtb", splat_byte(i10)); return true;
         case Op::heq: line(std::format("if ({} == {}) s.hooks->halt(s, {}, \"heq\");", preferred(a), preferred(b), hex(pc))); return true;
@@ -467,11 +556,11 @@ private:
 
         // ---------------------------------------------------------------- channels and stops
         // (The hooks but native_call don't see the registers: nothing is written back for them.)
-        case Op::rdch: line(std::format("{} = spu::scalar(s.hooks->read_channel(s, {}u, {}));", D(t), a, hex(pc))); return true;
-        case Op::rchcnt: line(std::format("{} = spu::scalar(s.hooks->channel_count(s, {}u, {}));", D(t), a, hex(pc))); return true;
-        case Op::wrch: line(std::format("s.hooks->write_channel(s, {}u, {}, {});", a, preferred(t), hex(pc))); return true;
-        case Op::stop: line(std::format("s.hooks->stop(s, {}, {});", hex(in.u14()), hex(pc))); return true;
-        case Op::stopd: line(std::format("s.hooks->stop(s, 0x00003FFFu, {});", hex(pc))); return true;
+        case Op::rdch: hook(), line(std::format("{} = spu::scalar(s.hooks->read_channel(s, {}u, {}));", D(t), a, hex(pc))); return true;
+        case Op::rchcnt: hook(), line(std::format("{} = spu::scalar(s.hooks->channel_count(s, {}u, {}));", D(t), a, hex(pc))); return true;
+        case Op::wrch: hook(), line(std::format("s.hooks->write_channel(s, {}u, {}, {});", a, preferred(t), hex(pc))); return true;
+        case Op::stop: hook(), line(std::format("s.hooks->stop(s, {}, {});", hex(in.u14()), hex(pc))); return true;
+        case Op::stopd: hook(), line(std::format("s.hooks->stop(s, 0x00003FFFu, {});", hex(pc))); return true;
         case Op::nop: case Op::lnop: case Op::sync: case Op::dsync: case Op::hbr: case Op::hbra: case Op::hbrr:
             out = std::format("    // {}\n", spu::spec(in.op).name);
             return true;
@@ -487,7 +576,8 @@ private:
             const uint32_t target = direct_target(in, pc);
             if (!cfg_->functions().contains(target)) return fail(std::format("a call to {:05X}, which is not a function", target));
             line(std::format("{} = {};{} {}(s);{}", D(t), link, kOut, spu_fn_name(target), kIn));
-            known_.clear();  // (the callee may change any register)
+            known_.clear();  // (the callee may change any register, and the local store)
+            hook();
             return true;
         }
         case Op::brz: case Op::brnz: case Op::brhz: case Op::brhnz: {
@@ -515,6 +605,7 @@ private:
             const std::string target = preferred(a);
             line(std::format("{{ const uint32_t target = {} & 0x3FFFCu; {} = {};{} call(s, target, {});{} }}", target, D(t), link, kOut, hex(pc), kIn));
             known_.clear();
+            hook();
             return true;
         }
         case Op::biz: case Op::binz: case Op::bihz: case Op::bihnz: {
@@ -533,20 +624,62 @@ private:
     std::set<uint32_t> present_, labels_;
     std::set<unsigned> used_, written_;  // the registers the function reads or writes, and those it writes
     std::map<unsigned, Words> known_;    // registers holding a known constant here, within a block
+    // The registers whose preferred word has a local of its own (`p3`), kept equal to it at every write: those whose
+    // preferred word the function reads (as the first pass found). Where an instruction's result has a preferred word
+    // that is cheaper to have from its operands' (a sum, a compare, the word a pointer points at), the local has it from
+    // them, so that an address or a branch's condition needn't wait for the vector.
+    std::set<unsigned> scalars_, preferred_read_, wanted_, given_;
+    std::set<unsigned> written_now_, scalar_now_;  // this instruction's writes, and those whose scalar it set
+    std::string extra_;                            // this instruction's statements for the scalars
+    // Registers holding a quadword an lqd loaded, by its base register (unchanged since) and offset, within a block and
+    // with nothing stored or called since.
+    struct Loaded {
+        unsigned base;
+        uint32_t offset;
+    };
+    std::map<unsigned, Loaded> loaded_;
     bool uses_ls_ = false;
     std::string error_;
 };
 
 }  // namespace
 
-SpuLifted spu_lift(const SpuCfg& cfg, const SpuFunction& f) { return Emitter(&cfg, f).run(); }
+// Passes over the function for the registers to give a local for their preferred word (the code is right after any of
+// them): first all that want one (those whose preferred word the function reads, and those whose word another's is made
+// from), then of those only the ones that some instruction gives their word without the vector's, so that the others
+// don't cost a copy at every write for nothing.
+SpuLifted spu_lift(const SpuCfg& cfg, const SpuFunction& f) {
+    std::set<unsigned> scalars;
+    SpuLifted lifted;
+    for (int pass = 0; pass < 5; ++pass) {
+        Emitter emitter(&cfg, f, scalars);
+        lifted = emitter.run();
+        if (!lifted.ok) return lifted;
+        std::set<unsigned> wanted = emitter.wanted();
+        wanted.insert(scalars.begin(), scalars.end());
+        if (wanted == scalars) break;
+        scalars = std::move(wanted);
+    }
+    for (int pass = 0; pass < 5; ++pass) {
+        Emitter emitter(&cfg, f, scalars);
+        lifted = emitter.run();
+        std::set<unsigned> kept;
+        std::ranges::set_intersection(scalars, emitter.given(), std::inserter(kept, kept.end()));
+        if (kept == scalars) return lifted;
+        scalars = std::move(kept);
+    }
+    return Emitter(&cfg, f, scalars).run();
+}
 
 std::optional<std::string> spu_lift_one(const Insn& in, uint32_t pc) {
     if (!spu_in_slice(in) || (spu::spec(in.op).flags & spu::kBranch)) return std::nullopt;
     // (No instruction but a branch looks at the program or the function.)
     static const SpuFunction no_function;
     std::string body;
-    if (!Emitter(nullptr, no_function).one(pc, in, body)) return std::nullopt;
+    Emitter first(nullptr, no_function);
+    if (!first.one(pc, in, body)) return std::nullopt;
+    body.clear();
+    if (!Emitter(nullptr, no_function, first.wanted()).one(pc, in, body)) return std::nullopt;
     return body;
 }
 

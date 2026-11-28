@@ -3,9 +3,10 @@
 // a function of its own, for qilin_spu_difftest to run against the
 // reference (ref.cpp); and 200 small random programs of two functions (a
 // loop, branches over code, a call, a conditional return, a constant split
-// by a label), lifted whole, for what the lifter does around branches and
-// calls (its registers in locals). (The switch is tested by the game's own
-// programs running.)
+// by a label, a pointer followed twice), lifted whole, for what the lifter
+// does around branches and calls (its registers in locals, and their
+// preferred words' own). (The switch is tested by the game's own programs
+// running.)
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -66,6 +67,7 @@ uint32_t ri16(uint32_t opcode, unsigned rt, uint32_t i16) { return (opcode << 23
 uint32_t ri10(uint32_t opcode, unsigned rt, unsigned ra, uint32_t i10) { return (opcode << 24) | ((i10 & 0x3ffu) << 14) | (ra << 7) | rt; }
 uint32_t branch_rt(uint32_t opcode, unsigned rt, uint32_t pc, uint32_t target) { return ri16(opcode, rt, (target - pc) >> 2); }
 uint32_t indirect(uint32_t opcode, unsigned rt, unsigned ra) { return (opcode << 21) | (ra << 7) | rt; }
+uint32_t rr(uint32_t opcode, unsigned rt, unsigned ra, unsigned rb) { return (opcode << 21) | (rb << 14) | (ra << 7) | rt; }
 
 // Registers the programs keep for themselves: the link register, the stack pointer, the loop's counter.
 constexpr unsigned kCounter = 127;
@@ -104,6 +106,16 @@ Made make_program(std::mt19937& rng) {
     w.push_back(ri16(0x081, kCounter, 1 + rng() % 3));  // il $127, 1..3
     const uint32_t loop = pc();
     block(4 + rng() % 6);
+    // A pointer followed twice (lqd, then rotqby by the same address: the lifter has the word from one load), and a
+    // compare of what it found; the branch below tests one of them, half the time.
+    const unsigned base = any(), quad = any(), word = any(), next = any(), found = any(), compared = any();
+    w.push_back(ri10(0x34, quad, base, rng() % 4 ? 0 : rng()));  // lqd quad, k(base)
+    w.push_back(rr(0x1dc, word, quad, base));                     // rotqby word, quad, base
+    w.push_back(ri10(0x1c, next, word, rng() % 4 ? 4 : rng()));   // ai next, word, 4
+    w.push_back(ri10(0x34, quad, next, 0));                       // lqd quad, 0(next)
+    w.push_back(rr(0x1dc, found, quad, next));                    // rotqby found, quad, next
+    w.push_back(rr(rng() % 2 ? 0x2c0 : 0x3c0, compared, found, any()));  // clgt or ceq
+    const unsigned tested = rng() % 2 ? (rng() % 2 ? found : compared) : any();
     const unsigned constant = any();
     w.push_back(ri16(0x082, constant, rng()));  // ilhu (before the skip: its value is known on one way in only)
     const size_t skip_at = w.size();
@@ -111,7 +123,7 @@ Made make_program(std::mt19937& rng) {
     w.push_back(ri16(0x082, constant, rng()));  // ilhu again, on the way that doesn't skip
     block(2 + rng() % 6);
     const uint32_t skip = pc();
-    w[skip_at] = branch_rt(kConditional[rng() % 4], any(), 0x3000u + 4 * static_cast<uint32_t>(skip_at), skip);
+    w[skip_at] = branch_rt(kConditional[rng() % 4], tested, 0x3000u + 4 * static_cast<uint32_t>(skip_at), skip);
     w.push_back(ri16(0x0c1, constant, rng()));  // iohl, after the label
     const size_t call_at = w.size();
     w.push_back(0);  // brsl $0 to the second function, filled in below

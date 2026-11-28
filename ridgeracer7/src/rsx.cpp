@@ -24,6 +24,7 @@
 #include <thread>
 
 #include "gcm.hpp"
+#include "rsx_state.hpp"
 #include "renderer.hpp"
 #include "video.hpp"
 #include "kernel.hpp"
@@ -40,126 +41,16 @@ struct Rsx {
     uint32_t return_to = 0;  // where a call came from, or 0: calls don't nest
     bool in_call = false;
     uint32_t label = 0;  // NV406E_SEMAPHORE_OFFSET
-    bool flip_pending = false;  // a flip has been asked for and not yet shown
-    std::array<uint32_t, 0x10000 / 4> state{};  // the last argument given to each method
     uint64_t commands = 0;
-    // The vertex programs' memory (512 instructions of four words) and their constants (468 vec4), and where the next
-    // word written to each goes.
-    std::array<uint32_t, 512 * 4> program{};
-    uint32_t program_at = 0;
-    std::array<float, 468 * 4> constants{};
-    uint32_t constant_at = 0;
-    uint64_t constants_version = 0;  // counts writes to them: the renderer reuses its copy while this is unchanged
-    // Between SET_BEGIN_END's begin and its end: the primitive, and the ranges of vertices drawn.
-    uint32_t primitive = 0;
-    struct Range {
-        uint32_t first, count;
-        bool indexed;  // DRAW_INDEX_ARRAY's: first and count are of the index array
-    };
-    std::vector<Range> ranges;
+    RsxState s;  // the methods' state, the vertex programs and constants, the ranges of a draw (rsx_state.hpp)
 };
 Rsx r;
-
-// The RSX's state: methods that only set something, which is kept until a method that acts reads it.
-// Each entry is a run of methods (4 apart) by the name the graphics chip's public documentation gives
-// the first. A method in none of these runs, and not one of those that act (run_method), stops the game.
-struct StateMethods {
-    uint16_t first, count;
-    const char* name;
-};
-constexpr StateMethods kState[] = {
-    {0x0180, 1, "SET_CONTEXT_DMA_NOTIFIES"},
-    {0x0184, 14, "SET_CONTEXT_DMA_A"},  // ... B, COLOR_B, STATE, COLOR_A, ZETA, VERTEX_A, VERTEX_B, SEMAPHORE, REPORT, CLIP_ID, CULL_DATA, COLOR_C, COLOR_D
-    {0x0200, 9, "SET_SURFACE_CLIP_HORIZONTAL"},  // ... CLIP_VERTICAL, FORMAT, PITCH_A, COLOR_AOFFSET, ZETA_OFFSET, COLOR_BOFFSET, PITCH_B, COLOR_TARGET
-    {0x022c, 1, "SET_SURFACE_PITCH_Z"},
-    {0x0238, 2, "SET_CYLINDRICAL_WRAP"},
-    {0x0280, 4, "SET_SURFACE_PITCH_C"},  // ... PITCH_D, COLOR_COFFSET, COLOR_DOFFSET
-    {0x02b8, 2, "SET_WINDOW_OFFSET"},    // ... WINDOW_CLIP_TYPE
-    {0x02c0, 16, "SET_WINDOW_CLIP_HORIZONTAL"},
-    {0x0300, 1, "SET_DITHER_ENABLE"},
-    {0x0304, 26, "SET_ALPHA_TEST_ENABLE"},  // alpha, blend, colour mask, stencil front and back, shade mode
-    {0x036c, 8, "SET_BLEND_ENABLE_MRT"},    // ... COLOR_MASK_MRT, LOGIC_OP_ENABLE, LOGIC_OP, BLEND_COLOR2, DEPTH_BOUNDS_TEST_ENABLE, DEPTH_BOUNDS_MIN, MAX
-    {0x0394, 2, "SET_CLIP_MIN"},
-    {0x03b0, 1, "SET_CONTROL0"},
-    {0x03b8, 2, "SET_LINE_WIDTH"},  // ... LINE_SMOOTH_ENABLE
-    {0x03c0, 16, "SET_ANISO_SPREAD"},
-    {0x08c0, 2, "SET_SCISSOR_HORIZONTAL"},
-    {0x08cc, 3, "SET_FOG_MODE"},  // ... FOG_PARAMS (2)
-    {0x08e4, 1, "SET_SHADER_PROGRAM"},
-    {0x0900, 32, "SET_VERTEX_TEXTURE_OFFSET"},  // four vertex textures of eight methods
-    {0x0a00, 2, "SET_VIEWPORT_HORIZONTAL"},
-    {0x0a0c, 1, "SET_POINT_CENTER_MODE"},
-    {0x0a1c, 1, "ZCULL_SYNC"},
-    {0x0a20, 8, "SET_VIEWPORT_OFFSET"},  // ... (4), VIEWPORT_SCALE (4)
-    {0x0a60, 8, "SET_POLY_OFFSET_POINT_ENABLE"},  // ... LINE, FILL, DEPTH_FUNC, DEPTH_MASK, DEPTH_TEST_ENABLE, POLYGON_OFFSET_SCALE_FACTOR, BIAS
-    {0x0b00, 16, "SET_TEXTURE_CONTROL2"},
-    {0x0b40, 10, "SET_TEX_COORD_CONTROL"},
-    {0x1428, 2, "SET_SPECULAR_ENABLE"},  // ... TWO_SIDE_LIGHT_EN
-    {0x143c, 1, "SET_PERFORMANCE_PARAMS"},
-    {0x1450, 2, "SET_FLAT_SHADE_OP"},  // ... EDGE_FLAG
-    {0x1478, 2, "SET_USER_CLIP_PLANE_CONTROL"},  // ... POLYGON_STIPPLE
-    {0x1480, 32, "SET_POLYGON_STIPPLE_PATTERN"},
-    {0x1680, 16, "SET_VERTEX_DATA_ARRAY_OFFSET"},
-    {0x1738, 2, "SET_VERTEX_DATA_BASE_OFFSET"},  // ... BASE_INDEX
-    {0x1740, 16, "SET_VERTEX_DATA_ARRAY_FORMAT"},
-    {0x17cc, 1, "SET_ZPASS_PIXEL_COUNT_ENABLE"},
-    {0x1804, 1, "SET_ZCULL_STATS_ENABLE"},
-    {0x181c, 2, "SET_INDEX_ARRAY_ADDRESS"},  // ... INDEX_ARRAY_DMA
-    {0x1828, 6, "SET_FRONT_POLYGON_MODE"},   // ... BACK_POLYGON_MODE, CULL_FACE, FRONT_FACE, POLY_SMOOTH_ENABLE, CULL_FACE_ENABLE
-    {0x1840, 16, "SET_TEXTURE_CONTROL3"},
-    {0x1a00, 128, "SET_TEXTURE_OFFSET"},  // sixteen textures of eight methods
-    {0x1d00, 16, "SET_COLOR_KEY_COLOR"},
-    {0x1d60, 2, "SET_SHADER_CONTROL"},  // ... INDEXED_CONSTANT_READ_LIMITS
-    {0x1d6c, 1, "SET_SEMAPHORE_OFFSET"},
-    {0x1d78, 7, "SET_ZMIN_MAX_CONTROL"},  // ... ANTI_ALIASING_CONTROL, SURFACE_COMPRESSION, ZCULL_EN, SHADER_WINDOW, ZSTENCIL_CLEAR_VALUE, COLOR_CLEAR_VALUE
-    {0x1d98, 2, "SET_CLEAR_RECT_HORIZONTAL"},
-    {0x1da4, 1, "SET_CLIP_ID_TEST_ENABLE"},
-    {0x1dac, 4, "SET_RESTART_INDEX_ENABLE"},  // ... RESTART_INDEX, LINE_STIPPLE, LINE_STIPPLE_PATTERN
-    {0x1e94, 2, "SET_TRANSFORM_EXECUTION_MODE"},  // ... RENDER_ENABLE
-    {0x1ea0, 4, "SET_TRANSFORM_PROGRAM_START"},   // ... ZCULL_CONTROL0, ZCULL_CONTROL1, SCULL_CONTROL
-    {0x1ee0, 3, "SET_POINT_SIZE"},                // ... POINT_PARAMS_ENABLE, POINT_SPRITE_CONTROL
-    {0x1ef8, 1, "SET_TRANSFORM_TIMEOUT"},
-    {0x1fc0, 6, "SET_FREQUENCY_DIVIDER_OPERATION"},  // ... ATTRIB_COLOR, ATTRIB_TEX_COORD, ATTRIB_TEX_COORD_EX, ATTRIB_UCLIP0, ATTRIB_UCLIP1
-    {0x1fe0, 1, "SET_REDUCE_DST_COLOR"},
-    {0x1fe8, 5, "SET_NO_PARANOID_TEXTURE_FETCHES"},  // ... SHADER_PACKER, VERTEX_ATTRIB_INPUT_MASK, VERTEX_ATTRIB_OUTPUT_MASK, TRANSFORM_BRANCH_BITS
-    // The 2D objects the game's library puts on subchannels 3 and 5 (its command headers say so: 0x6xxx and 0xaxxx), as
-    // PSL1GHT's headers name their methods. Subchannel 3: the 2D surface (NV3062) a blit writes to.
-    {0x6000, 1, "NV3062 SET_OBJECT"},
-    {0x6180, 3, "NV3062 SET_CONTEXT_DMA_NOTIFIES"},  // ... IMAGE_SOURCE, IMAGE_DESTIN
-    {0x6300, 4, "NV3062 SET_COLOR_FORMAT"},          // ... SET_PITCH (destination << 16 | source), SET_OFFSET_SOURCE, SET_OFFSET_DESTIN
-    // Subchannel 5: the image from the CPU (NV308A), whose COLOR words (0xa400 on) are written to the 2D surface.
-    {0xa000, 1, "NV308A SET_OBJECT"},
-    {0xa180, 8, "NV308A SET_CONTEXT_DMA_NOTIFIES"},  // ... COLOR_KEY, CLIP_RECTANGLE, PATTERN, ROP, BETA1, BETA4, SURFACE
-    {0xa2fc, 4, "NV308A SET_OPERATION"},             // ... SET_COLOR_FORMAT, POINT, SIZE_OUT
-    {0xa30c, 1, "NV308A SIZE_IN"},
-};
-
-// The table as a bit a method, made when the program is compiled: every command word asks.
-constexpr auto kStateBits = [] {
-    std::array<uint64_t, 0x10000 / 4 / 64> bits{};
-    for (const StateMethods& m : kState)
-        for (uint32_t i = 0; i < m.count; ++i) {
-            const uint32_t word = (m.first + 4u * i) / 4;
-            bits[word / 64] |= uint64_t{1} << (word % 64);
-        }
-    return bits;
-}();
-constexpr bool is_state(uint32_t method) { return method < 0x10000 && ((kStateBits[method / 4 / 64] >> (method / 4 % 64)) & 1) != 0; }
-// (Every run's ends are in, and methods that act are not.)
-static_assert([] {
-    for (const StateMethods& m : kState)
-        if (!is_state(m.first) || !is_state(m.first + 4u * (m.count - 1u))) return false;
-    for (const uint32_t acting : {0x0050u, 0x0064u, 0x0068u, 0x006cu, 0x0100u, 0x1808u, 0x1814u, 0x1824u, 0x1d70u, 0x1d74u, 0x1d94u, 0x1e9cu, 0x1efcu, 0xa400u, 0x10000u})
-        if (is_state(acting)) return false;
-    return true;
-}());
 
 // A development aid, never a way to play: with RR7_RSX_SURVEY set in the environment, methods not yet
 // provided are counted, not run, and at the first flip (or after ten seconds) the list is printed and
 // the process stops. It shows the work ahead at once and not one stop at a time.
 bool g_survey = false;
 uint64_t g_flip_shown_at = 0;  // the vertical blank the last flip is shown at (modes 2 and 3): the RSX's thread only
-bool g_trace = false;  // RR7_RSX_TRACE: every method and its argument, logged
 struct Surveyed {
     uint64_t count = 0;
     uint32_t first = 0;
@@ -176,28 +67,17 @@ std::chrono::steady_clock::time_point g_survey_ends;
 // object elsewhere, SET_CONTEXT_DMA_SEMAPHORE; anything but the labels stops the game.)
 uint32_t label_address(uint32_t offset, uint32_t at) {
     constexpr uint32_t kLabelsObject = 0x66616661u, kLabelsSize = 256 * 16;
-    if (const uint32_t object = r.state[0x01a4 / 4]; object != 0 && object != kLabelsObject)
+    if (const uint32_t object = r.s[0x01a4]; object != 0 && object != kLabelsObject)
         fatal("the RSX is to write a label through object %08x, which isn't the labels (at offset %08x)", object, at);
     if (offset > kLabelsSize - 4 || (offset & 3)) fatal("the RSX is to write a label at offset %#x, outside the labels (at offset %08x)", offset, at);
     return rsx_setup().labels + offset;
 }
 
-// An address in guest memory from an offset and the RSX's location for it: 0 its own memory, 1 the mapped main memory.
-uint32_t guest_address(uint32_t location, uint32_t offset, const char* what) {
-    if (location == 0) return kRsxLocal + offset;
-    const uint32_t address = rsx_io_address(offset);
-    if (!address) fatal("the RSX is to find %s at offset %08x of main memory, where nothing is mapped", what, offset);
-    return address;
-}
+// Guest memory as the RSX reads it.
+GuestView guest() { return {guest_memory(), rsx_io_address}; }
+uint32_t guest_address(uint32_t location, uint32_t offset, const char* what) { return rr7::guest_address(guest(), location, offset, what); }
 
-// A surface's memory, by its context object: SET_CONTEXT_DMA_COLOR_A's 0xFEED0000 is the RSX's memory, 0xFEED0001 the mapped main memory.
-uint32_t surface_location(uint32_t object) {
-    if (object == 0xFEED0000u) return 0;
-    if (object == 0xFEED0001u) return 1;
-    fatal("a surface in context object %08x, which this runtime doesn't know", object);
-}
-
-uint32_t state(uint32_t method) { return r.state[method / 4]; }
+uint32_t state(uint32_t method) { return r.s[method]; }
 
 // A development aid: RR7_DRAWLOG=<n> logs every draw, clear and flip of the frame after the nth flip, in one line each;
 // RR7_DRAWLOG=busy, the frame after the first with more than 300 draws, some to a surface in main memory (a race's scene).
@@ -210,194 +90,11 @@ bool draw_logged() {
     if (asked && std::strcmp(asked, "busy") == 0) return g_busy_frame && g_flips == g_busy_frame;
     return which && g_flips == which;
 }
-float state_float(uint32_t method) { return std::bit_cast<float>(r.state[method / 4]); }
 
 // One draw of vertices [first, first + count), with the state the methods have left.
 void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) {
     static Draw d;  // (one, reused: only the RSX's thread draws)
-    d.reset();
-    // The colour surface: only surface A, linear, not antialiased, in this first renderer.
-    const uint32_t format = state(0x0208);
-    if (((format >> 8) & 0xf) != 1) fatal("a draw to a surface of type %u (not linear), which the renderer doesn't take yet (at offset %08x)", (format >> 8) & 0xf, at);
-    if ((format >> 12) & 0xf) fatal("a draw to an antialiased surface, which the renderer doesn't take yet (at offset %08x)", at);
-    if (state(0x0220) != 1) fatal("a draw to colour targets %#x (only surface A is taken yet) (at offset %08x)", state(0x0220), at);
-    d.color.format = format & 0x1f;
-    d.color.pitch = state(0x020c);
-    d.color.address = guest_address(surface_location(state(0x0194)), state(0x0210), "a colour surface");
-    d.color.width = state(0x0200) >> 16, d.color.height = state(0x0204) >> 16;
-    if ((state(0x0200) & 0xffff) || (state(0x0204) & 0xffff)) fatal("a surface whose clip doesn't start at 0, 0 (at offset %08x)", at);
-    // The window offset (SET_WINDOW_OFFSET: x in the low half, y in the high: *a stated reading*, as the RSX's other pairs).
-    d.window_offset_x = state(0x02b8) & 0xffff, d.window_offset_y = state(0x02b8) >> 16;
-    d.color_mask = state(0x0324);
-    // What the first renderer doesn't take: said by name.
-    if (state(0x0a74)) {
-        d.depth_test = true;
-        d.depth_func = state(0x0a6c), d.depth_write = state(0x0a70) != 0;
-        if (d.depth_func < 0x200 || d.depth_func > 0x207) fatal("a depth test with function %#x (at offset %08x)", d.depth_func, at);
-    }
-    // The depth bounds test (SET_DEPTH_BOUNDS_TEST_ENABLE, DEPTH_BOUNDS_MIN, MAX: floats) reads the depth surface too.
-    if (state(0x0380)) d.depth_bounds = true, d.bounds_min = state_float(0x0384), d.bounds_max = state_float(0x0388);
-    if (d.depth_test || state(0x0328) || d.depth_bounds) {
-        d.depth_surface = true;
-        const uint32_t depth_format = (format >> 5) & 7;  // 1 Z16, 2 Z24S8
-        if (depth_format != 2) fatal("a depth test on a depth surface of format %u, which the renderer doesn't take yet (at offset %08x)", depth_format, at);
-        d.depth.format = depth_format, d.depth.pitch = state(0x022c);
-        d.depth.address = guest_address(surface_location(state(0x0198)), state(0x0214), "a depth surface");
-        d.depth.width = state(0x0200) >> 16, d.depth.height = state(0x0204) >> 16;
-    }
-    // Polygon offset (SET_POLY_OFFSET_POINT_ENABLE, LINE, FILL, SCALE_FACTOR, BIAS): Vulkan's depth bias, the slope factor and the
-    // constant, for polygons drawn in a mode whose enable is on (render_state.hpp). *With D32S8 a unit of bias follows the depth's
-    // exponent rather than 2^-24: a stated difference.*
-    d.offset_point = state(0x0a60) != 0, d.offset_line = state(0x0a64) != 0, d.offset_fill = state(0x0a68) != 0;
-    d.bias_factor = state_float(0x0a78), d.bias_units = state_float(0x0a7c);
-    // Polygons' modes (SET_FRONT_POLYGON_MODE, BACK_POLYGON_MODE) and the edge flag (SET_EDGE_FLAG), which a polygon drawn as lines
-    // needs on.
-    d.front_polygon_mode = state(0x1828), d.back_polygon_mode = state(0x182c), d.edge_flag = state(0x1454) != 0;
-    // The stencil test (NV30/40's: Mesa's nv30-40_3d.xml.h): 0x328 on, 0x32c write mask, 0x330 function, 0x334 reference,
-    // 0x338 function mask, 0x33c/0x340/0x344 the operations on failing, the depth test failing, passing; the back faces' at
-    // 0x348 on (two-sided) to 0x364.
-    if (state(0x0328)) {
-        const auto side = [&](uint32_t base) {
-            Draw::Stencil st;
-            st.write_mask = state(base + 4) & 0xff, st.func = state(base + 8), st.ref = state(base + 12) & 0xff, st.func_mask = state(base + 16) & 0xff;
-            st.fail = state(base + 20), st.zfail = state(base + 24), st.zpass = state(base + 28);
-            if (st.func < 0x200 || st.func > 0x207) fatal("a stencil test with function %#x (at offset %08x)", st.func, at);
-            return st;
-        };
-        d.stencil_test = true;
-        d.stencil_front = side(0x0328);
-        d.stencil_back = state(0x0348) ? side(0x0348) : d.stencil_front;
-    }
-    // Flat shading (SET_SHADE_MODE: OpenGL's FLAT 0x1D00, SMOOTH 0x1D01, 0 as the system leaves it), with the provoking vertex
-    // SET_FLAT_SHADE_OP gives: 0 a primitive's last, OpenGL's convention, 1 its first (*a stated reading*: NV40's FLATSHADE_FIRST,
-    // as Mesa's driver names the method).
-    if (const uint32_t shade = state(0x0368); shade == 0x1d00) {
-        d.flat = true;
-        const uint32_t op = state(0x1450);
-        if (op > 1) fatal("a draw with flat shading by %#x (SET_FLAT_SHADE_OP), which the renderer doesn't know (at offset %08x)", op, at);
-        d.flat_first = op == 1;
-    } else if (shade != 0 && shade != 0x1d01) {
-        fatal("a draw with shade mode %#x, which the renderer doesn't know (at offset %08x)", shade, at);
-    }
-    // A logic operation (SET_LOGIC_OP_ENABLE, SET_LOGIC_OP: OpenGL's), which replaces blending.
-    if (state(0x0374)) d.logic = true, d.logic_op = state(0x0378);
-    // State this renderer doesn't take, refused by name rather than ignored: polygon stipple (Vulkan has none).
-    // Two-sided colours (SET_TWO_SIDE_LIGHT_EN): on back faces the vertex program's back colours.
-    d.two_sided = state(0x142c) != 0;
-    // User clip planes (SET_USER_CLIP_PLANE_CONTROL: a plane's test in each of the low six nibbles, 0 off, 1 LT, 2 GE).
-    d.clip_planes = state(0x1478);
-    for (unsigned n = 0; n < 8; ++n)
-        if (const uint32_t test = (d.clip_planes >> (4 * n)) & 0xf; test > 2 || (n >= 6 && test))
-            fatal("a draw with user clip plane %u's test %u, which the renderer doesn't know (at offset %08x)", n, test, at);
-    if (state(0x147c)) fatal("a draw with polygon stipple, which the renderer doesn't take yet (at offset %08x)", at);
-    // Line stipple (SET_LINE_STIPPLE): refused by the renderer where lines are drawn (Vulkan 1.3 has none either).
-    d.line_stipple = state(0x1db4) != 0;
-    // The alpha test (SET_ALPHA_FUNC: OpenGL's NEVER 0x200 to ALWAYS 0x207, bit 0 less, bit 1 equal, bit 2 greater; SET_ALPHA_REF):
-    // on 8-bit surfaces the reference's low byte against the alpha as stored. *Its reference on a float surface isn't known here.*
-    if (state(0x0304)) {
-        const uint32_t function = state(0x0308);
-        if (function < 0x200 || function > 0x207) fatal("an alpha test with function %#x (at offset %08x)", function, at);
-        if (d.color.format != 8) fatal("an alpha test on a surface of format %u, which the renderer doesn't take yet (at offset %08x)", d.color.format, at);
-        d.alpha_test = {static_cast<float>(state(0x030c) & 0xff), 255.0f, 0, 0, float(function & 1), float((function >> 1) & 1), float((function >> 2) & 1), 0};
-    }
-    if (state(0x173c)) fatal("a draw with a base vertex index, which the renderer doesn't take yet (at offset %08x)", at);
-    d.primitive = r.primitive, d.first = first, d.count = count;
-    if (indexed) {
-        // The indices (SET_INDEX_ARRAY_ADDRESS, and INDEX_ARRAY_DMA: location in bit 0, type in bits 4 to 7, 0 32-bit and 1
-        // 16-bit), big-endian, from `first`: the vertices fetched are the range they use, and the indices rebased to it.
-        const uint32_t dma = state(0x1820), type = (dma >> 4) & 0xf;
-        if (type > 1 || (dma & ~0xf1u)) fatal("an index array of format %08x, which the renderer doesn't take yet (at offset %08x)", dma, at);
-        // Primitive restart (SET_RESTART_INDEX_ENABLE, RESTART_INDEX): the index that ends a primitive and starts the next,
-        // marked in the list as kRestart for the renderer.
-        const bool restart = state(0x1dac) != 0;
-        const uint32_t restart_index = state(0x1db0);
-        const uint32_t size = type ? 2 : 4;
-        const uint32_t base = guest_address(dma & 1, state(0x181c), "an index array") + first * size;
-        uint32_t lowest = UINT32_MAX, highest = 0;
-        d.indices.resize(count);
-        for (uint32_t i = 0; i < count; ++i) {
-            const uint32_t v = size == 2 ? (uint32_t{guest_memory()[base + 2 * i]} << 8 | guest_memory()[base + 2 * i + 1]) : load32(base + 4 * i);
-            if (restart && v == restart_index) {
-                d.indices[i] = kRestart;
-                continue;
-            }
-            d.indices[i] = v, lowest = std::min(lowest, v), highest = std::max(highest, v);
-        }
-        if (lowest > highest) return;  // (nothing but restarts)
-        for (uint32_t& v : d.indices)
-            if (v != kRestart) v -= lowest;
-        d.first = lowest, d.count = highest - lowest + 1;
-        d.indexed = true;
-    }
-    for (uint32_t a = 0; a < 16; ++a) {
-        d.attribute_format[a] = state(0x1740 + 4 * a);
-        if (((d.attribute_format[a] >> 4) & 0xf) == 0) continue;
-        const uint32_t offset = state(0x1680 + 4 * a);
-        d.attribute_address[a] = guest_address(offset >> 31, (offset & 0x7fffffffu) + state(0x1738), "a vertex array");
-    }
-    d.vertex_constants = r.constants.data(), d.constants_version = r.constants_version;
-    // The vertex program: from its start to the instruction marked last, as big-endian bytes.
-    {
-        const uint32_t start = state(0x1ea0);
-        if (start >= 512) fatal("a vertex program started at slot %u, past the 512", start);
-        uint32_t last = start;
-        while (last < 512 && !(r.program[4 * last + 3] & 1)) ++last;
-        if (last == 512) fatal("the vertex program from slot %u has no last instruction", start);
-        d.vertex_program.resize(size_t{last - start + 1} * 16);
-        for (size_t w = 0; w < d.vertex_program.size() / 4; ++w) {
-            const uint32_t big = std::byteswap(r.program[4 * start + w]);
-            std::memcpy(d.vertex_program.data() + 4 * w, &big, 4);
-        }
-    }
-    // The fragment program: from its address to the instruction marked as the end, with its inline constants.
-    {
-        const uint32_t program = state(0x08e4);
-        const uint32_t location = program & 3;
-        if (location != 1 && location != 2) fatal("a fragment program in location %u (at offset %08x)", location, at);
-        const uint32_t address = guest_address(location == 1 ? 0 : 1, program & ~3u, "a fragment program");
-        for (uint32_t offset = 0;; ) {
-            const uint8_t* p = guest_memory() + address + offset;
-            const auto word = [&](unsigned i) {
-                const uint32_t w = (uint32_t{p[4 * i]} << 24) | (uint32_t{p[4 * i + 1]} << 16) | (uint32_t{p[4 * i + 2]} << 8) | p[4 * i + 3];
-                return (w << 16) | (w >> 16);
-            };
-            const bool end = word(0) & 1, branch = word(2) >> 31;
-            const bool constant = !branch && ((word(1) & 3) == 2 || (word(2) & 3) == 2 || (word(3) & 3) == 2);
-            const uint32_t size = constant ? 32 : 16;
-            d.fragment_program.insert(d.fragment_program.end(), p, p + size);
-            offset += size;
-            if (end) break;
-            if (offset > 0x10000) fatal("the fragment program at %08x has no end in 64 KiB", address);
-        }
-    }
-    // The viewport and the window.
-    for (unsigned i = 0; i < 4; ++i) d.viewport_offset[i] = state_float(0x0a20 + 4 * i), d.viewport_scale[i] = state_float(0x0a30 + 4 * i);
-    d.clip_x = state(0x0a00) & 0xffff, d.clip_width = state(0x0a00) >> 16, d.clip_y = state(0x0a04) & 0xffff, d.clip_height = state(0x0a04) >> 16;
-    const uint32_t window = state(0x1d88);
-    d.window_height = window & 0xfff;
-    // The window's origin field (bits 12 to 15): 1 has window y counting down from the top row. *A reading from evidence:
-    // PSL1GHT always writes 1 with a negative y scale and its samples draw upright, and this game does the same (its logo
-    // came out upside down when 1 was taken as the bottom).* What 0 does isn't known here.
-    const uint32_t origin = (window >> 12) & 0xf;
-    if (origin != 1) fatal("a window with origin field %u, which the renderer doesn't take yet (at offset %08x)", origin, at);
-    d.origin_bottom = false;
-    if ((window >> 16) & 0xf) fatal("a window whose pixel centres are on whole numbers, which the renderer doesn't take yet (at offset %08x)", at);
-    d.scissor_x = state(0x08c0) & 0xffff, d.scissor_width = state(0x08c0) >> 16, d.scissor_y = state(0x08c4) & 0xffff, d.scissor_height = state(0x08c4) >> 16;
-    d.blend = state(0x0310) != 0;
-    d.blend_src = state(0x0314), d.blend_dst = state(0x0318), d.blend_equation = state(0x0320);
-    d.cull = state(0x183c) != 0;
-    // The texture units: their state, and where an enabled one's texels are (the format word's location: 1 the RSX's memory, 2 main memory).
-    for (uint32_t u = 0; u < 16; ++u) {
-        TextureUnit& t = d.textures[u];
-        const uint32_t base = 0x1a00 + 32 * u;
-        t.offset = state(base), t.format = state(base + 4), t.wrap = state(base + 8), t.control0 = state(base + 0xc);
-        t.remap = state(base + 0x10), t.filter = state(base + 0x14), t.rect = state(base + 0x18), t.border = state(base + 0x1c);
-        t.control3 = state(0x1840 + 4 * u);
-        // (Units the program doesn't sample may be enabled with no texture at all: the renderer checks those it reads.)
-        const uint32_t location = t.format & 3;
-        if (t.enabled() && (location == 1 || location == 2)) t.address = guest_address(location == 1 ? 0 : 1, t.offset, "a texture");
-    }
-    d.cull_face = state(0x1830), d.front_face = state(0x1834);
+    if (!gather_draw(r.s, guest(), first, count, indexed, at, d)) return;
     // A development aid, never a way to play: RR7_SCENE_TEST=1 draws to main-memory surfaces (a race's scene) with no depth
     // test, culling or alpha test, to tell a fragment test's fault from the geometry's.
     // (RR7_SCENE_TEST=depth: only the depth test.)
@@ -622,27 +319,9 @@ std::string words_at(uint32_t offset, unsigned count) {
     return out;
 }
 
-// One method with one argument.
-void run_method(uint32_t method, uint32_t argument, uint32_t at) {
-    if (is_state(method)) {
-        r.state[method / 4] = argument;
-        return;
-    }
-    if (method >= 0xa400 && method < 0xa600) {  // NV308A COLOR: an inline transfer's words
-        inline_word((method - 0xa400) / 4, argument, at);
-        return;
-    }
-    if (method >= 0x0b80 && method < 0x0c00) {  // SET_TRANSFORM_PROGRAM: a word of a vertex program
-        if (r.program_at >= r.program.size()) fatal("a vertex program written past its 512 instructions (at offset %08x)", at);
-        r.program[r.program_at++] = argument;
-        return;
-    }
-    if (method >= 0x1f00 && method < 0x1f80) {  // SET_TRANSFORM_CONSTANT: a word of the constants
-        if (r.constant_at >= r.constants.size()) fatal("vertex constants written past the 468 (at offset %08x)", at);
-        r.constants[r.constant_at++] = std::bit_cast<float>(argument);
-        ++r.constants_version;
-        return;
-    }
+// A method that acts, or one not provided (rsx_state.hpp's run_method has the state methods, the vertex programs and
+// constants, and SET_BEGIN_END's ranges).
+void act(uint32_t method, uint32_t argument, uint32_t at) {
     switch (method) {
     // (Before every label, reference or wait, everything drawn so far is written back to guest memory: renderer.hpp.)
     case 0x0050:  // NV406E_SET_REFERENCE: the game's own mark of how far the RSX has got, readable beside put and get
@@ -667,11 +346,11 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     case 0x1d70:  // BACK_END_WRITE_SEMAPHORE_RELEASE: write the label at SET_SEMAPHORE_OFFSET once everything drawn so far is in the surface.
         renderer_flush("a back-end semaphore");
         // The chip writes the argument's red and blue bytes exchanged (the game's library exchanges them first, so the label reads as meant).
-        store32(label_address(r.state[0x1d6c / 4], at), (argument & 0xff00ff00u) | ((argument & 0xff) << 16) | ((argument >> 16) & 0xff));
+        store32(label_address(state(0x1d6c), at), (argument & 0xff00ff00u) | ((argument & 0xff) << 16) | ((argument >> 16) & 0xff));
         return;
     case 0x1d74:  // TEXTURE_READ_SEMAPHORE_RELEASE: the same label, as given, once every texture read so far is done
         renderer_flush("a texture-read semaphore");
-        store32(label_address(r.state[0x1d6c / 4], at), argument);
+        store32(label_address(state(0x1d6c), at), argument);
         return;
     case kMethodWaitFlip:  // (the runtime's own) wait until the last flip has been shown
         if (g_flip_shown_at) wait_for_vertical_blank(g_flip_shown_at);
@@ -690,38 +369,12 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
         }
         flip(argument, at);
         return;
-    // Vertex programs and their constants: uploaded a word at a time from where the load methods point.
-    case 0x1e9c:  // SET_TRANSFORM_PROGRAM_LOAD: the instruction slot the next words go to
-        if (argument >= 512) fatal("a vertex program loaded at slot %u, past the 512 (at offset %08x)", argument, at);
-        r.program_at = argument * 4;
-        return;
-    case 0x1efc:  // SET_TRANSFORM_CONSTANT_LOAD: the constant the next words go to
-        if (argument >= 468) fatal("vertex constants loaded at %u, past the 468 (at offset %08x)", argument, at);
-        r.constant_at = argument * 4;
-        return;
     case 0x1710:  // INVALIDATE_VERTEX_CACHE_FILE
     case 0x1714:  // INVALIDATE_VERTEX_FILE: the RSX's caches of vertices; this one reads guest memory at each draw
         return;
     case 0x1fd8:  // the texture cache's control (PSL1GHT's TEX_CACHE_CTL): 1 invalidates the fragment programs' textures, 2 the
                   // vertex programs'. Here textures are checked against guest memory once a batch (renderer.cpp: why that is enough).
         if (argument != 1 && argument != 2) qilin::rt::fatal("the RSX's texture cache is given %08x", argument);
-        return;
-    case 0x1808:  // SET_BEGIN_END: a primitive's start (its kind), or 0 for its end, when the ranges since are drawn
-        if (argument) {
-            r.primitive = argument;
-            r.ranges.clear();
-        } else {
-            for (const Rsx::Range& range : r.ranges) draw(range.first, range.count, range.indexed, at);
-            r.ranges.clear();
-        }
-        return;
-    case 0x1824:  // DRAW_INDEX_ARRAY: indices [first, first + count) of the index array, count - 1 in the top byte
-        if (!r.primitive) fatal("DRAW_INDEX_ARRAY outside SET_BEGIN_END (at offset %08x)", at);
-        r.ranges.push_back({argument & 0xffffffu, (argument >> 24) + 1, true});
-        return;
-    case 0x1814:  // DRAW_ARRAYS: vertices [first, first + count) of the arrays, count - 1 in the top byte
-        if (!r.primitive) fatal("DRAW_ARRAYS outside SET_BEGIN_END (at offset %08x)", at);
-        r.ranges.push_back({argument & 0xffffffu, (argument >> 24) + 1, false});
         return;
     default:
         if (g_survey) {
@@ -737,23 +390,32 @@ void run_method(uint32_t method, uint32_t argument, uint32_t at) {
     }
 }
 
+// What run_command hands back to this thread.
+struct Acts {
+    bool trace = false;  // RR7_RSX_TRACE
+    void draw(uint32_t first, uint32_t count, bool indexed, uint32_t at) { rr7::draw(first, count, indexed, at); }
+    void inline_word(uint32_t index, uint32_t word, uint32_t at) { rr7::inline_word(index, word, at); }
+    void method(uint32_t method, uint32_t argument, uint32_t at) { act(method, argument, at); }
+};
+
 void serve() {
     const uint32_t control = rsx_setup().control;
     r.get = load32(control + 4);
     // The state the system's start-up leaves, which the game relies on without setting: the depth surface in the RSX's own
     // memory. *A stated choice: the game sets its other surfaces' context objects (colour B to D in the RSX's memory) but
     // never the depth surface's, whose offset fits the RSX's memory.*
-    r.state[0x0198 / 4] = 0xFEED0000u;
+    r.s.state[0x0198 / 4] = 0xFEED0000u;
     // Likewise the 2D surface's (subchannel 3) source and destination: the game sets neither and its offsets fit the RSX's
     // memory (*a stated choice, as the depth surface's*).
-    r.state[0x6184 / 4] = r.state[0x6188 / 4] = 0xFEED0000u;
+    r.s.state[0x6184 / 4] = r.s.state[0x6188 / 4] = 0xFEED0000u;
     // And the clear's rectangle (SET_CLEAR_RECT_HORIZONTAL, VERTICAL: origin and size) covering everything: the game never
     // sets it and clears with it, so the system's start-up must (*a stated choice*: 0 to 4095 each way, clipped to the surface).
-    r.state[0x1d98 / 4] = r.state[0x1d9c / 4] = 0x0fff0000u;
+    r.s.state[0x1d98 / 4] = r.s.state[0x1d9c / 4] = 0x0fff0000u;
     // And the edge flag (SET_EDGE_FLAG) on, as OpenGL starts it (*a stated choice*: what the system leaves isn't known here).
-    r.state[0x1454 / 4] = 1;
+    r.s.state[0x1454 / 4] = 1;
     g_survey = std::getenv("RR7_RSX_SURVEY") != nullptr;
-    g_trace = std::getenv("RR7_RSX_TRACE") != nullptr;
+    Acts acts;
+    acts.trace = std::getenv("RR7_RSX_TRACE") != nullptr;
     g_survey_ends = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     uint32_t idle = 0;
     bool after_transfer = false;  // the last command was a jump, call or return
@@ -831,10 +493,7 @@ void serve() {
             transferred = false;
             const uint32_t count = (header >> 18) & 0x7ff, method = header & 0xfffc;
             const bool same = (header & 0x40000000u) != 0;  // every argument to the one method
-            for (uint32_t i = 0; i < count; ++i) {
-                if (g_trace) qilin::rt::log("(rsx) %08x: %04x = %08x", r.get, same ? method : method + 4 * i, load32(address + 4 + 4 * i));
-                run_method(same ? method : method + 4 * i, load32(address + 4 + 4 * i), r.get);
-            }
+            run_command(r.s, method, count, same, guest_memory() + address + 4, r.get, acts);
             next = r.get + 4 + 4 * count;
             ++r.commands;
         }

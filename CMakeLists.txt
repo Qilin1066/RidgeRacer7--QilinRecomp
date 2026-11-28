@@ -300,6 +300,7 @@ add_library(ridgeracer7_machine STATIC
     ridgeracer7/src/film.cpp
     ridgeracer7/src/atrac.cpp
     ridgeracer7/src/rsx.cpp
+    ridgeracer7/src/rsx_state.cpp
     ridgeracer7/src/spu.cpp
     ridgeracer7/src/spurs.cpp
     ridgeracer7/src/sync.cpp
@@ -330,6 +331,16 @@ target_compile_definitions(ridgeracer7_window PRIVATE RIDGERACER7_VERSION="${PRO
 if(NOT MSVC)
     target_compile_options(ridgeracer7_window PRIVATE -Wno-missing-field-initializers)
 endif()
+# The RSX's side of a frame timed on the CPU: a synthetic frame of 2,000 draws through the command processing, the draws'
+# gathering and the renderer, every Vulkan call a stub that digests what the GPU would be given. No GPU, no game.
+add_executable(ridgeracer7_rsx_bench ridgeracer7/tests/rsx_bench.cpp ridgeracer7/src/rsx_state.cpp ridgeracer7/src/renderer.cpp
+    ridgeracer7/src/renderer_pipelines.cpp ridgeracer7/src/render_formats.cpp ridgeracer7/src/render_state.cpp ridgeracer7/src/textures.cpp)
+target_include_directories(ridgeracer7_rsx_bench PRIVATE recomp/src ridgeracer7/src)
+target_link_libraries(ridgeracer7_rsx_bench PRIVATE qilin_host qilin_rt qilin_warnings)
+if(NOT MSVC)
+    target_compile_options(ridgeracer7_rsx_bench PRIVATE -Wno-missing-field-initializers)
+endif()
+add_test(NAME ridgeracer7_rsx_bench COMMAND ridgeracer7_rsx_bench --frames 2)
 # The settings file and the controller from its bindings, and the pause's holding and letting go: no game, no window.
 add_executable(ridgeracer7_settings_test ridgeracer7/tests/settings_test.cpp ridgeracer7/src/settings.cpp ridgeracer7/src/pause.cpp)
 target_include_directories(ridgeracer7_settings_test PRIVATE recomp/src runtime/include ridgeracer7/src host/include)

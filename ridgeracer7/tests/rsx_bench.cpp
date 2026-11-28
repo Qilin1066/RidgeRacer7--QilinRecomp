@@ -85,13 +85,90 @@ struct Nop<R(VKAPI_PTR*)(A...)> {
 };
 #define NOP(name) name = Nop<PFN_##name>::call
 
-// What the command buffer has bound, for the digest at each draw.
+// What a pipeline fixes of a draw's GPU state, and what the command buffer's dynamic state commands set: at each draw the
+// stubs digest the state in effect (the pipeline's, with its dynamic states taken from the command buffer), not handles,
+// so that state moved out of the pipelines into dynamic state (or pipelines made fewer) can be shown to give the GPU the same.
+struct GpuState {
+    VkPrimitiveTopology topology{};
+    VkBool32 restart = VK_FALSE;
+    VkCullModeFlags cull = 0;
+    VkFrontFace front{};
+    VkPolygonMode polygon{};
+    VkBool32 bias = VK_FALSE;
+    float bias_constant = 0, bias_clamp = 0, bias_slope = 0;
+    VkBool32 depth_test = VK_FALSE, depth_write = VK_FALSE;
+    VkCompareOp depth_compare{};
+    VkBool32 bounds = VK_FALSE;
+    float bounds_min = 0, bounds_max = 0;
+    VkBool32 stencil = VK_FALSE;
+    VkStencilOpState stencil_front{}, stencil_back{};
+};
+void digest_stencil(const VkStencilOpState& s) {
+    digest_value(s.failOp), digest_value(s.passOp), digest_value(s.depthFailOp), digest_value(s.compareOp);
+    digest_value(s.compareMask), digest_value(s.writeMask), digest_value(s.reference);
+}
+void digest_state(const GpuState& s) {
+    digest_value(s.topology), digest_value(s.restart), digest_value(s.cull), digest_value(s.front), digest_value(s.polygon);
+    digest_value(s.bias), digest_value(s.bias_constant), digest_value(s.bias_clamp), digest_value(s.bias_slope);
+    digest_value(s.depth_test), digest_value(s.depth_write), digest_value(s.depth_compare);
+    digest_value(s.bounds), digest_value(s.bounds_min), digest_value(s.bounds_max);
+    digest_value(s.stencil), digest_stencil(s.stencil_front), digest_stencil(s.stencil_back);
+}
+// The dynamic states the renderer may use, as bits.
+enum Dynamic : uint32_t {
+    kCull = 1u << 0, kFront = 1u << 1, kTopology = 1u << 2, kRestart = 1u << 3, kDepthTest = 1u << 4, kDepthWrite = 1u << 5, kDepthCompare = 1u << 6,
+    kBoundsTest = 1u << 7, kStencilTest = 1u << 8, kStencilOp = 1u << 9, kBiasEnable = 1u << 10, kBias = 1u << 11, kBounds = 1u << 12,
+    kStencilCompareMask = 1u << 13, kStencilWriteMask = 1u << 14, kStencilReference = 1u << 15, kViewport = 1u << 16, kScissor = 1u << 17,
+};
+uint32_t dynamic_bit(VkDynamicState d) {
+    switch (d) {
+    case VK_DYNAMIC_STATE_CULL_MODE: return kCull;
+    case VK_DYNAMIC_STATE_FRONT_FACE: return kFront;
+    case VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY: return kTopology;
+    case VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE: return kRestart;
+    case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE: return kDepthTest;
+    case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE: return kDepthWrite;
+    case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP: return kDepthCompare;
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE: return kBoundsTest;
+    case VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE: return kStencilTest;
+    case VK_DYNAMIC_STATE_STENCIL_OP: return kStencilOp;
+    case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE: return kBiasEnable;
+    case VK_DYNAMIC_STATE_DEPTH_BIAS: return kBias;
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS: return kBounds;
+    case VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK: return kStencilCompareMask;
+    case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK: return kStencilWriteMask;
+    case VK_DYNAMIC_STATE_STENCIL_REFERENCE: return kStencilReference;
+    case VK_DYNAMIC_STATE_VIEWPORT: return kViewport;
+    case VK_DYNAMIC_STATE_SCISSOR: return kScissor;
+    default: qilin::rt::fatal("the bench's stubs don't know dynamic state %d", static_cast<int>(d));
+    }
+}
+// A pipeline as made: its fixed state, which of it is dynamic, its shaders and their constants, its blending, formats and
+// vertex input.
+struct PipelineRecord {
+    GpuState state;
+    uint32_t dynamic = 0;
+    std::array<VkShaderModule, 2> modules{};
+    std::vector<uint8_t> specialisation;
+    VkPipelineColorBlendAttachmentState blend{};
+    VkBool32 logic = VK_FALSE;
+    VkLogicOp logic_op{};
+    VkFormat colour{}, depth{}, stencil{};
+    std::vector<VkVertexInputAttributeDescription> attributes;
+    std::vector<VkVertexInputBindingDescription> bindings;
+};
+std::mutex g_pipelines_mutex;  // (pipelines may be made on the renderer's worker thread)
+std::unordered_map<VkPipeline, PipelineRecord> g_pipelines;
+uint64_t g_pipelines_made = 0;
+
+// What the command buffer has bound and set, for the digest at each draw.
 struct Bound {
     std::array<const uint8_t*, 16> vertices{};
     const uint8_t* indices = nullptr;
     std::array<uint32_t, 2> constant_offsets{};
     const uint8_t* arena = nullptr;  // the buffer set 0 points into (the batch's arena)
-    VkPipeline pipeline = VK_NULL_HANDLE;
+    const PipelineRecord* pipeline = nullptr;
+    GpuState dynamic;  // the dynamic state set
     VkDescriptorSet textures = VK_NULL_HANDLE;
     VkRect2D scissor{};
     VkViewport viewport{};
@@ -106,21 +183,104 @@ struct SetTexture {
 std::unordered_map<VkDescriptorSet, std::vector<SetTexture>> g_sets;
 std::unordered_map<VkBuffer, FakeBuffer*> g_buffers;
 uint32_t g_vertex_bindings_first = 0, g_vertex_bindings_count = 0;
-uint32_t g_attributes = 0;  // the bound pipeline's attributes (bit a for attribute a), from its creation
-std::unordered_map<VkPipeline, uint32_t> g_pipeline_attributes;
 uint64_t g_vk_draws = 0;
 
-// What a draw sees: its pipeline, textures, window, push constants, vertices and constants.
+// A vertex attribute's value as the GPU reads it, by its Vulkan format (little-endian components; missing ones 0, 0, 0, 1).
+std::array<float, 4> read_attribute(VkFormat format, const uint8_t* p) {
+    std::array<float, 4> v{0, 0, 0, 1};
+    const auto f32 = [&](uint32_t c) {
+        float x;
+        std::memcpy(&x, p + 4 * c, 4);
+        return x;
+    };
+    const auto s16 = [&](uint32_t c) {
+        int16_t x;
+        std::memcpy(&x, p + 2 * c, 2);
+        return x;
+    };
+    const auto f16 = [&](uint32_t c) {
+        const uint8_t be[2] = {p[2 * c + 1], p[2 * c]};
+        return rr7::half_float(be);
+    };
+    const auto components = [](VkFormat one, VkFormat two, VkFormat f) { return f == one ? 1u : f == two ? 2u : 4u; };
+    switch (format) {
+    case VK_FORMAT_R32_SFLOAT: v[0] = f32(0); break;
+    case VK_FORMAT_R32G32_SFLOAT: v[0] = f32(0), v[1] = f32(1); break;
+    case VK_FORMAT_R32G32B32_SFLOAT: v[0] = f32(0), v[1] = f32(1), v[2] = f32(2); break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: v = {f32(0), f32(1), f32(2), f32(3)}; break;
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+        for (uint32_t c = 0; c < components(VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, format); ++c) v[c] = f16(c);
+        break;
+    case VK_FORMAT_R16_SNORM:
+    case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM:
+        for (uint32_t c = 0; c < components(VK_FORMAT_R16_SNORM, VK_FORMAT_R16G16_SNORM, format); ++c) v[c] = std::max(-1.0f, static_cast<float>(s16(c)) / 32767.0f);
+        break;
+    case VK_FORMAT_R16_SSCALED:
+    case VK_FORMAT_R16G16_SSCALED:
+    case VK_FORMAT_R16G16B16A16_SSCALED:
+        for (uint32_t c = 0; c < components(VK_FORMAT_R16_SSCALED, VK_FORMAT_R16G16_SSCALED, format); ++c) v[c] = static_cast<float>(s16(c));
+        break;
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        for (uint32_t c = 0; c < components(VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, format); ++c) v[c] = static_cast<float>(p[c]) / 255.0f;
+        break;
+    case VK_FORMAT_R8_USCALED:
+    case VK_FORMAT_R8G8_USCALED:
+    case VK_FORMAT_R8G8B8A8_USCALED:
+        for (uint32_t c = 0; c < components(VK_FORMAT_R8_USCALED, VK_FORMAT_R8G8_USCALED, format); ++c) v[c] = static_cast<float>(p[c]);
+        break;
+    default: qilin::rt::fatal("the bench's stubs don't read vertex format %d", static_cast<int>(format));
+    }
+    return v;
+}
+
+// What a draw sees: its state, shaders, blending, textures, window, push constants, vertices (each attribute's values, as
+// the GPU reads them through the pipeline's formats) and constants.
 void digest_draw(uint32_t vertices) {
     if (!g_digesting) return;
-    digest_value(g_bound.pipeline), digest_value(g_bound.scissor), digest_value(g_bound.viewport), digest(g_bound.push.data(), g_bound.push.size());
+    const PipelineRecord& p = *g_bound.pipeline;
+    GpuState s = p.state;
+    const GpuState& d = g_bound.dynamic;
+    if (p.dynamic & kCull) s.cull = d.cull;
+    if (p.dynamic & kFront) s.front = d.front;
+    if (p.dynamic & kTopology) s.topology = d.topology;
+    if (p.dynamic & kRestart) s.restart = d.restart;
+    if (p.dynamic & kDepthTest) s.depth_test = d.depth_test;
+    if (p.dynamic & kDepthWrite) s.depth_write = d.depth_write;
+    if (p.dynamic & kDepthCompare) s.depth_compare = d.depth_compare;
+    if (p.dynamic & kBoundsTest) s.bounds = d.bounds;
+    if (p.dynamic & kBounds) s.bounds_min = d.bounds_min, s.bounds_max = d.bounds_max;
+    if (p.dynamic & kStencilTest) s.stencil = d.stencil;
+    if (p.dynamic & kBiasEnable) s.bias = d.bias;
+    if (p.dynamic & kBias) s.bias_constant = d.bias_constant, s.bias_clamp = d.bias_clamp, s.bias_slope = d.bias_slope;
+    const std::pair<VkStencilOpState*, const VkStencilOpState*> faces[2] = {{&s.stencil_front, &d.stencil_front}, {&s.stencil_back, &d.stencil_back}};
+    for (const auto& [face, set] : faces) {
+        if (p.dynamic & kStencilOp) face->failOp = set->failOp, face->passOp = set->passOp, face->depthFailOp = set->depthFailOp, face->compareOp = set->compareOp;
+        if (p.dynamic & kStencilCompareMask) face->compareMask = set->compareMask;
+        if (p.dynamic & kStencilWriteMask) face->writeMask = set->writeMask;
+        if (p.dynamic & kStencilReference) face->reference = set->reference;
+    }
+    digest_state(s);
+    digest_value(p.modules), digest(p.specialisation.data(), p.specialisation.size());
+    digest_value(p.blend), digest_value(p.logic), digest_value(p.logic_op), digest_value(p.colour), digest_value(p.depth), digest_value(p.stencil);
+    digest_value(g_bound.scissor), digest_value(g_bound.viewport), digest(g_bound.push.data(), g_bound.push.size());
     if (g_bound.textures)
         for (const SetTexture& t : g_sets.at(g_bound.textures)) digest_value(t.binding), digest_value(t.view), digest_value(t.sampler);
-    for (uint32_t a = 0; a < 16; ++a)
-        if ((g_attributes >> a) & 1) {
-            const uint32_t binding = a - g_vertex_bindings_first;
-            if (binding < g_vertex_bindings_count && g_bound.vertices[binding]) digest(g_bound.vertices[binding], size_t{vertices} * 16);
+    for (const VkVertexInputAttributeDescription& a : p.attributes) {
+        const auto binding = std::ranges::find_if(p.bindings, [&](const VkVertexInputBindingDescription& b) { return b.binding == a.binding; });
+        if (binding == p.bindings.end()) qilin::rt::fatal("a pipeline's attribute %u reads binding %u, which it doesn't describe", a.location, a.binding);
+        const uint32_t slot = a.binding - g_vertex_bindings_first;
+        if (slot >= g_vertex_bindings_count || !g_bound.vertices[slot]) qilin::rt::fatal("a draw reads binding %u, which isn't bound", a.binding);
+        digest_value(a.location);
+        for (uint32_t v = 0; v < vertices; ++v) {
+            const size_t at = a.offset + (binding->inputRate == VK_VERTEX_INPUT_RATE_INSTANCE ? 0 : size_t{v} * binding->stride);
+            digest_value(read_attribute(a.format, g_bound.vertices[slot] + at));
         }
+    }
     if (g_bound.arena) {
         digest(g_bound.arena + g_bound.constant_offsets[0], 468 * 16);
         digest(g_bound.arena + g_bound.constant_offsets[1], 32);
@@ -178,18 +338,88 @@ void stub_vulkan() {
     };
     vkCreateShaderModule = [](VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule* out) { return *out = fake_handle<VkShaderModule>(), VK_SUCCESS; };
     vkCreateGraphicsPipelines = [](VkDevice, VkPipelineCache, uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* out) {
+        const std::lock_guard lock(g_pipelines_mutex);
         for (uint32_t i = 0; i < count; ++i) {
             const VkGraphicsPipelineCreateInfo& info = infos[i];
-            digest_value(info.pInputAssemblyState->topology);
-            digest_value(info.pRasterizationState->cullMode), digest_value(info.pRasterizationState->frontFace), digest_value(info.pRasterizationState->polygonMode);
-            digest_value(info.pColorBlendState->pAttachments[0]);
-            digest_value(info.pDepthStencilState->depthTestEnable), digest_value(info.pDepthStencilState->depthCompareOp), digest_value(info.pDepthStencilState->depthWriteEnable);
-            uint32_t attributes = 0;
-            for (uint32_t a = 0; a < info.pVertexInputState->vertexAttributeDescriptionCount; ++a) attributes |= 1u << info.pVertexInputState->pVertexAttributeDescriptions[a].location;
+            PipelineRecord p;
+            GpuState& s = p.state;
+            s.topology = info.pInputAssemblyState->topology, s.restart = info.pInputAssemblyState->primitiveRestartEnable;
+            const VkPipelineRasterizationStateCreateInfo& r = *info.pRasterizationState;
+            s.cull = r.cullMode, s.front = r.frontFace, s.polygon = r.polygonMode;
+            s.bias = r.depthBiasEnable, s.bias_constant = r.depthBiasConstantFactor, s.bias_clamp = r.depthBiasClamp, s.bias_slope = r.depthBiasSlopeFactor;
+            const VkPipelineDepthStencilStateCreateInfo& z = *info.pDepthStencilState;
+            s.depth_test = z.depthTestEnable, s.depth_write = z.depthWriteEnable, s.depth_compare = z.depthCompareOp;
+            s.bounds = z.depthBoundsTestEnable, s.bounds_min = z.minDepthBounds, s.bounds_max = z.maxDepthBounds;
+            s.stencil = z.stencilTestEnable, s.stencil_front = z.front, s.stencil_back = z.back;
+            if (info.pDynamicState)
+                for (uint32_t k = 0; k < info.pDynamicState->dynamicStateCount; ++k) p.dynamic |= dynamic_bit(info.pDynamicState->pDynamicStates[k]);
+            for (uint32_t k = 0; k < info.stageCount && k < 2; ++k) {
+                p.modules[k] = info.pStages[k].module;
+                if (const VkSpecializationInfo* sp = info.pStages[k].pSpecializationInfo) {
+                    const auto* bytes = static_cast<const uint8_t*>(sp->pData);
+                    p.specialisation.insert(p.specialisation.end(), bytes, bytes + sp->dataSize);
+                }
+            }
+            p.blend = info.pColorBlendState->pAttachments[0];
+            p.logic = info.pColorBlendState->logicOpEnable, p.logic_op = info.pColorBlendState->logicOpEnable ? info.pColorBlendState->logicOp : VkLogicOp{};
+            for (const auto* next = static_cast<const VkBaseInStructure*>(info.pNext); next; next = next->pNext)
+                if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) {
+                    const auto& rendering = *reinterpret_cast<const VkPipelineRenderingCreateInfo*>(next);
+                    p.colour = rendering.colorAttachmentCount ? rendering.pColorAttachmentFormats[0] : VK_FORMAT_UNDEFINED;
+                    p.depth = rendering.depthAttachmentFormat, p.stencil = rendering.stencilAttachmentFormat;
+                }
+            const VkPipelineVertexInputStateCreateInfo& v = *info.pVertexInputState;
+            p.attributes.assign(v.pVertexAttributeDescriptions, v.pVertexAttributeDescriptions + v.vertexAttributeDescriptionCount);
+            p.bindings.assign(v.pVertexBindingDescriptions, v.pVertexBindingDescriptions + v.vertexBindingDescriptionCount);
+            std::ranges::sort(p.attributes, {}, &VkVertexInputAttributeDescription::location);
             out[i] = fake_handle<VkPipeline>();
-            g_pipeline_attributes[out[i]] = attributes;
+            g_pipelines[out[i]] = std::move(p);
+            ++g_pipelines_made;
         }
         return VK_SUCCESS;
+    };
+    vkCreatePipelineCache = [](VkDevice, const VkPipelineCacheCreateInfo*, const VkAllocationCallbacks*, VkPipelineCache* out) {
+        return *out = fake_handle<VkPipelineCache>(), VK_SUCCESS;
+    };
+    vkGetPipelineCacheData = [](VkDevice, VkPipelineCache, size_t* size, void* data) {
+        // (A cache's data as a driver gives it: here 32 bytes of nothing.)
+        if (data) std::memset(data, 0, std::min<size_t>(*size, 32));
+        *size = 32;
+        return VK_SUCCESS;
+    };
+    NOP(vkDestroyPipeline);
+    NOP(vkDestroyPipelineCache);
+    vkCmdSetCullMode = [](VkCommandBuffer, VkCullModeFlags v) { g_bound.dynamic.cull = v; };
+    vkCmdSetFrontFace = [](VkCommandBuffer, VkFrontFace v) { g_bound.dynamic.front = v; };
+    vkCmdSetPrimitiveTopology = [](VkCommandBuffer, VkPrimitiveTopology v) { g_bound.dynamic.topology = v; };
+    vkCmdSetPrimitiveRestartEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.restart = v; };
+    vkCmdSetDepthTestEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.depth_test = v; };
+    vkCmdSetDepthWriteEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.depth_write = v; };
+    vkCmdSetDepthCompareOp = [](VkCommandBuffer, VkCompareOp v) { g_bound.dynamic.depth_compare = v; };
+    vkCmdSetDepthBoundsTestEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.bounds = v; };
+    vkCmdSetDepthBounds = [](VkCommandBuffer, float lo, float hi) { g_bound.dynamic.bounds_min = lo, g_bound.dynamic.bounds_max = hi; };
+    vkCmdSetStencilTestEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.stencil = v; };
+    vkCmdSetDepthBiasEnable = [](VkCommandBuffer, VkBool32 v) { g_bound.dynamic.bias = v; };
+    vkCmdSetDepthBias = [](VkCommandBuffer, float constant, float clamp, float slope) {
+        g_bound.dynamic.bias_constant = constant, g_bound.dynamic.bias_clamp = clamp, g_bound.dynamic.bias_slope = slope;
+    };
+    vkCmdSetStencilOp = [](VkCommandBuffer, VkStencilFaceFlags faces, VkStencilOp fail, VkStencilOp pass, VkStencilOp depth_fail, VkCompareOp compare) {
+        if (faces & VK_STENCIL_FACE_FRONT_BIT) g_bound.dynamic.stencil_front.failOp = fail, g_bound.dynamic.stencil_front.passOp = pass,
+                                                g_bound.dynamic.stencil_front.depthFailOp = depth_fail, g_bound.dynamic.stencil_front.compareOp = compare;
+        if (faces & VK_STENCIL_FACE_BACK_BIT) g_bound.dynamic.stencil_back.failOp = fail, g_bound.dynamic.stencil_back.passOp = pass,
+                                               g_bound.dynamic.stencil_back.depthFailOp = depth_fail, g_bound.dynamic.stencil_back.compareOp = compare;
+    };
+    vkCmdSetStencilCompareMask = [](VkCommandBuffer, VkStencilFaceFlags faces, uint32_t v) {
+        if (faces & VK_STENCIL_FACE_FRONT_BIT) g_bound.dynamic.stencil_front.compareMask = v;
+        if (faces & VK_STENCIL_FACE_BACK_BIT) g_bound.dynamic.stencil_back.compareMask = v;
+    };
+    vkCmdSetStencilWriteMask = [](VkCommandBuffer, VkStencilFaceFlags faces, uint32_t v) {
+        if (faces & VK_STENCIL_FACE_FRONT_BIT) g_bound.dynamic.stencil_front.writeMask = v;
+        if (faces & VK_STENCIL_FACE_BACK_BIT) g_bound.dynamic.stencil_back.writeMask = v;
+    };
+    vkCmdSetStencilReference = [](VkCommandBuffer, VkStencilFaceFlags faces, uint32_t v) {
+        if (faces & VK_STENCIL_FACE_FRONT_BIT) g_bound.dynamic.stencil_front.reference = v;
+        if (faces & VK_STENCIL_FACE_BACK_BIT) g_bound.dynamic.stencil_back.reference = v;
     };
     vkAllocateCommandBuffers = [](VkDevice, const VkCommandBufferAllocateInfo* info, VkCommandBuffer* out) {
         for (uint32_t i = 0; i < info->commandBufferCount; ++i) out[i] = fake_handle<VkCommandBuffer>();
@@ -247,8 +477,8 @@ void stub_vulkan() {
         std::memcpy(g_bound.push.data() + offset, data, size);
     };
     vkCmdBindPipeline = [](VkCommandBuffer, VkPipelineBindPoint, VkPipeline p) {
-        g_bound.pipeline = p;
-        g_attributes = g_pipeline_attributes.at(p);
+        const std::lock_guard lock(g_pipelines_mutex);
+        g_bound.pipeline = &g_pipelines.at(p);
     };
     vkCmdBindDescriptorSets = [](VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t first, uint32_t, const VkDescriptorSet* sets, uint32_t dynamic_count,
                                  const uint32_t* dynamic) {
@@ -584,7 +814,9 @@ int main(int argc, char** argv) {
     const auto time = [&](Depth depth, const char* what) {
         Acts acts;
         acts.s = &s, acts.depth = depth;
+        const uint64_t made_before = g_pipelines_made;
         run_frame(s, acts, bytes);  // (a frame first, for the caches: textures decoded, pipelines made)
+        const uint64_t made_first = g_pipelines_made - made_before;
         if (touch && depth == Depth::draw) rr7::renderer_guest_access(rr7::kRsxLocal + kColour, uint64_t{kPitch} * kHeight * 2);
         g_digesting = false;
         // Each frame's time: the best and the median are given (other work on the computer only ever makes a frame slower).
@@ -597,6 +829,9 @@ int main(int argc, char** argv) {
         }
         std::sort(times.begin(), times.end());
         std::printf("  %-48s best %8.1f us, median %8.1f us a frame (%.3f us a draw)\n", what, times.front(), times[times.size() / 2], times.front() / kDraws);
+        if (depth == Depth::draw)
+            std::printf("  pipelines made: %llu in the first frame drawn, %llu in the %u after\n", static_cast<unsigned long long>(made_first),
+                        static_cast<unsigned long long>(g_pipelines_made - made_before - made_first), frames);
         g_digesting = true;
     };
     time(Depth::parse, "commands only (rsx_state.hpp: run_command)");

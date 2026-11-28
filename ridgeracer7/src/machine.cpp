@@ -147,6 +147,7 @@ const qilin::rt::CpuHooks& guest_hooks() { return kHooks; }
 // Runs lifted code for the runtime. A C++ exception of the game's that no lifted function on the way took (its
 // landing pad's frame isn't on this stack, cpu.hpp) stops the game here, by name.
 static void run_lifted(Cpu& c, qilin::rt::GuestFn fn, uint32_t code) {
+    qilin::rt::fp::enter_thread_mode();  // (relaxed floating point: denormals flushed, once per thread)
     try {
         fn(c);
     } catch (const qilin::rt::GuestUnwind& e) {

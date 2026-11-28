@@ -1,6 +1,7 @@
 // qilin_difftest: every generated case, run lifted and on the reference
 // interpreter from the same random states; registers, CR, XER, LR, CTR,
 // traps, indirect jumps, system calls and memory must all agree.
+#include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -8,6 +9,7 @@
 #include <print>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cases.hpp"
@@ -303,6 +305,164 @@ size_t run_rounding() {
     return runs;
 }
 
+// ---- relaxed floating point (fp.hpp, vmx.hpp: the game's mode) against the exact mode ----
+// On ordinary finite values (singles and doubles whose results stay normal): the operations the relaxed mode does
+// as the guest does must agree to the bit; the single fused forms, the single operations on doubles that are not
+// singles, and vrsqrtefp are bounded (one unit in the single's last place; two for vrsqrtefp's two roundings); and
+// how many differ at all is counted, for the record. The host's vector code against its portable twin, and the
+// flush of denormals that fp::flush_denormals sets, on a thread of its own.
+struct RelaxedCounts {
+    size_t runs = 0, fused_differ = 0, doubles_differ = 0, rsqrt_differ = 0, worst_rsqrt = 0, halfway = 0, halfway_differ = 0;
+};
+// How many singles lie between x and y (of one sign), as the ordered whole numbers their bits are.
+uint32_t ulps(uint32_t x, uint32_t y) {
+    if ((x ^ y) >> 31) return (x << 1) == 0 && (y << 1) == 0 ? 0u : 0xffffffffu;
+    return x > y ? x - y : y - x;
+}
+uint32_t single_bits(double v) { return std::bit_cast<uint32_t>(static_cast<float>(v)); }
+// A normal single of exponent 64 to 190 (from about 2^-63 to 2^63): sums, products and quotients of two stay normal.
+uint32_t ordinary_single() { return (static_cast<uint32_t>(rng()) & 0x807fffffu) | ((64 + static_cast<uint32_t>(rng() % 127)) << 23); }
+
+RelaxedCounts run_relaxed() {
+    RelaxedCounts n;
+    namespace ex = rt::fp::exact;
+    namespace rx = rt::fp::relaxed;
+    const auto bad = [&](const char* what, uint64_t x, uint64_t y, uint64_t z, uint64_t relaxed, uint64_t exact) {
+        if (++failures <= 20)
+            std::println(stderr, "FAIL relaxed {} of {:#x} {:#x} {:#x}: relaxed {:#x}, exact {:#x}", what, x, y, z, relaxed, exact);
+    };
+    const auto value = [](uint32_t w) { return static_cast<double>(std::bit_cast<float>(w)); };
+    for (int trial = 0; trial < 200000; ++trial) {
+        const uint32_t wa = ordinary_single(), wb = ordinary_single(), wc = ordinary_single();
+        const double a = value(wa), b = value(wb), c = value(wc);
+        // Singles: one rounding either way, so the same.
+        const std::pair<const char*, std::pair<double, double>> same[] = {
+            {"fadds", {rx::fadds(a, b), ex::fadds(a, b)}}, {"fsubs", {rx::fsubs(a, b), ex::fsubs(a, b)}},
+            {"fmuls", {rx::fmuls(a, c), ex::fmuls(a, c)}}, {"fdivs", {rx::fdivs(a, b), ex::fdivs(a, b)}},
+            {"fsqrts", {rx::fsqrts(std::abs(b)), ex::fsqrts(std::abs(b))}}, {"frsp", {rx::frsp(a * c), ex::frsp(a * c)}},
+            {"fadd", {rx::fadd(a * c, b), ex::fadd(a * c, b)}}, {"fsub", {rx::fsub(a, b * c), ex::fsub(a, b * c)}},
+            {"fmul", {rx::fmul(a * b, c), ex::fmul(a * b, c)}}, {"fdiv", {rx::fdiv(a * b, c), ex::fdiv(a * b, c)}},
+            {"fsqrt", {rx::fsqrt(std::abs(a * b)), ex::fsqrt(std::abs(a * b))}}, {"fmadd", {rx::fmadd(a * b, c, b), ex::fmadd(a * b, c, b)}},
+            {"fnmsub", {rx::fnmsub(a, c * b, b), ex::fnmsub(a, c * b, b)}},
+            {"lfs", {rx::load_single(wa), ex::load_single(wa)}},
+            {"stfs", {static_cast<double>(rx::store_single(a)), static_cast<double>(ex::store_single(a))}},
+        };
+        for (const auto& [what, r] : same)
+            if (std::bit_cast<uint64_t>(r.first) != std::bit_cast<uint64_t>(r.second)) bad(what, wa, wb, wc, std::bit_cast<uint64_t>(r.first), std::bit_cast<uint64_t>(r.second));
+        // The fused singles: within one unit.
+        const std::pair<const char*, std::pair<double, double>> fused[] = {
+            {"fmadds", {rx::fmadds(a, c, b), ex::fmadds(a, c, b)}}, {"fmsubs", {rx::fmsubs(a, c, b), ex::fmsubs(a, c, b)}},
+            {"fnmadds", {rx::fnmadds(a, c, b), ex::fnmadds(a, c, b)}}, {"fnmsubs", {rx::fnmsubs(a, c, b), ex::fnmsubs(a, c, b)}},
+        };
+        for (const auto& [what, r] : fused) {
+            const uint32_t d = ulps(single_bits(r.first), single_bits(r.second));
+            if (d > 1) bad(what, wa, wb, wc, std::bit_cast<uint64_t>(r.first), std::bit_cast<uint64_t>(r.second));
+            n.fused_differ += d != 0;
+        }
+        // Single operations on doubles that are not singles: rounded twice, within one unit.
+        const double da = a * (1.0 + 0x1p-40), db = b * (1.0 - 0x1p-37);
+        const std::pair<const char*, std::pair<double, double>> doubles[] = {
+            {"fadds of doubles", {rx::fadds(da, db), ex::fadds(da, db)}}, {"fmuls of doubles", {rx::fmuls(da, db), ex::fmuls(da, db)}},
+            {"fdivs of doubles", {rx::fdivs(da, db), ex::fdivs(da, db)}}, {"fmadds of doubles", {rx::fmadds(da, db, c), ex::fmadds(da, db, c)}},
+        };
+        for (const auto& [what, r] : doubles) {
+            const uint32_t d = ulps(single_bits(r.first), single_bits(r.second));
+            if (d > 1) bad(what, std::bit_cast<uint64_t>(da), std::bit_cast<uint64_t>(db), wc, std::bit_cast<uint64_t>(r.first), std::bit_cast<uint64_t>(r.second));
+            n.doubles_differ += d != 0;
+        }
+        // VMX: four elements at once, the host's vector code and its portable twin.
+        const rt::Vec va{{wa, wb, wc, ordinary_single()}}, vb{{wb, wc, ordinary_single(), wa}}, vc{{wc, ordinary_single(), wa, wb}};
+        const auto vsame = [&](const char* what, const rt::Vec& relaxed, const rt::Vec& exact) {
+            for (unsigned i = 0; i < 4; ++i)
+                if (relaxed.w[i] != exact.w[i]) bad(what, va.w[i], vb.w[i], vc.w[i], relaxed.w[i], exact.w[i]);
+        };
+        const auto vnear = [&](const char* what, const rt::Vec& relaxed, const rt::Vec& exact, uint32_t bound) {
+            uint32_t worst = 0;
+            for (unsigned i = 0; i < 4; ++i) {
+                const uint32_t d = ulps(relaxed.w[i], exact.w[i]);
+                if (d > bound) bad(what, va.w[i], vb.w[i], vc.w[i], relaxed.w[i], exact.w[i]);
+                worst = std::max(worst, d);
+            }
+            return worst;
+        };
+        namespace vx = rt::vmx::exact;
+        namespace vr = rt::vmx::relaxed;
+        namespace vp = rt::vmx::portable;
+        vsame("vaddfp", vr::vaddfp(va, vb), vx::vaddfp(va, vb));
+        vsame("vsubfp", vr::vsubfp(va, vb), vx::vsubfp(va, vb));
+        vsame("vmaxfp", vr::vmaxfp(va, vb), vx::vmaxfp(va, vb));
+        vsame("vminfp", vr::vminfp(va, vb), vx::vminfp(va, vb));
+        vsame("vcmpeqfp", vr::vcmpeqfp(va, va), vx::vcmpeqfp(va, va));
+        vsame("vcmpeqfp", vr::vcmpeqfp(va, vb), vx::vcmpeqfp(va, vb));
+        vsame("vrefp", vr::vrefp(va), vx::vrefp(va));
+        const rt::Vec positive{{va.w[0] & 0x7fffffffu, va.w[1] & 0x7fffffffu, va.w[2] & 0x7fffffffu, va.w[3] & 0x7fffffffu}};
+        const uint32_t root = vnear("vrsqrtefp", vr::vrsqrtefp(positive), vx::vrsqrtefp(positive), 2);
+        n.rsqrt_differ += root != 0;
+        n.worst_rsqrt = std::max<size_t>(n.worst_rsqrt, root);
+        n.fused_differ += vnear("vmaddfp", vr::vmaddfp(va, vc, vb), vx::vmaddfp(va, vc, vb), 1) != 0;
+        n.fused_differ += vnear("vnmsubfp", vr::vnmsubfp(va, vc, vb), vx::vnmsubfp(va, vc, vb), 1) != 0;
+        // vctsxs on any bits at all (NaNs, infinities, denormals, out of range): the same.
+        const rt::Vec any{{static_cast<uint32_t>(rng()), static_cast<uint32_t>(rng()), static_cast<uint32_t>(rng()), trial % 2 ? 0x7fc00000u : 0xcf000001u}};
+        const unsigned scale = static_cast<unsigned>(rng() % 32);
+        vsame("vctsxs", vr::vctsxs(any, scale), vx::vctsxs(any, scale));
+        // The twin: the same results, but for the fused forms where the host has a fused single multiply-add.
+        vsame("vaddfp (portable)", vp::vaddfp(va, vb), vr::vaddfp(va, vb));
+        vsame("vsubfp (portable)", vp::vsubfp(va, vb), vr::vsubfp(va, vb));
+        vsame("vmaxfp (portable)", vp::vmaxfp(va, any), vr::vmaxfp(va, any));
+        vsame("vminfp (portable)", vp::vminfp(any, va), vr::vminfp(any, va));
+        vsame("vcmpeqfp (portable)", vp::vcmpeqfp(va, any), vr::vcmpeqfp(va, any));
+        vsame("vrefp (portable)", vp::vrefp(va), vr::vrefp(va));
+        vsame("vrsqrtefp (portable)", vp::vrsqrtefp(positive), vr::vrsqrtefp(positive));
+        vsame("vctsxs (portable)", vp::vctsxs(any, scale), vr::vctsxs(any, scale));
+#if QILIN_VMX_NEON || defined(__FMA__) || defined(__AVX2__)
+        vnear("vmaddfp (portable)", vp::vmaddfp(va, vc, vb), vr::vmaddfp(va, vc, vb), 1);
+        vnear("vnmsubfp (portable)", vp::vnmsubfp(va, vc, vb), vr::vnmsubfp(va, vc, vb), 1);
+#else
+        vsame("vmaddfp (portable)", vp::vmaddfp(va, vc, vb), vr::vmaddfp(va, vc, vb));
+        vsame("vnmsubfp (portable)", vp::vnmsubfp(va, vc, vb), vr::vnmsubfp(va, vc, vb));
+#endif
+        ++n.runs;
+    }
+    // Where the fused singles do differ: a sum whose double lands on a point halfway between two singles. b odd, and
+    // a product of singles 2^(e - 24) (1 - 2^-2k) of b's sign (a = 2^x (1 + 2^-k), c = 2^y (1 - 2^-k)): the true sum is a
+    // hair below the halfway point, so the guest rounds to b; the double rounds up onto the halfway point, and then to
+    // the even single, one unit away.
+    for (int trial = 0; trial < 20000; ++trial, ++n.halfway) {
+        const uint32_t eb = 80 + static_cast<uint32_t>(rng() % 100), k = 15 + static_cast<uint32_t>(rng() % 9), x = 100 + static_cast<uint32_t>(rng() % 20);
+        const uint32_t sign = static_cast<uint32_t>(rng() % 2) << 31;
+        const uint32_t wb = sign | (eb << 23) | ((static_cast<uint32_t>(rng()) & 0x007ffffeu) | 1u);
+        const uint32_t wa = sign | (x << 23) | (0x00800000u >> k), wc = ((eb - 24 + 127 - x - 1) << 23) | (0x00800000u - (0x01000000u >> k));  // (2 - 2^(1-k)) / 2
+        const double a = value(wa), b = value(wb), c = value(wc);
+        for (const bool subtract : {false, true}) {
+            const double z = subtract ? -b : b;
+            const double relaxed = subtract ? rx::fmsubs(a, c, z) : rx::fmadds(a, c, z), exact = subtract ? ex::fmsubs(a, c, z) : ex::fmadds(a, c, z);
+            const uint32_t d = ulps(single_bits(relaxed), single_bits(exact));
+            if (d > 1 || exact != b) bad(subtract ? "fmsubs on a halfway point" : "fmadds on a halfway point", wa, wc, wb, std::bit_cast<uint64_t>(relaxed), std::bit_cast<uint64_t>(exact));
+            n.halfway_differ += d != 0;
+        }
+        const rt::Vec va{{wa, wa, wa, wa}}, vc{{wc, wc, wc, wc}}, vb{{wb, wb, wb, wb}};
+        const uint32_t d = ulps(rt::vmx::relaxed::vmaddfp(va, vc, vb).w[0], rt::vmx::exact::vmaddfp(va, vc, vb).w[0]);
+        if (d > 1) bad("vmaddfp on a halfway point", wa, wc, wb, rt::vmx::relaxed::vmaddfp(va, vc, vb).w[0], rt::vmx::exact::vmaddfp(va, vc, vb).w[0]);
+    }
+    // Denormals with the thread's float unit flushing them (as fp::enter_thread_mode sets it for play): VMX's results
+    // are what its non-Java mode gives; a denormal operand counts as zero.
+    std::thread([&] {
+        rt::fp::flush_denormals();
+        const rt::Vec tiny{{0x00400000u, 0x80000001u, 0x00800000u, 0x3f800000u}}, half{{0x3f000000u, 0x3f000000u, 0x3f000000u, 0x00000001u}};
+        const rt::Vec zero{{0, 0, 0, 0}}, small{{0x00c00000u, 0x80c00000u, 0x00800001u, 0x3f800000u}}, normal{{0x00800000u, 0x80800000u, 0x00800000u, 0x3f800000u}};
+        const std::pair<const char*, std::pair<rt::Vec, rt::Vec>> flushed[] = {
+            {"vmaddfp of denormals", {rt::vmx::relaxed::vmaddfp(tiny, half, zero), rt::vmx::exact::vmaddfp(tiny, half, zero)}},
+            {"vaddfp of denormals", {rt::vmx::relaxed::vaddfp(tiny, half), rt::vmx::exact::vaddfp(tiny, half)}},
+            {"vsubfp to a denormal", {rt::vmx::relaxed::vsubfp(small, normal), rt::vmx::exact::vsubfp(small, normal)}},
+            {"vcmpeqfp of denormals", {rt::vmx::relaxed::vcmpeqfp(tiny, zero), rt::vmx::exact::vcmpeqfp(tiny, zero)}},
+        };
+        for (const auto& [what, r] : flushed)
+            for (unsigned i = 0; i < 4; ++i)
+                if (r.first.w[i] != r.second.w[i]) bad(what, tiny.w[i], half.w[i], 0, r.first.w[i], r.second.w[i]);
+    }).join();
+    return n;
+}
+
 // ---- the function index (dispatch.hpp): calls through a register find the function by address ----
 void f_a(rt::Cpu&) {}
 void f_b(rt::Cpu&) {}
@@ -480,6 +640,7 @@ int main() {
     }
     const size_t unwinding = run_unwinding(space);
     const size_t rounding = run_rounding();
+    const RelaxedCounts relaxed = run_relaxed();
     if (failures || eh_failures) {
         std::println(stderr, "difftest: {} disagreements, {} in the unwinding program", failures, eh_failures);
         return 1;
@@ -487,5 +648,10 @@ int main() {
     std::println("difftest: {} cases, {} runs, all agree ({} branches taken, {} traps fired, {} runs of programs); the unwinding program: {} runs, all agree; "
                  "rounding once to single: {} operands, all agree",
                  difftest::kCaseCount, runs, taken, traps, programs, unwinding, rounding);
+    std::println("relaxed floating point: {} operand sets, within bounds; differing from exact: the fused singles {} times (of {}), single "
+                 "operations on doubles {} (of {}), vrsqrtefp {} vectors (of {}, by at most {} units); fused singles built to round on a halfway point {} "
+                 "(of {})",
+                 relaxed.runs, relaxed.fused_differ, 6 * relaxed.runs, relaxed.doubles_differ, 4 * relaxed.runs, relaxed.rsqrt_differ, relaxed.runs, relaxed.worst_rsqrt,
+                 relaxed.halfway_differ, 2 * relaxed.halfway);
     return 0;
 }

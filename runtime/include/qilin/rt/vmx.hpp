@@ -26,8 +26,33 @@
 // It can differ from a console's result in the low bits. *If the PPU's
 // tables can be had, they replace this.*
 //
+// **The two modes** (fp.hpp, QILIN_FP_EXACT): all of the above is the exact
+// mode (vmx::exact), which the differential test runs. The relaxed mode
+// (vmx::relaxed, the game's build) is the host's single precision: no NaN
+// rules, no denormal flush of its own (the host's flush-to-zero mode, set
+// once per thread by fp::enter_thread_mode, does that), vmaddfp and
+// vnmsubfp as the host's fused single multiply-add where it has one (ARM64,
+// x86 built for FMA) and else the double sum of the exact product rounded to
+// single (within one unit), vrefp and vrsqrtefp as the host's division and
+// square root, vmaxfp and vminfp as a compare and a choice. It is SSE on
+// x86-64 and NEON on ARM64, with a portable twin (vmx::portable, the plain
+// C++ elsewhere and with QILIN_VMX_PORTABLE) that gives the same results.
+// The integer, logical and permute instructions, and the conversions, are
+// the same in both modes.
+//
 // Included by cpu.hpp. Runtime code: no std::format here.
 #pragma once
+
+#if !defined(QILIN_VMX_PORTABLE) && (defined(__x86_64__) || defined(_M_X64))
+#include <emmintrin.h>
+#if defined(__FMA__) || defined(__AVX2__)
+#include <immintrin.h>
+#endif
+#define QILIN_VMX_SSE 1
+#elif !defined(QILIN_VMX_PORTABLE) && (defined(__aarch64__) || defined(_M_ARM64))
+#include <arm_neon.h>
+#define QILIN_VMX_NEON 1
+#endif
 
 namespace qilin::rt::vmx {
 
@@ -195,6 +220,7 @@ QILIN_INLINE Vec fused_vec(const Vec& a, const Vec& c, const Vec& b, bool subtra
     }
     return fused_vec_slow(a, c, b, subtract, negate);
 }
+namespace exact {
 // (Element by element: a whole-vector fast path, as fused_vec has, measured slower with MSVC and no faster with Clang.)
 QILIN_INLINE Vec vaddfp(const Vec& a, const Vec& b) {
     return {{add32(a.w[0], b.w[0], false), add32(a.w[1], b.w[1], false), add32(a.w[2], b.w[2], false), add32(a.w[3], b.w[3], false)}};
@@ -206,6 +232,7 @@ QILIN_INLINE Vec vsubfp(const Vec& a, const Vec& b) {
 QILIN_INLINE Vec vmaddfp(const Vec& a, const Vec& c, const Vec& b) { return fused_vec(a, c, b, false, false); }
 // vD = -(vA * vC - vB)
 QILIN_INLINE Vec vnmsubfp(const Vec& a, const Vec& c, const Vec& b) { return fused_vec(a, c, b, true, true); }
+}  // namespace exact
 // ---- the estimates (see the top of the file) ----
 // 1/x. A double holds more than twice a single's digits and two more, so its quotient rounds to the single's correctly.
 QILIN_INLINE uint32_t reciprocal32(uint32_t w) {
@@ -249,10 +276,12 @@ inline uint32_t reciprocal_root32(uint32_t w) {
         return f - 1;
     return f;
 }
+namespace exact {
 QILIN_INLINE Vec vrefp(const Vec& b) { return {{reciprocal32(b.w[0]), reciprocal32(b.w[1]), reciprocal32(b.w[2]), reciprocal32(b.w[3])}}; }
 QILIN_INLINE Vec vrsqrtefp(const Vec& b) {
     return {{reciprocal_root32(b.w[0]), reciprocal_root32(b.w[1]), reciprocal_root32(b.w[2]), reciprocal_root32(b.w[3])}};
 }
+}  // namespace exact
 
 // The larger, or the smaller: of zeros of both signs, +0 is the larger.
 QILIN_INLINE uint32_t extreme32(uint32_t a, uint32_t b, bool larger) {
@@ -264,6 +293,7 @@ QILIN_INLINE uint32_t extreme32(uint32_t a, uint32_t b, bool larger) {
     if (x == y) return larger ? a & b : a | b;  // equal: the same bits, or zeros whose signs differ
     return (x > y) == larger ? a : b;
 }
+namespace exact {
 QILIN_INLINE Vec vmaxfp(const Vec& a, const Vec& b) {
     return {{extreme32(a.w[0], b.w[0], true), extreme32(a.w[1], b.w[1], true), extreme32(a.w[2], b.w[2], true), extreme32(a.w[3], b.w[3], true)}};
 }
@@ -276,13 +306,15 @@ QILIN_INLINE Vec vcmpeqfp(const Vec& a, const Vec& b) {
     for (unsigned i = 0; i < 4; ++i) r.w[i] = std::bit_cast<float>(operand(a.w[i])) == std::bit_cast<float>(operand(b.w[i])) ? 0xffffffffu : 0u;
     return r;
 }
-// Signed integers to singles, divided by 2^scale: one rounding, of the exact quotient.
+}  // namespace exact
+// Signed integers to singles, divided by 2^scale: one rounding, of the exact quotient. (Both modes.)
 QILIN_INLINE Vec vcfsx(const Vec& b, unsigned scale) {
     const double factor = 1.0 / static_cast<double>(uint64_t{1} << scale);
     Vec r;
     for (unsigned i = 0; i < 4; ++i) r.w[i] = std::bit_cast<uint32_t>(static_cast<float>(static_cast<double>(static_cast<int32_t>(b.w[i])) * factor));
     return r;
 }
+namespace exact {
 // Singles times 2^scale to signed integers, toward zero, saturating; a NaN gives 0.
 QILIN_INLINE Vec vctsxs(const Vec& b, unsigned scale) {
     const double factor = static_cast<double>(uint64_t{1} << scale);
@@ -294,5 +326,132 @@ QILIN_INLINE Vec vctsxs(const Vec& b, unsigned scale) {
     }
     return r;
 }
+}  // namespace exact
+
+// ---- the relaxed mode (see the top) ----
+// The portable twin: plain C++ on the four elements, what the host's vector code below must give too.
+namespace portable {
+QILIN_INLINE float f(uint32_t w) { return std::bit_cast<float>(w); }
+QILIN_INLINE uint32_t u(float x) { return std::bit_cast<uint32_t>(x); }
+QILIN_INLINE Vec vaddfp(const Vec& a, const Vec& b) {
+    return {{u(f(a.w[0]) + f(b.w[0])), u(f(a.w[1]) + f(b.w[1])), u(f(a.w[2]) + f(b.w[2])), u(f(a.w[3]) + f(b.w[3]))}};
+}
+QILIN_INLINE Vec vsubfp(const Vec& a, const Vec& b) {
+    return {{u(f(a.w[0]) - f(b.w[0])), u(f(a.w[1]) - f(b.w[1])), u(f(a.w[2]) - f(b.w[2])), u(f(a.w[3]) - f(b.w[3]))}};
+}
+// The exact product in a double, the sum rounded to double and then to single.
+QILIN_INLINE uint32_t madd(uint32_t a, uint32_t c, uint32_t b) { return u(static_cast<float>(value(a) * value(c) + value(b))); }
+QILIN_INLINE uint32_t nmsub(uint32_t a, uint32_t c, uint32_t b) { return u(static_cast<float>(value(a) * value(c) - value(b))) ^ 0x80000000u; }
+QILIN_INLINE Vec vmaddfp(const Vec& a, const Vec& c, const Vec& b) {
+    return {{madd(a.w[0], c.w[0], b.w[0]), madd(a.w[1], c.w[1], b.w[1]), madd(a.w[2], c.w[2], b.w[2]), madd(a.w[3], c.w[3], b.w[3])}};
+}
+QILIN_INLINE Vec vnmsubfp(const Vec& a, const Vec& c, const Vec& b) {
+    return {{nmsub(a.w[0], c.w[0], b.w[0]), nmsub(a.w[1], c.w[1], b.w[1]), nmsub(a.w[2], c.w[2], b.w[2]), nmsub(a.w[3], c.w[3], b.w[3])}};
+}
+QILIN_INLINE Vec vrefp(const Vec& b) { return {{u(1.0f / f(b.w[0])), u(1.0f / f(b.w[1])), u(1.0f / f(b.w[2])), u(1.0f / f(b.w[3]))}}; }
+QILIN_INLINE Vec vrsqrtefp(const Vec& b) {
+    return {{u(1.0f / std::sqrt(f(b.w[0]))), u(1.0f / std::sqrt(f(b.w[1]))), u(1.0f / std::sqrt(f(b.w[2]))), u(1.0f / std::sqrt(f(b.w[3])))}};
+}
+// a where a > b, else b (so b for a NaN, and for zeros of either sign): what SSE's maxps does.
+QILIN_INLINE Vec vmaxfp(const Vec& a, const Vec& b) {
+    Vec r;
+    for (unsigned i = 0; i < 4; ++i) r.w[i] = f(a.w[i]) > f(b.w[i]) ? a.w[i] : b.w[i];
+    return r;
+}
+QILIN_INLINE Vec vminfp(const Vec& a, const Vec& b) {
+    Vec r;
+    for (unsigned i = 0; i < 4; ++i) r.w[i] = f(a.w[i]) < f(b.w[i]) ? a.w[i] : b.w[i];
+    return r;
+}
+QILIN_INLINE Vec vcmpeqfp(const Vec& a, const Vec& b) {
+    Vec r;
+    for (unsigned i = 0; i < 4; ++i) r.w[i] = f(a.w[i]) == f(b.w[i]) ? 0xffffffffu : 0u;
+    return r;
+}
+// Saturating, a NaN 0, as in exact mode (the product by 2^scale is exact in a single, or past the range anyway).
+QILIN_INLINE Vec vctsxs(const Vec& b, unsigned scale) {
+    const float factor = static_cast<float>(uint32_t{1} << scale);
+    Vec r;
+    for (unsigned i = 0; i < 4; ++i) {
+        const float v = f(b.w[i]) * factor;
+        r.w[i] = v != v ? 0u : v >= 2147483648.0f ? 0x7fffffffu : v <= -2147483648.0f ? 0x80000000u : static_cast<uint32_t>(static_cast<int32_t>(v));
+    }
+    return r;
+}
+}  // namespace portable
+
+// The host's vector unit, where it has one; else the portable twin.
+namespace relaxed {
+#if QILIN_VMX_SSE
+QILIN_INLINE __m128 ps(const Vec& v) { return _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.w))); }
+QILIN_INLINE Vec vec(__m128 x) {
+    Vec r;
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(r.w), _mm_castps_si128(x));
+    return r;
+}
+QILIN_INLINE Vec vaddfp(const Vec& a, const Vec& b) { return vec(_mm_add_ps(ps(a), ps(b))); }
+QILIN_INLINE Vec vsubfp(const Vec& a, const Vec& b) { return vec(_mm_sub_ps(ps(a), ps(b))); }
+#if defined(__FMA__) || defined(__AVX2__)
+QILIN_INLINE Vec vmaddfp(const Vec& a, const Vec& c, const Vec& b) { return vec(_mm_fmadd_ps(ps(a), ps(c), ps(b))); }
+QILIN_INLINE Vec vnmsubfp(const Vec& a, const Vec& c, const Vec& b) { return vec(_mm_xor_ps(_mm_fmsub_ps(ps(a), ps(c), ps(b)), _mm_set1_ps(-0.0f))); }
+#else
+// a * c + b (or minus) in doubles, two elements at a time: the product is exact, the sum rounded twice.
+QILIN_INLINE __m128 fused(__m128 a, __m128 c, __m128 b, bool subtract) {
+    const __m128d lo = _mm_mul_pd(_mm_cvtps_pd(a), _mm_cvtps_pd(c)), hi = _mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(a, a)), _mm_cvtps_pd(_mm_movehl_ps(c, c)));
+    const __m128d blo = _mm_cvtps_pd(b), bhi = _mm_cvtps_pd(_mm_movehl_ps(b, b));
+    const __m128d slo = subtract ? _mm_sub_pd(lo, blo) : _mm_add_pd(lo, blo), shi = subtract ? _mm_sub_pd(hi, bhi) : _mm_add_pd(hi, bhi);
+    return _mm_movelh_ps(_mm_cvtpd_ps(slo), _mm_cvtpd_ps(shi));
+}
+QILIN_INLINE Vec vmaddfp(const Vec& a, const Vec& c, const Vec& b) { return vec(fused(ps(a), ps(c), ps(b), false)); }
+QILIN_INLINE Vec vnmsubfp(const Vec& a, const Vec& c, const Vec& b) { return vec(_mm_xor_ps(fused(ps(a), ps(c), ps(b), true), _mm_set1_ps(-0.0f))); }
+#endif
+QILIN_INLINE Vec vrefp(const Vec& b) { return vec(_mm_div_ps(_mm_set1_ps(1.0f), ps(b))); }
+QILIN_INLINE Vec vrsqrtefp(const Vec& b) { return vec(_mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(ps(b)))); }
+QILIN_INLINE Vec vmaxfp(const Vec& a, const Vec& b) { return vec(_mm_max_ps(ps(a), ps(b))); }
+QILIN_INLINE Vec vminfp(const Vec& a, const Vec& b) { return vec(_mm_min_ps(ps(a), ps(b))); }
+QILIN_INLINE Vec vcmpeqfp(const Vec& a, const Vec& b) { return vec(_mm_cmpeq_ps(ps(a), ps(b))); }
+// cvttps2dq gives 0x80000000 for a NaN and past either end: the top end is turned into 0x7fffffff, a NaN into 0.
+QILIN_INLINE Vec vctsxs(const Vec& b, unsigned scale) {
+    const __m128 v = _mm_mul_ps(ps(b), _mm_set1_ps(static_cast<float>(uint32_t{1} << scale)));
+    const __m128i w = _mm_xor_si128(_mm_cvttps_epi32(v), _mm_castps_si128(_mm_cmpge_ps(v, _mm_set1_ps(2147483648.0f))));
+    return vec(_mm_and_ps(_mm_castsi128_ps(w), _mm_cmpord_ps(v, v)));
+}
+#elif QILIN_VMX_NEON
+QILIN_INLINE float32x4_t ps(const Vec& v) { return vreinterpretq_f32_u32(vld1q_u32(v.w)); }
+QILIN_INLINE Vec vec(float32x4_t x) {
+    Vec r;
+    vst1q_u32(r.w, vreinterpretq_u32_f32(x));
+    return r;
+}
+QILIN_INLINE Vec vec(uint32x4_t x) {
+    Vec r;
+    vst1q_u32(r.w, x);
+    return r;
+}
+QILIN_INLINE Vec vaddfp(const Vec& a, const Vec& b) { return vec(vaddq_f32(ps(a), ps(b))); }
+QILIN_INLINE Vec vsubfp(const Vec& a, const Vec& b) { return vec(vsubq_f32(ps(a), ps(b))); }
+// The host's fused single multiply-add: one rounding, as the guest's.
+QILIN_INLINE Vec vmaddfp(const Vec& a, const Vec& c, const Vec& b) { return vec(vfmaq_f32(ps(b), ps(a), ps(c))); }
+QILIN_INLINE Vec vnmsubfp(const Vec& a, const Vec& c, const Vec& b) { return vec(vnegq_f32(vfmaq_f32(vnegq_f32(ps(b)), ps(a), ps(c)))); }
+QILIN_INLINE Vec vrefp(const Vec& b) { return vec(vdivq_f32(vdupq_n_f32(1.0f), ps(b))); }
+QILIN_INLINE Vec vrsqrtefp(const Vec& b) { return vec(vdivq_f32(vdupq_n_f32(1.0f), vsqrtq_f32(ps(b)))); }
+QILIN_INLINE Vec vmaxfp(const Vec& a, const Vec& b) { return vec(vbslq_f32(vcgtq_f32(ps(a), ps(b)), ps(a), ps(b))); }
+QILIN_INLINE Vec vminfp(const Vec& a, const Vec& b) { return vec(vbslq_f32(vcltq_f32(ps(a), ps(b)), ps(a), ps(b))); }
+QILIN_INLINE Vec vcmpeqfp(const Vec& a, const Vec& b) { return vec(vceqq_f32(ps(a), ps(b))); }
+// fcvtzs saturates, and gives 0 for a NaN: the guest's rule.
+QILIN_INLINE Vec vctsxs(const Vec& b, unsigned scale) {
+    return vec(vreinterpretq_u32_s32(vcvtq_s32_f32(vmulq_f32(ps(b), vdupq_n_f32(static_cast<float>(uint32_t{1} << scale))))));
+}
+#else
+using portable::vaddfp, portable::vsubfp, portable::vmaddfp, portable::vnmsubfp, portable::vrefp, portable::vrsqrtefp, portable::vmaxfp, portable::vminfp,
+    portable::vcmpeqfp, portable::vctsxs;
+#endif
+}  // namespace relaxed
+
+#if QILIN_FP_EXACT
+using namespace exact;
+#else
+using namespace relaxed;
+#endif
 
 }  // namespace qilin::rt::vmx

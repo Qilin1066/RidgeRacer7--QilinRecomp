@@ -19,6 +19,28 @@
 //   - Loads and stores of singles convert formats without rounding or
 //     quieting, as the architecture's own conversions do.
 //
+// **Two modes** (QILIN_FP_EXACT, a build-time switch, the same for the lifted
+// code and the runtime): exact (1), all of the above, which the differential
+// test runs; and relaxed (0, the default: the game's build), the host's own
+// float and double arithmetic and std::fma with none of the corrections. Both
+// are always defined, in fp::exact and fp::relaxed; the mode picks which one
+// fp::fadds and the rest name. What relaxed gives up, and its bounds
+// (docs/recompiler-core.md, "Relaxed floating point"):
+//   - NaNs are the host's: its default NaN (negative on x86), its choice
+//     among NaN operands; a signalling NaN loaded as a single is made quiet.
+//   - A single-precision operation on operands that are not singles rounds
+//     twice (to double, then to single): within one unit in the last place of
+//     the single. On singles (nearly always) add, subtract, multiply, divide
+//     and square root are exactly the guest's (a double holds more than twice
+//     a single's digits plus two, so the second rounding is harmless).
+//   - The single fused forms round the double sum of the exact product:
+//     within one unit of the single, equal except on a halfway point.
+//   - stfs of a register that doesn't hold a single rounds it, where the
+//     guest selects bits.
+//   - Denormals: enter_thread_mode sets the host to flush them to zero, in
+//     and out, once per thread (what VMX's non-Java mode asks anyway; scalar
+//     arithmetic on denormals, which the guest keeps, then gives zero).
+//
 // The rounding mode is round to nearest, the mode a program starts in; the
 // FPSCR's exception and result flags are not kept. Instructions that read or
 // write the FPSCR are not in the lifter's slice yet, so a function that would
@@ -31,6 +53,15 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+
+#ifndef QILIN_FP_EXACT
+#define QILIN_FP_EXACT 0  // relaxed: the game's build; the differential test defines it 1
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <xmmintrin.h>  // the float unit's mode (MXCSR)
+#elif defined(_M_ARM64)
+#include <float.h>
+#endif
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #define QILIN_FP_INLINE __forceinline
@@ -60,6 +91,9 @@ QILIN_FP_SLOW double nan_of(double a, double b, double c) { return is_nan(a) ? f
 QILIN_FP_INLINE double fneg(double x) { return from_bits(bits(x) ^ kSign); }
 QILIN_FP_INLINE double fabs(double x) { return from_bits(bits(x) & ~kSign); }
 QILIN_FP_INLINE double fnabs(double x) { return from_bits(bits(x) | kSign); }
+
+// ---- the exact mode (see the top): what the differential test checks ----
+namespace exact {
 
 // ---- double precision ----
 QILIN_FP_INLINE double fadd(double a, double b) {
@@ -99,6 +133,8 @@ QILIN_FP_INLINE double fnmsub(double a, double c, double b) {
     const double r = std::fma(a, c, -b);
     return r == r ? -r : nan_of(a, b, c);
 }
+
+}  // namespace exact
 
 // ---- single precision ----
 // Is the double exactly a single? (False for a NaN.)
@@ -196,6 +232,8 @@ QILIN_FP_SLOW double fmadds_slow(double a, double c, double b, double nan_a, dou
     return single_from(r, sum_sign(terms, 4));
 }
 
+namespace exact {
+
 QILIN_FP_INLINE double fadds(double a, double b) {
     if (is_single(a) && is_single(b)) {
         const float r = static_cast<float>(a) + static_cast<float>(b);
@@ -232,6 +270,8 @@ QILIN_FP_INLINE double fsqrts(double b) {
     }
     return fsqrts_slow(b);
 }
+
+}  // namespace exact
 // x + y rounded once to single, for an exact x and y that are not NaNs: the
 // sum in double, the error of that sum (exactly, by Knuth's two-sum), and
 // from the error's sign the single nearest the true sum.
@@ -257,6 +297,8 @@ QILIN_FP_INLINE double add_to_single(double x, double y) {
     if (error == 0) return static_cast<double>(static_cast<float>(r));
     return single_from(r, error > 0 ? 1 : -1);
 }
+namespace exact {
+
 // The fused forms. With frA and frC singles (as they nearly always are) their
 // product is exact in a double, and what is left is one sum to round once.
 // The host's single-precision fma is not used: not every C library's rounds
@@ -284,42 +326,52 @@ QILIN_FP_INLINE double fnmsubs(double a, double c, double b) {
     return r == r ? -r : r;
 }
 
-// ---- conversions ----
 // frsp: round to single. A NaN is made quiet and keeps what of its payload a single holds.
 QILIN_FP_INLINE double frsp(double b) {
     if (is_nan(b)) return from_bits((bits(b) | kQuiet) & 0xFFFFFFFFE0000000ull);
     return static_cast<double>(static_cast<float>(b));
 }
+
+}  // namespace exact
+
+// ---- conversions (one way for both modes: exact, and cheap) ----
 // fcfid: the register's bits as a signed integer, to double.
 QILIN_FP_INLINE double fcfid(double b) { return static_cast<double>(static_cast<int64_t>(bits(b))); }
-// To an integer in the register's bits, saturating; a NaN gives the most
-// negative. The word forms leave the upper half undefined: here, 0xFFF80000.
-QILIN_FP_SLOW double to_word(double value) {  // `value` already an integer, or a NaN
-    uint32_t w;
-    if (is_nan(value)) w = 0x80000000u;
-    else if (value >= 2147483648.0) w = 0x7FFFFFFFu;
-    else if (value <= -2147483648.0) w = 0x80000000u;
-    else w = static_cast<uint32_t>(static_cast<int32_t>(value));
-    return from_bits(0xFFF8000000000000ull | w);
+// The integral double nearest b, ties to even, for |b| below 2^52: |b| added to 2^52 (where a double's last place is
+// 1) and taken away again, in the mode in force (to nearest); the sign put back.
+QILIN_FP_INLINE double round_even(double b) {
+    const double rounded = (from_bits(bits(b) & ~kSign) + 0x1p52) - 0x1p52;
+    return from_bits(bits(rounded) | (bits(b) & kSign));
 }
-QILIN_FP_SLOW double to_doubleword(double value) {
-    uint64_t d;
-    if (is_nan(value)) d = kSign;
-    else if (value >= 9223372036854775808.0) d = 0x7FFFFFFFFFFFFFFFull;
-    else if (value <= -9223372036854775808.0) d = kSign;
-    else d = static_cast<uint64_t>(static_cast<int64_t>(value));
-    return from_bits(d);
+// To an integer in the register's bits, saturating; a NaN gives the most negative (every compare with a NaN is
+// false). The word forms leave the upper half undefined: here, 0xFFF80000. (Before, std::trunc and std::nearbyint
+// and a call out of line: library calls with MSVC.)
+QILIN_FP_INLINE double word_result(uint32_t w) { return from_bits(0xFFF8000000000000ull | w); }
+QILIN_FP_INLINE double fctiwz(double b) {  // toward zero
+    if (b > -2147483649.0 && b < 2147483648.0) return word_result(static_cast<uint32_t>(static_cast<int32_t>(b)));
+    return word_result(b >= 2147483648.0 ? 0x7FFFFFFFu : 0x80000000u);
 }
-QILIN_FP_INLINE double fctiwz(double b) { return to_word(std::trunc(b)); }
-QILIN_FP_INLINE double fctidz(double b) { return to_doubleword(std::trunc(b)); }
-QILIN_FP_INLINE double fctiw(double b) { return to_word(std::nearbyint(b)); }   // to nearest, ties to even: the mode in force
-QILIN_FP_INLINE double fctid(double b) { return to_doubleword(std::nearbyint(b)); }
+QILIN_FP_INLINE double fctiw(double b) {  // to nearest, ties to even: the mode in force
+    if (b >= -2147483648.5 && b < 2147483647.5) return word_result(static_cast<uint32_t>(static_cast<int32_t>(round_even(b))));
+    return word_result(b >= 2147483647.5 ? 0x7FFFFFFFu : 0x80000000u);
+}
+QILIN_FP_INLINE double fctidz(double b) {  // (no double lies between -2^63 and the next one below it, -2^63 - 2^11)
+    if (b >= -9223372036854775808.0 && b < 9223372036854775808.0) return from_bits(static_cast<uint64_t>(static_cast<int64_t>(b)));
+    return from_bits(b >= 9223372036854775808.0 ? 0x7FFFFFFFFFFFFFFFull : kSign);
+}
+QILIN_FP_INLINE double fctid(double b) {  // (from 2^52 up every double is an integer already)
+    if (b >= -9223372036854775808.0 && b < 9223372036854775808.0)
+        return from_bits(static_cast<uint64_t>(static_cast<int64_t>((bits(b) & ~kSign) < 0x4330000000000000ull ? round_even(b) : b)));
+    return from_bits(b >= 9223372036854775808.0 ? 0x7FFFFFFFFFFFFFFFull : kSign);
+}
 
 // fsel: frC if frA >= 0 (minus zero counts; a NaN doesn't), else frB.
 QILIN_FP_INLINE double fsel(double a, double c, double b) { return a >= 0.0 ? c : b; }
 
 // A compare's CR field: less, greater, equal, unordered.
 QILIN_FP_INLINE uint32_t fcompare(double a, double b) { return a < b ? 8u : a > b ? 4u : a == b ? 2u : 1u; }
+
+namespace exact {
 
 // ---- singles in memory ----
 // lfs: the single's value as a double, with a NaN's bits carried over as they are.
@@ -344,6 +396,72 @@ QILIN_FP_INLINE uint64_t store_single(double value) {
         return ((b >> 32) & 0x80000000u) | ((fraction >> (896 - exponent + 30)) & 0x007FFFFFu);
     }
     return (b >> 32) & 0x80000000u;
+}
+
+}  // namespace exact
+
+// ---- the relaxed mode (see the top): the host's arithmetic, for play ----
+namespace relaxed {
+
+QILIN_FP_INLINE double to_single(double r) { return static_cast<double>(static_cast<float>(r)); }
+
+QILIN_FP_INLINE double fadd(double a, double b) { return a + b; }
+QILIN_FP_INLINE double fsub(double a, double b) { return a - b; }
+QILIN_FP_INLINE double fmul(double a, double c) { return a * c; }
+QILIN_FP_INLINE double fdiv(double a, double b) { return a / b; }
+QILIN_FP_INLINE double fsqrt(double b) { return std::sqrt(b); }
+QILIN_FP_INLINE double fmadd(double a, double c, double b) { return std::fma(a, c, b); }
+QILIN_FP_INLINE double fmsub(double a, double c, double b) { return std::fma(a, c, -b); }
+QILIN_FP_INLINE double fnmadd(double a, double c, double b) { return -std::fma(a, c, b); }
+QILIN_FP_INLINE double fnmsub(double a, double c, double b) { return -std::fma(a, c, -b); }
+// In double, then to single: on singles that is one rounding (see the top), else two.
+QILIN_FP_INLINE double fadds(double a, double b) { return to_single(a + b); }
+QILIN_FP_INLINE double fsubs(double a, double b) { return to_single(a - b); }
+QILIN_FP_INLINE double fmuls(double a, double c) { return to_single(a * c); }
+QILIN_FP_INLINE double fdivs(double a, double b) { return to_single(a / b); }
+QILIN_FP_INLINE double fsqrts(double b) { return static_cast<double>(std::sqrt(static_cast<float>(b))); }
+// The product of singles is exact in a double; the sum is rounded to double, then to single.
+QILIN_FP_INLINE double fmadds(double a, double c, double b) { return to_single(a * c + b); }
+QILIN_FP_INLINE double fmsubs(double a, double c, double b) { return to_single(a * c - b); }
+QILIN_FP_INLINE double fnmadds(double a, double c, double b) { return -to_single(a * c + b); }
+QILIN_FP_INLINE double fnmsubs(double a, double c, double b) { return -to_single(a * c - b); }
+QILIN_FP_INLINE double frsp(double b) { return to_single(b); }
+QILIN_FP_INLINE double load_single(uint64_t word) { return static_cast<double>(std::bit_cast<float>(static_cast<uint32_t>(word))); }
+QILIN_FP_INLINE uint64_t store_single(double value) { return std::bit_cast<uint32_t>(static_cast<float>(value)); }
+
+}  // namespace relaxed
+
+// The mode's helpers are the ones fp::fadds and the rest name.
+#if QILIN_FP_EXACT
+using namespace exact;
+#else
+using namespace relaxed;
+#endif
+inline constexpr bool kExact = QILIN_FP_EXACT != 0;
+
+// The calling thread's float unit set to flush denormals to zero, as operands and as results (x86's DAZ and FTZ,
+// ARM's FZ), for both precisions.
+inline void flush_denormals() {
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_setcsr(_mm_getcsr() | 0x8040u);
+#elif defined(__aarch64__) && !defined(_MSC_VER)
+    uint64_t fpcr;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr | (uint64_t{1} << 24)));
+#elif defined(_M_ARM64)
+    unsigned int control = 0;
+    _controlfp_s(&control, _DN_FLUSH, _MCW_DN);
+#endif
+}
+// The calling thread's float unit set for the mode, once per thread (the runtime calls it before it runs lifted
+// code): in relaxed mode, denormals flushed. In exact mode it changes nothing.
+inline void enter_thread_mode() {
+#if !QILIN_FP_EXACT
+    thread_local bool entered = false;
+    if (entered) return;
+    entered = true;
+    flush_denormals();
+#endif
 }
 
 }  // namespace qilin::rt::fp

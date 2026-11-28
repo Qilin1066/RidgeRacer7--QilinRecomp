@@ -23,12 +23,16 @@ namespace {
 using namespace std::chrono_literals;
 
 // An upper bound on a time, in microseconds: as given on a quiet machine, four times as much on a shared CI machine
-// (GitHub's set CI), whose timers and scheduling are far coarser. Lower bounds are never loosened.
+// (GitHub's set CI), whose timers and scheduling are far coarser, and on macOS's CI machines, which coalesce timers (a
+// 5 ms sleep took 27 to 33 ms there), at least 50 ms. Lower bounds are never loosened.
 long long slack(long long us) {
     static const bool ci = [] {
         const char* const text = std::getenv("CI");
         return text && *text && *text != '0';
     }();
+#if defined(__APPLE__)
+    if (ci) return std::max(us * 4, 50000LL);
+#endif
     return ci ? us * 4 : us;
 }
 using rr7::Cpu;
@@ -343,7 +347,7 @@ void lend_wakes() {
         check(took_us.load() >= 0, "the waiting thread was lent a token");
         check(woke <= 3, "a thread waiting for a lent token wakes only when it may borrow");
         if (priority == 1000) check(took_us.load() >= 50000 && took_us.load() < slack(80000), "a worse thread is lent a token after 50 ms");
-        else check(took_us.load() >= 250 && took_us.load() < 1000, "an equal thread is lent a token soon after 250 us");
+        else check(took_us.load() >= 250 && took_us.load() < slack(1000), "an equal thread is lent a token soon after 250 us");
     }
     check(rr7::free_core_tokens() == 0 && rr7::threads_waiting_for_core() == 0, "every lent token repaid");
     rr7::give_up_core();

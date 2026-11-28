@@ -323,6 +323,39 @@ uint32_t single_bits(double v) { return std::bit_cast<uint32_t>(static_cast<floa
 // A normal single of exponent 64 to 190 (from about 2^-63 to 2^63): sums, products and quotients of two stay normal.
 uint32_t ordinary_single() { return (static_cast<uint32_t>(rng()) & 0x807fffffu) | ((64 + static_cast<uint32_t>(rng() % 127)) << 23); }
 
+// The relaxed VMX against the exact on denormals, for a thread whose float unit flushes them (fp::flush_denormals).
+// Out of line, its inputs read through volatiles inside it: so that no compiler computes them before the flush was
+// set (a call that reads volatiles can't be moved across the mode's change) or folds them at compile time in IEEE
+// mode, which no flush set at run time reaches (Clang and GCC folded constants here).
+#if defined(_MSC_VER) && !defined(__clang__)
+#define DIFFTEST_NOINLINE __declspec(noinline)
+#else
+#define DIFFTEST_NOINLINE [[gnu::noinline]]
+#endif
+template <typename Report>
+DIFFTEST_NOINLINE void check_flushed(Report report) {
+    const auto unseen = [](rt::Vec v) {
+        rt::Vec r;
+        for (unsigned i = 0; i < 4; ++i) {
+            volatile uint32_t w = v.w[i];
+            r.w[i] = w;
+        }
+        return r;
+    };
+    const rt::Vec tiny = unseen({{0x00400000u, 0x80000001u, 0x00800000u, 0x3f800000u}}), half = unseen({{0x3f000000u, 0x3f000000u, 0x3f000000u, 0x00000001u}});
+    const rt::Vec zero = unseen({{0, 0, 0, 0}}), small = unseen({{0x00c00000u, 0x80c00000u, 0x00800001u, 0x3f800000u}}),
+                  normal = unseen({{0x00800000u, 0x80800000u, 0x00800000u, 0x3f800000u}});
+    const std::pair<const char*, std::pair<rt::Vec, rt::Vec>> flushed[] = {
+        {"vmaddfp of denormals", {rt::vmx::relaxed::vmaddfp(tiny, half, zero), rt::vmx::exact::vmaddfp(tiny, half, zero)}},
+        {"vaddfp of denormals", {rt::vmx::relaxed::vaddfp(tiny, half), rt::vmx::exact::vaddfp(tiny, half)}},
+        {"vsubfp to a denormal", {rt::vmx::relaxed::vsubfp(small, normal), rt::vmx::exact::vsubfp(small, normal)}},
+        {"vcmpeqfp of denormals", {rt::vmx::relaxed::vcmpeqfp(tiny, zero), rt::vmx::exact::vcmpeqfp(tiny, zero)}},
+    };
+    for (const auto& [what, r] : flushed)
+        for (unsigned i = 0; i < 4; ++i)
+            if (r.first.w[i] != r.second.w[i]) report(what, tiny.w[i], half.w[i], r.first.w[i], r.second.w[i]);
+}
+
 RelaxedCounts run_relaxed() {
     RelaxedCounts n;
     namespace ex = rt::fp::exact;
@@ -448,28 +481,14 @@ RelaxedCounts run_relaxed() {
     // are what its non-Java mode gives; a denormal operand counts as zero.
     std::thread([&] {
         rt::fp::flush_denormals();
-        // (Each input through a volatile, read after the flush is set: constants would be folded at compile time, in IEEE
-        // mode, which no flush set at run time reaches. Clang and GCC did so.)
-        const auto unseen = [](rt::Vec v) {
-            rt::Vec r;
-            for (unsigned i = 0; i < 4; ++i) {
-                volatile uint32_t w = v.w[i];
-                r.w[i] = w;
-            }
-            return r;
-        };
-        const rt::Vec tiny = unseen({{0x00400000u, 0x80000001u, 0x00800000u, 0x3f800000u}}), half = unseen({{0x3f000000u, 0x3f000000u, 0x3f000000u, 0x00000001u}});
-        const rt::Vec zero = unseen({{0, 0, 0, 0}}), small = unseen({{0x00c00000u, 0x80c00000u, 0x00800001u, 0x3f800000u}}),
-                      normal = unseen({{0x00800000u, 0x80800000u, 0x00800000u, 0x3f800000u}});
-        const std::pair<const char*, std::pair<rt::Vec, rt::Vec>> flushed[] = {
-            {"vmaddfp of denormals", {rt::vmx::relaxed::vmaddfp(tiny, half, zero), rt::vmx::exact::vmaddfp(tiny, half, zero)}},
-            {"vaddfp of denormals", {rt::vmx::relaxed::vaddfp(tiny, half), rt::vmx::exact::vaddfp(tiny, half)}},
-            {"vsubfp to a denormal", {rt::vmx::relaxed::vsubfp(small, normal), rt::vmx::exact::vsubfp(small, normal)}},
-            {"vcmpeqfp of denormals", {rt::vmx::relaxed::vcmpeqfp(tiny, zero), rt::vmx::exact::vcmpeqfp(tiny, zero)}},
-        };
-        for (const auto& [what, r] : flushed)
-            for (unsigned i = 0; i < 4; ++i)
-                if (r.first.w[i] != r.second.w[i]) bad(what, tiny.w[i], half.w[i], 0, r.first.w[i], r.second.w[i]);
+        size_t failed = 0;
+        check_flushed([&](const char* what, uint32_t a, uint32_t b, uint32_t relaxed, uint32_t exact) {
+            ++failed;
+            bad(what, a, b, 0, relaxed, exact);
+        });
+#if defined(__x86_64__) || defined(_M_X64)
+        if (failed) std::println(stderr, "  (the float unit's MXCSR while they ran: {:#x}; flushing is 0x8040)", _mm_getcsr());
+#endif
     }).join();
     return n;
 }

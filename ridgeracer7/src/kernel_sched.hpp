@@ -185,8 +185,8 @@ private:
 inline void cpu_relax() {
 #if defined(_M_X64) || defined(__x86_64__)
     _mm_pause();
-#elif defined(_M_ARM64) || defined(__aarch64__)
-    __yield();  // (ACLE's: no inline assembly)
+#elif defined(_M_ARM64) || (defined(__aarch64__) && defined(__clang__))
+    __yield();  // (ACLE's: no inline assembly. GCC 14's arm_acle.h has no __yield: there the hint is left out)
 #endif
 }
 

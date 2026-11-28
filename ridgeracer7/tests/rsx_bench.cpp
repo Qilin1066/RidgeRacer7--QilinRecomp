@@ -162,7 +162,8 @@ struct PipelineRecord {
 };
 std::mutex g_pipelines_mutex;  // (pipelines may be made on the renderer's worker thread)
 std::unordered_map<VkPipeline, PipelineRecord> g_pipelines;
-std::unordered_map<VkShaderModule, uint64_t> g_modules;  // each module's code, hashed (not its handle: modules may be made in any order)
+std::unordered_map<VkShaderModule, uint64_t> g_modules;
+std::unordered_map<VkShaderModule, std::pair<uint32_t, uint32_t>> g_module_constants;  // a vertex program's constants read, [first, end)  // each module's code, hashed (not its handle: modules may be made in any order)
 uint64_t g_pipelines_made = 0;
 
 // What the command buffer has bound and set, for the digest at each draw.
@@ -291,7 +292,9 @@ void digest_draw(uint32_t vertices) {
         }
     }
     if (g_bound.arena) {
-        digest(g_bound.arena + g_bound.constant_offsets[0], 468 * 16);
+        // (The vertex constants its program reads: those the renderer must give it.)
+        const auto [first, end] = g_module_constants.at(p.modules[0]);
+        digest(g_bound.arena + g_bound.constant_offsets[0] + size_t{first} * 16, size_t{end - first} * 16);
         digest(g_bound.arena + g_bound.constant_offsets[1], 32);
     }
 }
@@ -351,6 +354,12 @@ void stub_vulkan() {
         uint64_t h = 0xcbf29ce484222325ull;
         for (size_t i = 0; i < info->codeSize; ++i) h = (h ^ reinterpret_cast<const uint8_t*>(info->pCode)[i]) * 0x100000001b3ull;
         g_modules[*out] = h;
+        // (A vertex program's constants read: all 468 where its table doesn't say.)
+        std::pair<uint32_t, uint32_t> constants{0, 468};
+        for (size_t i = 0; i < qilin::rt::kTranslatedShaderCount; ++i)
+            if (const qilin::rt::TranslatedShader& t = qilin::rt::kTranslatedShaders[i]; t.spirv == info->pCode && t.vertex && t.constants_end)
+                constants = {t.constants_first, t.constants_end};
+        g_module_constants[*out] = constants;
         return VK_SUCCESS;
     };
     vkCreateGraphicsPipelines = [](VkDevice, VkPipelineCache, uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* out) {
@@ -616,6 +625,8 @@ qilin::rt::TranslatedShader make_shader(bool vertex, unsigned program) {
             for (const uint32_t w : vertex_instruction(program, i)) keyed.resize(keyed.size() + 4), put_be32(keyed.data() + keyed.size() - 4, w);
         s.inputs = 1u << 0 | 1u << 3 | 1u << 8;  // position, colour, texture coordinate 0
         s.outputs = 1u << 0 | 1u << 1 | 1u << 7;  // position, COL0, TEX0
+        // The constants read: the matrix (0 to 3), and some of the 64 sent every 50th draw from 16; the last indexes them all.
+        s.constants_first = program == 2 ? 2 : 0, s.constants_end = program == kVertexPrograms - 1 ? 468 : 16 + 16 * program;
     } else {
         keyed = fragment_microcode(program, 0);
         std::memset(keyed.data() + 16, 0, 16), std::memset(keyed.data() + 64, 0, 16);
